@@ -11,29 +11,41 @@ class PT_RemixProjectPanel(bpy.types.Panel):
     bl_region_type = 'UI'
     # Add a category name for the tab in the N-Panel
     bl_category = "RTX Remix"
+    bl_order = 1  # Captures (initial setup) appears before the mod workspace
     bl_context = ""
 
     def draw(self, context):
         layout = self.layout
         scene = context.scene
 
+        # All game/capture discovery and mod selection belong to the initial
+        # workflow in Captures. This panel is a mod-only workspace.
         box = layout.box()
-        box.label(text="Project Setup", icon='SETTINGS')
-        row_file = box.row(align=True)
-        row_file.prop(scene, "remix_mod_file_path")
-        # Button to create a new mod file (on its own row for clarity)
-        box.operator(CreateRemixModFile.bl_idname, icon='FILE_NEW')
-        
-        # Add game name field
-        row_game = box.row(align=True)
-        row_game.prop(scene, "remix_game_name")
-        
-        row_root = box.row()
-        row_root.label(text="Project Root:")
-        row_root.label(text=scene.remix_project_root_display)
-        row_load = box.row(align=True)
-        row_load.operator(LoadRemixProject.bl_idname, icon='FILE_REFRESH', text="Load Project")
-        
+        box.label(text="Selected Mod Workspace", icon='FILE_3D')
+
+        if scene.remix_mod_file_path:
+            import os
+            mod_path = bpy.path.abspath(scene.remix_mod_file_path)
+            try:
+                relative_mod = os.path.relpath(mod_path, bpy.path.abspath(scene.remix_mods_folder_path)) \
+                    if scene.remix_mods_folder_path else os.path.basename(mod_path)
+            except (ValueError, OSError):
+                relative_mod = os.path.basename(mod_path)
+            box.label(text=f'Mod: {relative_mod}', icon='CHECKMARK')
+            box.label(text=f'Project Root: {scene.remix_project_root_display}', icon='FILE_FOLDER')
+            if scene.remix_mod_load_status:
+                box.label(text=scene.remix_mod_load_status, icon='ERROR')
+        else:
+            box.label(text='No mod selected.', icon='INFO')
+            box.label(text='Select game and mod in Captures first.')
+
+        row_controls = box.row(align=True)
+        row_controls.operator(CreateRemixModFile.bl_idname, icon='FILE_NEW', text='Create Mod')
+        load_row = row_controls.row(align=True)
+        load_row.enabled = bool(scene.remix_mod_file_path)
+        load_row.operator(LoadRemixProject.bl_idname, icon='FILE_REFRESH', text='Reload Mod')
+        box.prop(scene, 'remix_game_name')
+
         # --- Button to apply mod file changes ---
         row_apply_changes = box.row(align=True)
         row_apply_changes.operator(ApplyRemixModChanges.bl_idname, icon='FILE_TICK', text="Load mod.usda Changes")
