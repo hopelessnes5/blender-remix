@@ -6,6 +6,7 @@ import subprocess
 import bmesh
 import mathutils
 import math
+import re
 import traceback
 from bpy_extras.io_utils import ExportHelper
 from bpy.props import StringProperty, BoolProperty, EnumProperty
