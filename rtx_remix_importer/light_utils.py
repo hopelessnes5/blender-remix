@@ -218,6 +218,34 @@ def create_light_from_usd(light_prim, stage, scene_scale=1.0):
         if hasattr(light_data, 'update_tag'):
             light_data.update_tag()
 
+        # FIX: base-capture lights were never tagged with their USD path, unlike
+        # lights created by the mod-loader or exported by this addon. Without this,
+        # "Load mod.usda Changes" can never recognize this light as already existing
+        # (_build_object_map has nothing to match it against) and always creates a
+        # duplicate instead of updating it in place.
+        light_prim_path_str = str(light_prim.GetPath())
+        light_obj["usd_light_path"] = light_prim_path_str
+
+        # FIX: lights were never parented to their owning mesh, so the Blender
+        # hierarchy didn't mirror the capture's (light nested under mesh_XXXX) and
+        # the light wouldn't follow its anchor mesh if it moved. Walk up the USD
+        # hierarchy and parent to the first ancestor that's already an imported
+        # Blender object.
+        parent_prim = light_prim.GetParent()
+        while parent_prim and parent_prim.IsValid() and str(parent_prim.GetPath()) != "/":
+            parent_path_str = str(parent_prim.GetPath())
+            parent_obj = None
+            for candidate in bpy.data.objects:
+                if candidate.get("usd_prim_path") == parent_path_str or candidate.get("usd_instance_path") == parent_path_str:
+                    parent_obj = candidate
+                    break
+            if parent_obj:
+                light_obj.parent = parent_obj
+                light_obj.matrix_parent_inverse = parent_obj.matrix_world.inverted()
+                print(f"  Parented light '{light_name}' to '{parent_obj.name}' (<{parent_path_str}>)")
+                break
+            parent_prim = parent_prim.GetParent()
+
         print(f"Created light: {light_name} ({bl_light_type})")
         return light_obj
 

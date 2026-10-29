@@ -173,14 +173,43 @@ def get_input_value(shader, input_name):
     if not USD_AVAILABLE or not shader:
         return None
 
-    # Try getting input without prefix first
-    shader_input = shader.GetInput(input_name)
+    # FIX: UsdShade.Shader.GetInput() only ever matches an attribute literally
+    # named "inputs:<base_name>" - it prepends "inputs:" itself. Callers across
+    # this codebase pass names inconsistently: some bare ("enable_emission"),
+    # some already prefixed ("inputs:enable_opacity"). For an already-prefixed
+    # name, both the direct GetInput(input_name) call AND the "fallback" below
+    # end up looking for "inputs:inputs:enable_opacity" - which never exists -
+    # so this silently returned None for every prefixed caller, every time.
+    # Strip any leading "inputs:" before calling GetInput so both styles work.
+    base_name = input_name[len("inputs:"):] if input_name.startswith("inputs:") else input_name
+
+    shader_input = shader.GetInput(base_name)
     if not shader_input:
-        # Fallback: Try with 'inputs:' prefix
-        shader_input = shader.GetInput(f"inputs:{input_name}")
-        if not shader_input:
-             # print(f"Debug: Input '{input_name}' (with or without prefix) not found on shader '{shader.GetPrim().GetName()}'")
-             return None
+        # FIX: real captured materials author certain "legacy state derived"
+        # booleans (confirmed via official toolkit test fixtures: enable_opacity,
+        # likely enable_emission/enable_thin_film/ignore_material too) as a bare
+        # `uniform bool enable_opacity = 1` directly on the Shader prim - with NO
+        # "inputs:" namespace at all. That's not a real UsdShade connectable
+        # Input, so GetInput() structurally can never see it regardless of
+        # prefixing. Fall back to a plain, unnamespaced attribute lookup.
+        plain_attr = shader.GetPrim().GetAttribute(base_name)
+        if plain_attr and plain_attr.HasValue():
+            value = plain_attr.Get()
+            print(f"  Returning bare (non-namespaced) attribute value for '{input_name}': {value}")
+            return value
+
+        # Some requested names aren't shader "inputs:" at all (e.g.
+        # "info:mdl:sourceAsset" is in the "info:mdl:" namespace) - GetInput()
+        # can never find those regardless of prefixing. Read them directly off
+        # the prim as a plain attribute instead.
+        if base_name != input_name or ':' in base_name:
+            attr = shader.GetPrim().GetAttribute(input_name)
+            if attr and attr.HasValue():
+                value = attr.Get()
+                print(f"  Returning direct attribute value for '{input_name}': {value}")
+                return value
+        # print(f"Debug: Input '{input_name}' (with or without prefix) not found on shader '{shader.GetPrim().GetName()}'")
+        return None
 
     # Get the underlying attribute
     attr = shader_input.GetAttr()

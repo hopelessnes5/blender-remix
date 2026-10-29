@@ -7,6 +7,7 @@ by using USD's layer composition system properly and only processing authored ch
 
 import bpy
 import os
+import math
 from typing import Dict, Set, Optional, Tuple
 from ... import mod_apply_utils
 from ...core_utils import (
@@ -490,7 +491,8 @@ class ModFileLoader:
             mod_file_path_for_tex_p=mod_file_absolute,
             mod_base_material_node_cache_param=self.base_material_node_cache,
             local_material_cache_param=self.material_cache,
-            report_fn=self.report
+            report_fn=self.report,
+            existing_bl_material_param=current_mat
         )
         
         if bl_material:
@@ -598,6 +600,11 @@ class ModFileLoader:
             
             material_path = str(targets[0])
             
+            # Capture the object's currently-bound material (from capture import,
+            # or a previous mod load) BEFORE building the override, so unspecified
+            # inputs can be preserved instead of lost (see create_mod_material_nodes_util).
+            current_bl_material = bl_object.data.materials[0] if bl_object.data.materials else None
+
             # Get or create Blender material
             bl_material = mod_apply_utils.get_or_create_mod_instance_material_util(
                 base_material_usd_path=material_path,
@@ -607,7 +614,8 @@ class ModFileLoader:
                 mod_file_path_for_tex_p=self.stage.GetRootLayer().realPath,
                 mod_base_material_node_cache_param=self.base_material_node_cache,
                 local_material_cache_param=self.material_cache,
-                report_fn=self.report
+                report_fn=self.report,
+                existing_bl_material_param=current_bl_material
             )
             
             if bl_material:
@@ -624,12 +632,128 @@ class ModFileLoader:
         except Exception as e:
             self.report({'WARNING'}, f"Failed to apply material to {bl_object.name}: {e}")
     
+    def _is_specific_light_type(self, prim: Usd.Prim, light_type_name: str) -> bool:
+        """Check if a prim is a specific USD light type, handling different USD versions gracefully."""
+        if hasattr(UsdLux, light_type_name):
+            light_class = getattr(UsdLux, light_type_name)
+            try:
+                return prim.IsA(light_class)
+            except Exception:
+                return False
+        return False
+
     def _apply_light_properties(self, prim: Usd.Prim, bl_object: bpy.types.Object):
-        """Apply USD light properties to Blender light."""
-        # Reuse existing implementation from sync_ops.py
-        # This is already well-implemented, just needs to be called
+        """Apply USD light property overrides to an existing Blender light in place.
+
+        FIX: this used to be a no-op stub (only bumped a stats counter) - authored
+        color/intensity/shape overrides from mod.usda never actually reached the light.
+        Ported from the working implementation in sync_ops.py.
+        """
+        bl_light_data = bl_object.data
+        light_api = UsdLux.LightAPI(prim)
+        time_code = self.time_code
+        current_scene_scale = self.context.scene.remix_export_scale
+        changed_props = []
+
+        # Common properties
+        if light_api.GetColorAttr().IsDefined() and light_api.GetColorAttr().IsAuthored():
+            new_color = Gf.Vec3f(light_api.GetColorAttr().Get(time_code))
+            if tuple(bl_light_data.color) != tuple(new_color):
+                bl_light_data.color = new_color
+                changed_props.append("color")
+
+        intensity_authored = False
+        if light_api.GetIntensityAttr().IsDefined() and light_api.GetIntensityAttr().IsAuthored():
+            intensity = light_api.GetIntensityAttr().Get(time_code)
+            intensity_authored = True
+        else:
+            stored_exposure = bl_light_data.get("usd_exposure", None)
+            intensity = bl_light_data.energy / pow(2, stored_exposure) if stored_exposure is not None else bl_light_data.energy
+
+        exposure_authored = False
+        if light_api.GetExposureAttr().IsDefined() and light_api.GetExposureAttr().IsAuthored():
+            exposure = light_api.GetExposureAttr().Get(time_code)
+            bl_light_data["usd_exposure"] = exposure
+            exposure_authored = True
+        else:
+            exposure = bl_light_data.get("usd_exposure", 0.0)
+
+        if intensity_authored or exposure_authored:
+            new_energy_val = intensity * pow(2, exposure)
+            if abs(bl_light_data.energy - new_energy_val) > 1e-5:
+                bl_light_data.energy = new_energy_val
+                changed_props.append("energy (intensity/exposure)")
+
+        enable_temp_attr = light_api.GetEnableColorTemperatureAttr()
+        color_temp_attr = light_api.GetColorTemperatureAttr()
+        if enable_temp_attr.IsDefined() and enable_temp_attr.IsAuthored():
+            use_temp = enable_temp_attr.Get(time_code)
+            if bl_light_data.use_custom_color_temp != use_temp:
+                bl_light_data.use_custom_color_temp = use_temp
+                changed_props.append("use_color_temp")
+            if use_temp and color_temp_attr.IsDefined() and color_temp_attr.IsAuthored():
+                new_temp = color_temp_attr.Get(time_code)
+                if bl_light_data.color_temperature != new_temp:
+                    bl_light_data.color_temperature = new_temp
+                    changed_props.append("color_temperature")
+        elif color_temp_attr.IsDefined() and color_temp_attr.IsAuthored() and bl_light_data.use_custom_color_temp:
+            new_temp = color_temp_attr.Get(time_code)
+            if bl_light_data.color_temperature != new_temp:
+                bl_light_data.color_temperature = new_temp
+                changed_props.append("color_temperature (assuming enabled)")
+
+        # Type-specific properties (only if the underlying Blender light type still matches)
+        if self._is_specific_light_type(prim, 'SphereLight') and bl_light_data.type == 'POINT':
+            sphere_api = UsdLux.SphereLight(prim)
+            if sphere_api.GetRadiusAttr().IsDefined() and sphere_api.GetRadiusAttr().IsAuthored():
+                new_size = sphere_api.GetRadiusAttr().Get(time_code) * 2.0 * current_scene_scale
+                if sphere_api.GetTreatAsPointAttr().Get(time_code):
+                    new_size = 0.0
+                if abs(bl_light_data.shadow_soft_size - new_size) > 1e-5:
+                    bl_light_data.shadow_soft_size = new_size
+                    changed_props.append("size (radius)")
+        elif self._is_specific_light_type(prim, 'RectLight') and bl_light_data.type == 'AREA':
+            rect_api = UsdLux.RectLight(prim)
+            if rect_api.GetWidthAttr().IsDefined() and rect_api.GetWidthAttr().IsAuthored():
+                new_width = rect_api.GetWidthAttr().Get(time_code) * current_scene_scale
+                if abs(bl_light_data.size - new_width) > 1e-5:
+                    bl_light_data.size = new_width
+                    changed_props.append("size (width)")
+            if rect_api.GetHeightAttr().IsDefined() and rect_api.GetHeightAttr().IsAuthored():
+                new_height = rect_api.GetHeightAttr().Get(time_code) * current_scene_scale
+                if hasattr(bl_light_data, 'size_y') and abs(bl_light_data.size_y - new_height) > 1e-5:
+                    bl_light_data.size_y = new_height
+                    changed_props.append("size_y (height)")
+        elif self._is_specific_light_type(prim, 'SpotLight') and bl_light_data.type == 'SPOT':
+            spot_api = UsdLux.SpotLight(prim)
+            if spot_api.GetShapingConeAngleAttr().IsDefined() and spot_api.GetShapingConeAngleAttr().IsAuthored():
+                new_angle = math.radians(spot_api.GetShapingConeAngleAttr().Get(time_code)) * 2.0
+                if abs(bl_light_data.spot_size - new_angle) > 1e-5:
+                    bl_light_data.spot_size = new_angle
+                    changed_props.append("spot_size")
+            if spot_api.GetShapingConeSoftnessAttr().IsDefined() and spot_api.GetShapingConeSoftnessAttr().IsAuthored():
+                new_blend = spot_api.GetShapingConeSoftnessAttr().Get(time_code)
+                if abs(bl_light_data.spot_blend - new_blend) > 1e-5:
+                    bl_light_data.spot_blend = new_blend
+                    changed_props.append("spot_blend")
+        elif self._is_specific_light_type(prim, 'DiskLight') and bl_light_data.type == 'POINT':
+            disk_api = UsdLux.DiskLight(prim)
+            if disk_api.GetRadiusAttr().IsDefined() and disk_api.GetRadiusAttr().IsAuthored():
+                new_size = disk_api.GetRadiusAttr().Get(time_code) * 2.0 * current_scene_scale
+                if abs(bl_light_data.shadow_soft_size - new_size) > 1e-5:
+                    bl_light_data.shadow_soft_size = new_size
+                    changed_props.append("size (radius)")
+        elif self._is_specific_light_type(prim, 'DistantLight') and bl_light_data.type == 'SUN':
+            distant_api = UsdLux.DistantLight(prim)
+            if distant_api.GetAngleAttr().IsDefined() and distant_api.GetAngleAttr().IsAuthored():
+                new_angle_rad = math.radians(distant_api.GetAngleAttr().Get(time_code) * 2.0)
+                if abs(bl_light_data.angle - new_angle_rad) > 1e-5:
+                    bl_light_data.angle = new_angle_rad
+                    changed_props.append("angle")
+
         self.stats['lights_updated'] += 1
-        print(f"Updated light properties for '{bl_object.name}'")
+        if changed_props:
+            print(f"  Applied overrides to light '{bl_object.name}': {', '.join(changed_props)}")
     
     def _create_mesh_object(self, prim: Usd.Prim) -> Optional[bpy.types.Object]:
         """Create a new mesh object from USD prim."""

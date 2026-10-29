@@ -226,6 +226,9 @@ def load_mod_texture_util(image_path, is_normal=False, is_non_color=False, repor
     try:
         img = bpy.data.images.load(abs_image_path, check_existing=True)
         img.colorspace_settings.name = 'Non-Color' if (is_normal or is_non_color) else 'sRGB'
+        # FIX: treat channels as independent packed data rather than assuming
+        # alpha is always transparency (see texture_loader.py / material_utils.py).
+        img.alpha_mode = 'CHANNEL_PACKED'
         _TEXTURE_CACHE_MOD_APPLY[abs_image_path] = img
         return img
     except RuntimeError as e:
@@ -337,15 +340,37 @@ def process_mod_input_util(usd_input_val, input_type_name, nodes, links, target_
             if resolved_path and os.path.exists(resolved_path):
                 image = load_mod_texture_util(resolved_path, is_normal, is_non_color, report_fn)
                 if image:
-                    tex_node = nodes.new(type='ShaderNodeTexImage'); tex_node.image = image
-                    tex_node.label = f"{input_type_name.replace('_', ' ').title()} Texture"; tex_node.location = (texture_node_x, node_pos[1])
-                    out_sock_name = 'Alpha' if (is_non_color or is_normal) and target_socket.type=='VALUE' and 'Alpha' in tex_node.outputs else 'Color'
-                    if is_normal:
-                        nm = nodes.new(type='ShaderNodeNormalMap'); nm.location = (normal_map_node_x, node_pos[1])
-                        links.new(tex_node.outputs[out_sock_name], nm.inputs['Color']); links.new(nm.outputs['Normal'], target_socket)
-                        created_node = nm
+                    # FIX: if this socket is already fed by a texture node (from a previous
+                    # load of this same material), update its image in place instead of
+                    # spawning a duplicate node chain on every reload.
+                    existing_tex_node = None
+                    existing_container_node = None
+                    if target_socket.is_linked:
+                        src = target_socket.links[0].from_node
+                        if is_normal and src.type == 'NORMAL_MAP':
+                            existing_container_node = src
+                            color_in = src.inputs.get('Color')
+                            if color_in and color_in.is_linked:
+                                cand = color_in.links[0].from_node
+                                if cand.type == 'TEX_IMAGE':
+                                    existing_tex_node = cand
+                        elif not is_normal and src.type == 'TEX_IMAGE':
+                            existing_tex_node = src
+
+                    if existing_tex_node:
+                        if existing_tex_node.image != image:
+                            existing_tex_node.image = image
+                        created_node = existing_container_node if is_normal else existing_tex_node
                     else:
-                        links.new(tex_node.outputs[out_sock_name], target_socket); created_node = tex_node
+                        tex_node = nodes.new(type='ShaderNodeTexImage'); tex_node.image = image
+                        tex_node.label = f"{input_type_name.replace('_', ' ').title()} Texture"; tex_node.location = (texture_node_x, node_pos[1])
+                        out_sock_name = 'Alpha' if (is_non_color or is_normal) and target_socket.type=='VALUE' and 'Alpha' in tex_node.outputs else 'Color'
+                        if is_normal:
+                            nm = nodes.new(type='ShaderNodeNormalMap'); nm.location = (normal_map_node_x, node_pos[1])
+                            links.new(tex_node.outputs[out_sock_name], nm.inputs['Color']); links.new(nm.outputs['Normal'], target_socket)
+                            created_node = nm
+                        else:
+                            links.new(tex_node.outputs[out_sock_name], target_socket); created_node = tex_node
     elif isinstance(usd_input_val, Gf.Vec3f) and target_socket.type == 'RGBA': target_socket.default_value = (usd_input_val[0], usd_input_val[1], usd_input_val[2], 1.0)
     elif isinstance(usd_input_val, Gf.Vec4f) and target_socket.type == 'RGBA': target_socket.default_value = tuple(usd_input_val)
     elif isinstance(usd_input_val, (int, float)) and target_socket.type == 'VALUE': target_socket.default_value = float(usd_input_val)
@@ -434,28 +459,49 @@ def process_mod_pbr_util(shader_prim_instance, bl_mat_instance, main_shader_node
                 elif isinstance(val, bool):
                     bl_mat_instance[prop_name] = val
                 report_fn({'INFO'}, f"  Stored {grp_sock} = {val} as custom property '{prop_name}'")
-    # Handle alpha transparency - only connect if texture has meaningful alpha data
+    # FIX: same class of bug fixed earlier in material_utils.py (capture import) -
+    # this was connecting Albedo's alpha to Opacity based purely on pixel-variance
+    # (has_meaningful_alpha), ignoring the material's actual enable_opacity flag
+    # entirely. That silently reconnected alpha on materials where it had been
+    # correctly left disconnected (enable_opacity=False), any time this mod
+    # material's shader block ran - even when this particular mod override
+    # doesn't author anything about opacity at all (e.g. a normal+roughness-only
+    # patch), which is a PATCH context: if this mod material doesn't mention
+    # opacity, leave the (copied-from-original) Opacity socket exactly as-is.
+    def _get_bare_or_prefixed(name):
+        val, _ = get_mod_input_value_util(shader_prim_instance, name)
+        if val is None:
+            val, _ = get_mod_input_value_util(shader_prim_instance, f"inputs:{name}")
+        return val
+
+    usd_enable_opacity = _get_bare_or_prefixed("enable_opacity")
     from .texture_utils import has_meaningful_alpha
     op_s, alb_s = main_shader_node_instance.inputs.get("Opacity"), main_shader_node_instance.inputs.get("Albedo Color")
-    if op_s and not op_s.is_linked and alb_s and alb_s.is_linked:
-        alb_n = alb_s.links[0].from_node
-        if (alb_n.type == 'TEX_IMAGE' and 'Alpha' in alb_n.outputs and 
-            alb_n.image and has_meaningful_alpha(alb_n.image)): 
-            links.new(alb_n.outputs['Alpha'], op_s)
-            print(f"  Connected alpha from '{alb_n.image.name}' to opacity - texture has meaningful alpha data")
-        elif alb_n.type == 'TEX_IMAGE' and alb_n.image:
-            print(f"  Skipped alpha connection for '{alb_n.image.name}' - texture has uniform/no meaningful alpha data")
+    if usd_enable_opacity is True:
+        if op_s and not op_s.is_linked and alb_s and alb_s.is_linked:
+            alb_n = alb_s.links[0].from_node
+            if alb_n.type == 'TEX_IMAGE' and 'Alpha' in alb_n.outputs and alb_n.image and has_meaningful_alpha(alb_n.image):
+                links.new(alb_n.outputs['Alpha'], op_s)
+                print(f"  Connected alpha from '{alb_n.image.name}' to opacity - enable_opacity=True")
+    elif usd_enable_opacity is False:
+        if op_s and op_s.is_linked:
+            links.remove(op_s.links[0])
+            print("  Disconnected alpha from opacity - mod material explicitly sets enable_opacity=False")
+    # usd_enable_opacity is None (this mod override doesn't mention opacity at all) -
+    # leave the Opacity socket exactly as inherited from the copied base material.
     em_c, em_i = main_shader_node_instance.inputs.get("Emissive Color"), main_shader_node_instance.inputs.get("Emissive Intensity")
     en_em = main_shader_node_instance.inputs.get("Enable Emission")
-    usd_en_em_result = get_mod_input_value_util(shader_prim_instance, "inputs:enable_emission")
-    usd_en_em = usd_en_em_result[0] if usd_en_em_result else None
+    # FIX: was only trying "inputs:enable_emission" - same bare-vs-prefixed issue as
+    # enable_opacity above, so this likely never matched real captured/mod data either.
+    usd_en_em = _get_bare_or_prefixed("enable_emission")
     expl_dis = isinstance(usd_en_em, bool) and not usd_en_em
     if em_c and em_i and em_c.is_linked and not em_i.is_linked and not expl_dis:
         if not (en_em and isinstance(en_em.default_value, (float, int, bool)) and not en_em.default_value) and em_i.default_value == 0.0: 
             em_i.default_value = 1.0
 
 def create_mod_material_nodes_util(material_usd_path_str, current_mod_stage, 
-                                   texture_res_context_path_p, mod_file_path_for_tex_p, report_fn):
+                                   texture_res_context_path_p, mod_file_path_for_tex_p, report_fn,
+                                   existing_bl_material_param=None):
     mat_prim = current_mod_stage.GetPrimAtPath(material_usd_path_str)
     if not mat_prim or not mat_prim.IsValid():
         return None, None
@@ -490,7 +536,51 @@ def create_mod_material_nodes_util(material_usd_path_str, current_mod_stage,
                     report_fn({'INFO'}, f"  Detected translucent material: {mat_name}")
                     break
     
-    bl_mat, main_node = create_mod_default_blender_material_util(f"{mat_name}_mod_override", report_fn, is_translucent)
+    target_mat_name = f"{mat_name}_mod_override"
+    expected_group_name = APERTURE_TRANSLUCENT_NODE_GROUP_NAME_CONST if is_translucent else APERTURE_OPAQUE_NODE_GROUP_NAME_CONST
+
+    # FIX: reuse the existing material + shader group from a previous load instead of
+    # always calling bpy.data.materials.new() (which silently created "_mod_override.001",
+    # ".002", ... on every reload, leaving the mesh's actual material behind untouched and
+    # orphaning the old datablocks). If a material with this name already exists and still
+    # has the expected shader group node, update it in place.
+    bl_mat, main_node = None, None
+    existing_mat = bpy.data.materials.get(target_mat_name)
+    if existing_mat and existing_mat.node_tree:
+        for node in existing_mat.node_tree.nodes:
+            if node.type == 'GROUP' and node.node_tree and node.node_tree.name == expected_group_name:
+                bl_mat, main_node = existing_mat, node
+                report_fn({'INFO'}, f"  Reusing existing material '{existing_mat.name}' - updating shader parameters in place")
+                break
+        if not main_node:
+            report_fn({'INFO'}, f"  Existing material '{existing_mat.name}' has a different shader structure (opaque/translucent changed) - rebuilding")
+
+    if not bl_mat:
+        # FIX: mod.usda material overrides are meant to ADD/PATCH specific inputs
+        # (e.g. only normalmap_texture + reflectionroughness_texture) onto the
+        # material the object already has from the capture import - not replace
+        # it wholesale. process_pbr below already only touches sockets that are
+        # actually authored in the mod's shader prim, so as long as we START
+        # from a copy of the object's EXISTING (capture-imported) material - with
+        # its diffuse/albedo already wired - instead of a blank default, whatever
+        # isn't mentioned in this mod material (like diffuse here) stays intact.
+        if existing_bl_material_param and existing_bl_material_param.node_tree:
+            for node in existing_bl_material_param.node_tree.nodes:
+                if node.type == 'GROUP' and node.node_tree and node.node_tree.name == expected_group_name:
+                    bl_mat = existing_bl_material_param.copy()
+                    bl_mat.name = target_mat_name
+                    main_node = None
+                    for copied_node in bl_mat.node_tree.nodes:
+                        if copied_node.type == 'GROUP' and copied_node.node_tree and copied_node.node_tree.name == expected_group_name:
+                            main_node = copied_node
+                            break
+                    report_fn({'INFO'}, f"  Basing '{target_mat_name}' on the object's existing material '{existing_bl_material_param.name}' (patching only what mod.usda specifies)")
+                    break
+            if not bl_mat:
+                report_fn({'INFO'}, f"  Existing object material '{existing_bl_material_param.name}' has a different shader structure (opaque/translucent changed) - starting fresh")
+
+    if not bl_mat:
+        bl_mat, main_node = create_mod_default_blender_material_util(target_mat_name, report_fn, is_translucent)
     
     # Try to get shader prim - either via surface output or direct child
     shader_prim = None
@@ -533,7 +623,8 @@ def get_or_create_mod_instance_material_util(base_material_usd_path, instance_pr
                                              texture_res_context_path_p, mod_file_path_for_tex_p, 
                                              mod_base_material_node_cache_param, # Specific cache for (mat, node) tuples
                                              local_material_cache_param, # Cache for final Blender materials
-                                             report_fn):
+                                             report_fn,
+                                             existing_bl_material_param=None):
     instance_metadata = {}
     if instance_prim_for_metadata:
         over_mesh_in_mod = instance_prim_for_metadata.GetChild("mesh")
@@ -547,7 +638,8 @@ def get_or_create_mod_instance_material_util(base_material_usd_path, instance_pr
     bl_mat_base_tuple = mod_base_material_node_cache_param.get(base_material_usd_path)
     if not bl_mat_base_tuple:
         bl_mat_base_tuple = create_mod_material_nodes_util(base_material_usd_path, current_mod_stage, 
-                                                             texture_res_context_path_p, mod_file_path_for_tex_p, report_fn)
+                                                             texture_res_context_path_p, mod_file_path_for_tex_p, report_fn,
+                                                             existing_bl_material_param=existing_bl_material_param)
         if not bl_mat_base_tuple or not bl_mat_base_tuple[0]:
              report_fn({'ERROR'}, f"Failed to create base material structure for mod override: {base_material_usd_path}")
              return None

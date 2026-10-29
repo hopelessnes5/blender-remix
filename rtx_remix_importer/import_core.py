@@ -295,17 +295,44 @@ def get_transform_matrix(usd_prim, context):
 
 
 def get_remix_metadata(usd_instance_prim):
-    """Extract the _remix_metadata dictionary from an instance prim."""
+    """Extract captured alpha/blend render-state metadata from an instance prim.
+
+    FIX: this only ever looked under the "primvars:_remix_metadata" namespace on
+    the prim's "mesh" child. Inspecting a real capture's raw string table shows
+    the actual authored properties live directly on the mesh prim under a plain
+    "metadata:" namespace (e.g. "metadata:alphaTestEnabled",
+    "metadata:alphaTestReferenceValue", blend-factor/op attributes, etc.) - a
+    completely different location, which is why instance_metadata was always
+    coming back empty and apply_metadata_overrides() never fired for this
+    capture format. Check both the prim itself and its "mesh" child, and try
+    both namespaces so older captures that do use "primvars:_remix_metadata"
+    keep working too.
+    """
     metadata = {}
+    candidate_prims = [usd_instance_prim.GetPrim()]
     over_mesh = usd_instance_prim.GetPrim().GetChild("mesh")
     if over_mesh:
-        for prop in over_mesh.GetAuthoredPropertiesInNamespace("primvars:_remix_metadata"):
-            key = prop.GetBaseName()
-            value = prop.Get()
-            if value is not None:
-                metadata[key] = value
-        if metadata:
-            print(f"  Found _remix_metadata on {usd_instance_prim.GetPath()}: {list(metadata.keys())}")
+        candidate_prims.append(over_mesh)
+
+    for candidate_prim in candidate_prims:
+        for namespace in ("metadata", "primvars:_remix_metadata"):
+            for prop in candidate_prim.GetAuthoredPropertiesInNamespace(namespace):
+                key = prop.GetBaseName()
+                value = prop.Get()
+                if value is not None and key not in metadata:
+                    metadata[key] = value
+
+    if metadata:
+        print(f"  Found capture metadata on {usd_instance_prim.GetPath()}: {list(metadata.keys())}")
+    else:
+        # Diagnostic fallback: if neither known namespace matched, log any
+        # authored property that looks alpha/blend-related so the real
+        # namespace/name can be identified instead of guessing again.
+        for candidate_prim in candidate_prims:
+            for prop in candidate_prim.GetAuthoredProperties():
+                name_lower = prop.GetName().lower()
+                if 'alpha' in name_lower or 'blend' in name_lower:
+                    print(f"  [diagnostic] Unrecognized alpha/blend property on {candidate_prim.GetPath()}: {prop.GetName()} = {prop.Get()}")
     return metadata
 
 

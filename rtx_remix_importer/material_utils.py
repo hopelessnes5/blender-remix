@@ -625,7 +625,7 @@ def create_material(usd_material_path, usd_stage, usd_file_path_context):
         if "AperturePBR_Translucent" in mdl_asset_str:
             is_translucent = True
             print("Material identified as AperturePBR_Translucent")
-    
+
     # Create appropriate Blender material based on type
     if is_translucent:
         bl_material, main_shader_node = create_translucent_blender_material(unique_material_name)
@@ -880,20 +880,42 @@ def process_pbr(shader, bl_material, shader_node, usd_file_path_context):
                 processed_texture = True # Mark that a texture was processed
 
 
-    # --- Alpha / Transparency Handling (for Aperture Opaque) ---
-    # Only connect alpha to opacity if the texture actually has meaningful alpha data
+    # --- Alpha / Transparency Handling ---
+    # FIX (v2): earlier attempt gated this on per-instance _remix_metadata
+    # (alphaBlendEnabled/alphaTestEnabled), which isn't always present, causing
+    # real transparency to go missing. The actual, reliable signal is simpler and
+    # lives right on the material's shader: RTX Remix captures author
+    # `inputs:enable_opacity` (bool) - the same pattern already used below for
+    # `inputs:enable_emission`. Use that as the source of truth instead of
+    # guessing from either per-instance metadata or pixel variance alone.
     opacity_socket = shader_node.inputs.get("Opacity")
-    albedo_socket = shader_node.inputs.get("Albedo Color") # Assuming "Albedo Color" is the new name
+    albedo_socket = shader_node.inputs.get("Albedo Color")
+    usd_enable_opacity_val = get_input_value(shader, "inputs:enable_opacity")
+    # FIX (v3): "alpha on everything" regression. Two things rolled back here:
+    # 1) force_opacity (AperturePBR_Opacity.mdl detection) is removed - per the
+    #    real .mdl source, AperturePBR_Opacity is an authoring/ingestion-time
+    #    convenience shader (used by the material converter), not something
+    #    captured game materials reference; captures use AperturePBR_Model
+    #    directly with enable_opacity as a real per-material bool. Gating on the
+    #    mdl asset string was producing false positives.
+    # 2) the enable_opacity check is now strict (`is True`) rather than merely
+    #    truthy, in case an unauthored input resolves to some non-bool truthy
+    #    sentinel via NDR/MDL schema defaults rather than a real Python bool -
+    #    logged below so this can be confirmed precisely if it still misfires.
+    if usd_enable_opacity_val is not None and not isinstance(usd_enable_opacity_val, bool):
+        print(f"  [diagnostic] inputs:enable_opacity on '{shader.GetPrim().GetPath()}' resolved to non-bool value: {usd_enable_opacity_val!r} (type={type(usd_enable_opacity_val).__name__})")
+    should_use_alpha_opacity = usd_enable_opacity_val is True
 
-    if opacity_socket and not opacity_socket.is_linked and albedo_socket and albedo_socket.is_linked:
+    if should_use_alpha_opacity and opacity_socket and not opacity_socket.is_linked and albedo_socket and albedo_socket.is_linked:
         albedo_node = albedo_socket.links[0].from_node
         if albedo_node.type == 'TEX_IMAGE' and 'Alpha' in albedo_node.outputs and albedo_node.image:
-            # Check if the texture actually has meaningful alpha data
             if has_meaningful_alpha(albedo_node.image):
-                print(f"  Connecting Alpha from Albedo Color texture ('{albedo_node.image.name}') to Opacity input - texture has meaningful alpha data.")
+                print(f"  Connecting Alpha from Albedo Color texture ('{albedo_node.image.name}') to Opacity (enable_opacity={usd_enable_opacity_val})")
                 links.new(albedo_node.outputs['Alpha'], opacity_socket)
             else:
-                print(f"  Skipping Alpha connection for Albedo Color texture ('{albedo_node.image.name}') - texture has uniform/no meaningful alpha data.")
+                print(f"  Skipping alpha connection for '{albedo_node.image.name}' - enable_opacity=True but texture alpha is uniform")
+    elif opacity_socket and not opacity_socket.is_linked:
+        print(f"  Not connecting alpha to Opacity - inputs:enable_opacity is not True on this material ({usd_enable_opacity_val!r})")
 
     # --- Emission Strength (if "Enable Emission" is a property of the node group and is true) ---
     # This logic assumes "Emissive Color" and "Emissive Intensity" are inputs,
@@ -1153,10 +1175,18 @@ def apply_metadata_overrides(metadata, bl_material, shader_node):
                 print(f"      TextureColorOperation: MODULATE detected for '{target_socket_name}' - using direct texture connection (no multiply node)")
 
     # --- Handle Alpha Operation --- #
-    if tex_alpha_op == 1: # D3DTOP_SELECTARG1 (Use texture alpha)
-        # Target "Opacity" on Aperture Opaque, or "Alpha" on Principled BSDF
+    # FIX: this is now gated primarily by the CAPTURED render state
+    # (alphaBlendEnabled / alphaTestEnabled - the game's actual fixed-function alpha
+    # test/blend flags at capture time), not just by textureAlphaOperation being
+    # exactly D3DTOP_SELECTARG1. Many captures set blend/test enabled without
+    # populating textureAlphaOperation at all; requiring == 1 silently skipped those.
+    # has_meaningful_alpha() is still used as a secondary sanity check so we don't
+    # connect a flat/constant alpha channel even when blending is nominally on.
+    uses_alpha_transparency = alpha_blend_enabled or alpha_test_enabled
+    alpha_op_selects_texture = tex_alpha_op is None or tex_alpha_op == 1  # 1 = D3DTOP_SELECTARG1 (use texture alpha)
+
+    if uses_alpha_transparency and alpha_op_selects_texture:
         alpha_target_socket_name = "Opacity" if shader_node.type == 'GROUP' else "Alpha"
-        # Source of alpha is usually from the Albedo/BaseColor texture
         color_source_socket_name = "Albedo Color" if shader_node.type == 'GROUP' else "Base Color"
 
         alpha_socket = shader_node.inputs.get(alpha_target_socket_name)
@@ -1168,10 +1198,12 @@ def apply_metadata_overrides(metadata, bl_material, shader_node):
             if incoming_node.type == 'TEX_IMAGE' and 'Alpha' in incoming_node.outputs and incoming_node.image:
                 # Check if the texture actually has meaningful alpha data
                 if has_meaningful_alpha(incoming_node.image):
-                    print(f"      Applying TextureAlphaOperation: SELECTARG1 (Connecting Texture Alpha to '{alpha_target_socket_name}') - texture has meaningful alpha data")
+                    print(f"      Connecting texture alpha to '{alpha_target_socket_name}' - capture render state uses alpha transparency (blend={alpha_blend_enabled}, test={alpha_test_enabled})")
                     links.new(incoming_node.outputs['Alpha'], alpha_socket)
                 else:
-                    print(f"      Skipping TextureAlphaOperation: SELECTARG1 for '{alpha_target_socket_name}' - texture has uniform/no meaningful alpha data")
+                    print(f"      Skipping alpha connection for '{alpha_target_socket_name}' - texture alpha is uniform despite blend/test being enabled")
+    elif shader_node.inputs.get("Opacity" if shader_node.type == 'GROUP' else "Alpha") is not None:
+        print(f"      Not connecting alpha - capture render state doesn't use alpha transparency here (blend={alpha_blend_enabled}, test={alpha_test_enabled}, textureAlphaOp={tex_alpha_op})")
 
 
     print(f"      TODO: Implement handling for textureColorOp={tex_color_op}, textureAlphaOp={tex_alpha_op}")

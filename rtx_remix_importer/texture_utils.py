@@ -138,6 +138,10 @@ def load_texture(file_path, is_normal=False, is_non_color=False):
                     image.colorspace_settings.name = 'sRGB'
                     print(f"      Set colorspace to sRGB")
 
+                # FIX: treat channels as independent packed data rather than
+                # assuming alpha is always transparency (see texture_loader.py).
+                image.alpha_mode = 'CHANNEL_PACKED'
+
                 # Handle DDS mip maps if supported by Blender
                 if file_path.lower().endswith('.dds'):
                     image.use_generated_mipmap = True

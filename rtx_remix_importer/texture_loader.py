@@ -98,6 +98,13 @@ def _load_standard_texture(
             image.colorspace_settings.name = 'Non-Color'
         else:
             image.colorspace_settings.name = 'sRGB'
+
+        # FIX: default alpha_mode ('STRAIGHT') tells Blender the alpha channel IS
+        # transparency and premultiplies/interprets it accordingly for display and
+        # certain node evaluations. Old-game textures often pack unrelated data
+        # (specular, gloss, etc.) into alpha, so treat every channel as independent
+        # packed data and let the material graph decide what the alpha means.
+        image.alpha_mode = 'CHANNEL_PACKED'
         
         return image
         
@@ -126,6 +133,10 @@ def _load_dds_texture(
             image.colorspace_settings.name = 'sRGB'
         
         print(f"Direct DDS loading successful: {os.path.basename(texture_path)}")
+
+        # FIX: see _load_standard_texture - treat channels as independent packed data.
+        image.alpha_mode = 'CHANNEL_PACKED'
+
         return image
         
     except Exception as direct_error:
@@ -217,6 +228,9 @@ def _create_placeholder_texture(
         image.colorspace_settings.name = 'Non-Color'
     else:
         image.colorspace_settings.name = 'sRGB'
+    
+    # FIX: see _load_standard_texture - treat channels as independent packed data.
+    image.alpha_mode = 'CHANNEL_PACKED'
     
     print(f"Created placeholder texture for: {os.path.basename(original_path)}")
     return image
