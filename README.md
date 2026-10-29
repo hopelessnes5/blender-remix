@@ -1,5 +1,6 @@
 > This project uses AI-generated code.
 
+**English** · [Русский](docs/README_ru.md)
 # Remix Toolkit for Blender
 
 A Blender add-on that imports RTX Remix captures and exports meshes, materials and lights back into a Remix mod (`mod.usda`).
