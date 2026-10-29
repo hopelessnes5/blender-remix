@@ -119,9 +119,10 @@ class ShaderSetup:
         shader_output = UsdShade.Shader(shader_prim).CreateOutput("out", Sdf.ValueTypeNames.Token)
         shader_output.SetRenderType("material")
         
-        material_api.CreateSurfaceOutput("mdl:surface").ConnectToSource(shader_output)
-        material_api.CreateDisplacementOutput("mdl:displacement").ConnectToSource(shader_output)
-        material_api.CreateVolumeOutput("mdl:volume").ConnectToSource(shader_output)
+        # The argument is a render context: "mdl" produces `outputs:mdl:surface`.
+        material_api.CreateSurfaceOutput("mdl").ConnectToSource(shader_output)
+        material_api.CreateDisplacementOutput("mdl").ConnectToSource(shader_output)
+        material_api.CreateVolumeOutput("mdl").ConnectToSource(shader_output)
     
     @staticmethod
     def setup_shader_attributes(shader_prim: Usd.Prim, mdl_name: str = "AperturePBR_Opacity"):

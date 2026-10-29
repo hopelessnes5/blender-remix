@@ -18,7 +18,11 @@ except ImportError:
     USD_AVAILABLE = False
 
 from .. import constants
-from ..core_utils import calc_normals_split_compatible, to_mesh_clear_compatible
+from ..core_utils import (
+    calc_normals_split_compatible,
+    get_corner_normals_compatible,
+    to_mesh_clear_compatible,
+)
 
 # --- Helper Functions ---
 
@@ -125,6 +129,518 @@ def resolve_anchor_prim_path(anchor_obj):
             return '/'.join(path_parts[:i+1])
     return raw_path
 
+
+# --- RTX Remix naming / authoring constants ---------------------------------
+# Mirrors `lightspeed.common.constants` and
+# `lightspeed.trex.asset_replacements.core.shared` so the files written here are
+# structurally identical to the ones produced by the official Toolkit.
+REMIX_MESH_PREFIX = "mesh_"
+REMIX_INSTANCE_PREFIX = "inst_"
+REMIX_REF_PREFIX = "ref_"
+REMIX_IS_REF_ATTR = "IsRemixRef"
+REMIX_ROOT_NODE = "/RootNode"
+REMIX_MESHES_PATH = REMIX_ROOT_NODE + "/meshes"
+REMIX_INSTANCES_PATH = REMIX_ROOT_NODE + "/instances"
+REMIX_LOOKS_PATH = REMIX_ROOT_NODE + "/Looks"
+REMIX_REFERENCE_TARGET = "/ReferenceTarget"
+# Ingested mesh asset layout: /ReferenceTarget/Looks/<material> and
+# /ReferenceTarget/XForms/<mesh> (see asset_pipeline meta step).
+ASSET_LOOKS_PATH = REMIX_REFERENCE_TARGET + "/Looks"
+
+# Remix asset hashes are 16 uppercase hex characters captured from the game,
+# e.g. `mesh_1A2B3C4D5E6F7A8B` / `inst_1A2B3C4D5E6F7A8B_0`.
+_REMIX_HASH_RE = re.compile(r"^(?:mesh|inst|light|mat)_([A-Z0-9]{16})(?:_[0-9]+)?$")
+
+_GAME_STAGE_CACHE = {}
+
+
+def remix_new_hash():
+    """Return a new 16 character uppercase hex hash as used in Remix prim names."""
+    import uuid
+    return uuid.uuid4().hex[:16].upper()
+
+
+def remix_new_ref_name():
+    """Return a new `ref_<32 hex>` holder name, as the Toolkit authors it."""
+    import uuid
+    return REMIX_REF_PREFIX + uuid.uuid4().hex
+
+
+def remix_hash_from_prim_path(prim_path):
+    """Extract the 16 character Remix hash from a prim path, if there is one."""
+    if not prim_path:
+        return None
+    for part in str(prim_path).split("/"):
+        match = _REMIX_HASH_RE.match(part)
+        if match:
+            return match.group(1)
+    return None
+
+
+def remix_mesh_prim_path(prim_path):
+    """Resolve the Remix mesh prototype prim (`/RootNode/meshes/mesh_<HASH>`).
+
+    Accepts a prototype path, an instance path (`inst_<HASH>_N`) or any prim
+    below one of them. Returns None when the path carries no Remix hash.
+    """
+    hash_str = remix_hash_from_prim_path(prim_path)
+    if not hash_str:
+        return None
+    return "%s/%s%s" % (REMIX_MESHES_PATH, REMIX_MESH_PREFIX, hash_str)
+
+
+def usd_matrix_to_blender(gf_matrix):
+    """Convert a row major `Gf.Matrix4d` into a Blender (column vector) matrix."""
+    m = gf_matrix
+    return mathutils.Matrix((
+        (m[0][0], m[1][0], m[2][0], m[3][0]),
+        (m[0][1], m[1][1], m[2][1], m[3][1]),
+        (m[0][2], m[1][2], m[2][2], m[3][2]),
+        (m[0][3], m[1][3], m[2][3], m[3][3]),
+    ))
+
+
+def get_game_stage(context):
+    """Open and cache the stage of the loaded mod file.
+
+    The export target can be a sublayer opened on its own, but the capture layer
+    (and with it every captured transform) only exists in the composed mod
+    stage. That stage is queried read only.
+    """
+    try:
+        mod_path = bpy.path.abspath(context.scene.remix_mod_file_path or "")
+    except Exception:
+        mod_path = ""
+    if not mod_path or not os.path.exists(mod_path):
+        return None
+    key = os.path.normcase(os.path.abspath(mod_path))
+    if key in _GAME_STAGE_CACHE:
+        return _GAME_STAGE_CACHE[key]
+    stage = None
+    try:
+        stage = Usd.Stage.Open(mod_path)
+    except Exception as e:
+        print("  WARNING: could not open mod stage %s: %s" % (mod_path, e))
+    _GAME_STAGE_CACHE[key] = stage
+    return stage
+
+
+def get_prim_world_matrix(stage, prim_path):
+    """World matrix of a prim converted to Blender space, or None."""
+    if stage is None or not prim_path:
+        return None
+    try:
+        prim = stage.GetPrimAtPath(prim_path)
+        if not prim:
+            return None
+        cache = UsdGeom.XformCache(Usd.TimeCode.Default())
+        return usd_matrix_to_blender(cache.GetLocalToWorldTransform(prim))
+    except Exception as e:
+        print("  WARNING: could not read the transform of %s: %s" % (prim_path, e))
+        return None
+
+
+def set_identity_remix_xform(prim):
+    """Author the identity translate/rotateXYZ/scale trio Remix replacements use."""
+    xformable = UsdGeom.Xformable(prim)
+    xformable.ClearXformOpOrder()
+    translate_op = xformable.AddTranslateOp(UsdGeom.XformOp.PrecisionDouble)
+    translate_op.Set(Gf.Vec3d(0.0, 0.0, 0.0))
+    rotate_op = xformable.AddRotateXYZOp(UsdGeom.XformOp.PrecisionFloat)
+    rotate_op.Set(Gf.Vec3f(0.0, 0.0, 0.0))
+    scale_op = xformable.AddScaleOp(UsdGeom.XformOp.PrecisionFloat)
+    scale_op.Set(Gf.Vec3f(1.0, 1.0, 1.0))
+    xformable.SetXformOpOrder([translate_op, rotate_op, scale_op])
+
+
+def bind_material_on_prim(prim, material_prim, strength="weakerThanDescendants"):
+    """Bind a material the way USD stores it: `bindMaterialAs` is metadata on the
+    `material:binding` relationship, not an attribute."""
+    if not prim or not material_prim:
+        return False
+    UsdShade.MaterialBindingAPI.Apply(prim)
+    binding_strength = getattr(UsdShade.Tokens, strength, None)
+    if binding_strength is None:
+        binding_strength = UsdShade.Tokens.weakerThanDescendants
+    UsdShade.MaterialBindingAPI(prim).Bind(
+        UsdShade.Material(material_prim), bindingStrength=binding_strength
+    )
+    return True
+
+
+def resolve_replacement_target(context, obj, anchor_obj=None):
+    """Resolve the captured Remix mesh an exported object replaces.
+
+    Returns `(game_stage, mesh_prim_path, instance_world_matrix)`.
+    `mesh_prim_path` is None when the object has to be added as a new Remix mesh.
+    """
+    game_stage = get_game_stage(context)
+    candidates = []
+    if anchor_obj is not None:
+        candidates.append(("target mesh", resolve_anchor_prim_path(anchor_obj)))
+    if obj is not None:
+        candidates.append(("object", resolve_anchor_prim_path(obj)))
+
+    for source, raw_path in candidates:
+        mesh_path = remix_mesh_prim_path(raw_path)
+        if not mesh_path:
+            continue
+        if game_stage is not None and not game_stage.GetPrimAtPath(mesh_path):
+            print("  %s prim %s is not part of the loaded mod - skipping" % (source, mesh_path))
+            continue
+        instance_world = None
+        if obj is not None:
+            instance_path = obj.get("usd_instance_path")
+            if instance_path:
+                instance_world = get_prim_world_matrix(game_stage, instance_path)
+        print("  Using %s prim %s as the replacement target" % (source, mesh_path))
+        return game_stage, mesh_path, instance_world
+
+    return game_stage, None, None
+
+
+def _remove_prim_spec(layer, prim_path):
+    """Delete a prim spec (and its subtree) from a layer."""
+    try:
+        parent_spec = layer.GetPrimAtPath(Sdf.Path(prim_path).GetParentPath())
+        if parent_spec is not None:
+            del parent_spec.nameChildren[Sdf.Path(prim_path).name]
+            return True
+    except Exception as e:
+        print("  WARNING: could not remove %s from %s: %s" % (prim_path, layer.identifier, e))
+    return False
+
+
+def _drop_stale_holder_overrides(edit_layer, holder_path):
+    """Remove overrides written by older versions of this add-on under a holder.
+
+    Earlier versions stored the placement of the replacement as
+    `over <holder>/XForms { xformOp... }`; that would displace the geometry once
+    the placement is authored properly, so it has to go.
+    """
+    holder_spec = edit_layer.GetPrimAtPath(Sdf.Path(holder_path))
+    if holder_spec is None:
+        return
+    stale = [child.path for child in holder_spec.nameChildren if child.name == "XForms"]
+    for path in stale:
+        print("  Removing stale override %s written by an earlier version" % path)
+        _remove_prim_spec(edit_layer, path)
+
+
+def _reuse_or_create_ref_holder(stage, mesh_path, edit_layer):
+    """Return the `ref_...` child of a mesh prim, reusing what is already there.
+
+    Repeated exports must not stack holders up: every extra `ref_` child would
+    render another copy of the replacement geometry.
+    """
+    mesh_spec = edit_layer.GetPrimAtPath(mesh_path)
+    existing = []
+    stale_mesh_xforms = None
+    if mesh_spec is not None:
+        for child in mesh_spec.nameChildren:
+            if child.name.startswith(REMIX_REF_PREFIX):
+                existing.append(child.path)
+            elif child.name == "XForms":
+                stale_mesh_xforms = child.path
+
+    if stale_mesh_xforms is not None:
+        # `XForms` directly under a mesh prim only ever came from older versions
+        # of this add-on; it does not exist in Remix captures.
+        print("  Removing stale override %s written by an earlier version" % stale_mesh_xforms)
+        _remove_prim_spec(edit_layer, stale_mesh_xforms)
+
+    if existing:
+        holder_path = existing[0]
+        for extra in existing[1:]:
+            print("  Removing duplicate replacement holder %s" % extra)
+            _remove_prim_spec(edit_layer, extra)
+        print("  Reusing existing replacement holder %s" % holder_path)
+        return holder_path
+
+    holder_path = mesh_path.AppendPath(remix_new_ref_name())
+    while stage.GetPrimAtPath(holder_path):
+        holder_path = mesh_path.AppendPath(remix_new_ref_name())
+    stage.DefinePrim(holder_path, "Xform")
+    return holder_path
+
+
+def author_mesh_replacement(stage, mesh_prim_path, asset_rel_path, report_fn=print, hide_original=True):
+    """Mask a captured mesh reference and add the Remix `ref_` holder prim.
+
+    This is what
+    `lightspeed.trex.asset_replacements.core.shared.Setup.add_new_reference`
+    does:
+
+        over "mesh_<HASH>" ( references = None )
+        {
+            def Xform "ref_<uuid4hex>" ( prepend references = @asset@ )
+            {
+                custom bool IsRemixRef = 1
+                <identity translate/rotateXYZ/scale + xformOpOrder>
+            }
+        }
+
+    `references = None` masks the capture layer's reference to the captured mesh
+    data, the child `ref_` prim is what Remix and the Toolkit treat as the
+    replacement, and because it is a child of the captured mesh prim it inherits
+    every instance transform for free.
+
+    Returns the holder prim path, or None on failure.
+    """
+    mesh_path = Sdf.Path(mesh_prim_path)
+    over_prim = stage.OverridePrim(mesh_path)
+    if not over_prim:
+        report_fn({'ERROR'}, "Failed to override mesh prim %s" % mesh_path)
+        return None
+
+    if hide_original:
+        # Explicit empty reference list: prints as `references = None` and masks
+        # the weaker layer's reference. Note that `ClearReferences()` would only
+        # drop edits of the current layer and would not mask anything.
+        over_prim.GetReferences().SetReferences([])
+    else:
+        print("  WARNING: 'Hide Target Mesh' is off - the captured geometry will still render")
+
+    edit_layer = stage.GetEditTarget().GetLayer()
+    holder_path = _reuse_or_create_ref_holder(stage, mesh_path, edit_layer)
+    _drop_stale_holder_overrides(edit_layer, holder_path)
+
+    holder_prim = stage.GetPrimAtPath(holder_path)
+    if not holder_prim:
+        report_fn({'ERROR'}, "Failed to create the replacement holder %s" % holder_path)
+        return None
+
+    # Drop whatever this layer authored on the holder before, then prepend the
+    # new reference (prints as `prepend references = @...@`, like the Toolkit).
+    holder_prim.GetReferences().ClearReferences()
+    holder_prim.GetReferences().AddReference(assetPath=asset_rel_path)
+    holder_prim.CreateAttribute(
+        REMIX_IS_REF_ATTR, Sdf.ValueTypeNames.Bool, custom=True
+    ).Set(True)
+    set_identity_remix_xform(holder_prim)
+
+    print("  Authored replacement %s -> %s = @%s@" % (mesh_path, holder_path, asset_rel_path))
+    return holder_path
+
+
+def author_new_remix_mesh(stage, asset_rel_path, report_fn=print):
+    """Add a brand new Remix mesh: `mesh_<HASH>` prototype + `inst_<HASH>_0`.
+
+    Remix only draws geometry that is placed by an `inst_...` prim referencing a
+    `mesh_...` prototype, which is the layout captures use.
+    """
+    hash_str = remix_new_hash()
+
+    stage.OverridePrim(Sdf.Path(REMIX_MESHES_PATH))
+    stage.OverridePrim(Sdf.Path(REMIX_INSTANCES_PATH))
+
+    mesh_path = Sdf.Path("%s/%s%s" % (REMIX_MESHES_PATH, REMIX_MESH_PREFIX, hash_str))
+    mesh_prim = stage.DefinePrim(mesh_path, "Xform")
+    if not mesh_prim:
+        report_fn({'ERROR'}, "Failed to define %s" % mesh_path)
+        return None
+    Usd.ModelAPI(mesh_prim).SetKind("assembly")
+    set_identity_remix_xform(mesh_prim)
+
+    holder_path = mesh_path.AppendPath(remix_new_ref_name())
+    holder_prim = stage.DefinePrim(holder_path, "Xform")
+    holder_prim.GetReferences().AddReference(assetPath=asset_rel_path)
+    holder_prim.CreateAttribute(
+        REMIX_IS_REF_ATTR, Sdf.ValueTypeNames.Bool, custom=True
+    ).Set(True)
+    set_identity_remix_xform(holder_prim)
+
+    instance_path = Sdf.Path("%s/%s%s_0" % (REMIX_INSTANCES_PATH, REMIX_INSTANCE_PREFIX, hash_str))
+    instance_prim = stage.DefinePrim(instance_path, "Xform")
+    instance_prim.GetReferences().AddInternalReference(mesh_path)
+    set_identity_remix_xform(instance_prim)
+
+    print("  Added new Remix mesh     %s (reference @%s@)" % (mesh_path, asset_rel_path))
+    print("  Added new Remix instance %s" % instance_path)
+    return mesh_path
+
+
+def _prepare_ingested_asset_layer(stage, context, up_axis):
+    """Reset an ingested mesh asset layer and apply the Remix layer metadata."""
+    layer = stage.GetRootLayer()
+    layer.Clear()
+    try:
+        game_name = context.scene.remix_game_name
+    except Exception:
+        game_name = "Unknown Game"
+    layer.customLayerData = {
+        'lightspeed_game_name': game_name,
+        'lightspeed_layer_type': "data",
+    }
+    layer.comment = "Generated by RTX Remix Toolkit"
+    layer.startTimeCode = 0
+    layer.endTimeCode = 100
+    layer.timeCodesPerSecond = 24
+    UsdGeom.SetStageUpAxis(stage, up_axis)
+    UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+
+
+def create_asset_default_material(stage, mesh_prim_path, mesh_name):
+    """Author the fallback AperturePBR_Opacity material an ingested mesh needs.
+
+    The ingest pipeline always guarantees a bound AperturePBR material
+    (`DefaultMaterial` / `MaterialShaders` in model_ingestion.json).
+    """
+    mat_path = Sdf.Path(ASSET_LOOKS_PATH).AppendPath("%s__" % mesh_name)
+    material_prim = stage.DefinePrim(mat_path, "Material")
+    shader_prim = stage.DefinePrim(mat_path.AppendPath("Shader"), "Shader")
+
+    shader_prim.CreateAttribute("info:implementationSource", Sdf.ValueTypeNames.Token).Set("sourceAsset")
+    shader_prim.CreateAttribute("info:mdl:sourceAsset", Sdf.ValueTypeNames.Asset).Set(
+        Sdf.AssetPath("AperturePBR_Opacity.mdl")
+    )
+    shader_prim.CreateAttribute("info:mdl:sourceAsset:subIdentifier", Sdf.ValueTypeNames.Token).Set(
+        "AperturePBR_Opacity"
+    )
+
+    shader_output = UsdShade.Shader(shader_prim).CreateOutput("out", Sdf.ValueTypeNames.Token)
+    shader_output.SetRenderType("material")
+
+    material_api = UsdShade.Material(material_prim)
+    material_api.CreateSurfaceOutput("mdl").ConnectToSource(shader_output)
+    material_api.CreateDisplacementOutput("mdl").ConnectToSource(shader_output)
+    material_api.CreateVolumeOutput("mdl").ConnectToSource(shader_output)
+
+    mesh_prim = stage.GetPrimAtPath(mesh_prim_path)
+    if mesh_prim:
+        bind_material_on_prim(mesh_prim, material_prim)
+    print("  Defined default material %s" % mat_path)
+    return mat_path
+
+
+def write_ingested_mesh_asset(stage, obj, context, mesh_name_sanitized, points_matrix, bl_mat,
+                              inherit_material, project_root, mesh_file_path, up_axis,
+                              report_fn=print):
+    """Write an ingested mesh asset the way the Remix ingest pipeline does.
+
+    Structure (asset_pipeline meta step + model_ingestion.json):
+
+        /ReferenceTarget            Xform, kind=group, defaultPrim
+            /Looks                  Scope
+                /<name>__           Material + Shader
+            /XForms                 Xform, kind=group
+                /<mesh name>        Mesh, MaterialBindingAPI, bound to the material
+
+    Returns `(mesh_prim_path, material_path)` or None on failure.
+    """
+    _prepare_ingested_asset_layer(stage, context, up_axis)
+
+    ref_target_path = Sdf.Path(REMIX_REFERENCE_TARGET)
+    xforms_path = ref_target_path.AppendPath("XForms")
+    looks_path = Sdf.Path(ASSET_LOOKS_PATH)
+    mesh_prim_path = xforms_path.AppendPath(mesh_name_sanitized)
+
+    ref_target_prim = UsdGeom.Xform.Define(stage, ref_target_path).GetPrim()
+    Usd.ModelAPI(ref_target_prim).SetKind("group")
+    set_identity_remix_xform(ref_target_prim)
+
+    xforms_prim = UsdGeom.Xform.Define(stage, xforms_path).GetPrim()
+    Usd.ModelAPI(xforms_prim).SetKind("group")
+    set_identity_remix_xform(xforms_prim)
+
+    stage.DefinePrim(looks_path, "Scope")
+
+    mesh_prim = stage.DefinePrim(mesh_prim_path, "Mesh")
+    if not mesh_prim:
+        report_fn({'ERROR'}, "Failed to define mesh prim %s" % mesh_prim_path)
+        return None
+    mesh_api = UsdGeom.Mesh(mesh_prim)
+    UsdShade.MaterialBindingAPI.Apply(mesh_prim)
+
+    try:
+        depsgraph = context.evaluated_depsgraph_get()
+        eval_obj = obj.evaluated_get(depsgraph)
+        mesh_data = eval_obj.to_mesh()
+    except Exception as e:
+        report_fn({'ERROR'}, "Failed to get evaluated mesh for %s: %s" % (obj.name, e))
+        return None
+
+    try:
+        if not mesh_data.vertices or not mesh_data.polygons:
+            report_fn({'WARNING'}, "Skipping mesh %s: no vertices or polygons." % obj.name)
+            return None
+
+        normal_matrix = points_matrix.to_3x3().inverted_safe().transposed()
+
+        points = []
+        for vertex in mesh_data.vertices:
+            co = points_matrix @ vertex.co
+            points.append((co[0], co[1], co[2]))
+        mesh_api.CreatePointsAttr().Set(Vt.Vec3fArray(points))
+
+        face_vertex_counts = [len(poly.vertices) for poly in mesh_data.polygons]
+        face_vertex_indices = [index for poly in mesh_data.polygons for index in poly.vertices]
+        mesh_api.CreateFaceVertexCountsAttr().Set(Vt.IntArray(face_vertex_counts))
+        mesh_api.CreateFaceVertexIndicesAttr().Set(Vt.IntArray(face_vertex_indices))
+        mesh_api.CreateOrientationAttr().Set(UsdGeom.Tokens.rightHanded)
+        mesh_api.CreateDoubleSidedAttr().Set(False)
+        # Without an authored subdivisionScheme USD falls back to catmullClark
+        # and the replacement geometry gets subdivided in any conforming consumer.
+        mesh_api.CreateSubdivisionSchemeAttr().Set(UsdGeom.Tokens.none)
+        if points:
+            extent_min = Gf.Vec3f(*[min(p[axis] for p in points) for axis in range(3)])
+            extent_max = Gf.Vec3f(*[max(p[axis] for p in points) for axis in range(3)])
+            mesh_api.CreateExtentAttr().Set(Vt.Vec3fArray([extent_min, extent_max]))
+
+        if mesh_data.uv_layers and mesh_data.uv_layers.active:
+            active_uv_layer = mesh_data.uv_layers.active
+            uv_values = []
+            for loop_index in range(len(mesh_data.loops)):
+                uv = active_uv_layer.data[loop_index].uv
+                uv_values.append((uv[0], uv[1]))
+            if uv_values:
+                uv_primvar = UsdGeom.PrimvarsAPI(mesh_prim).CreatePrimvar(
+                    "st", Sdf.ValueTypeNames.TexCoord2fArray, UsdGeom.Tokens.faceVarying
+                )
+                uv_primvar.Set(Vt.Vec2fArray(uv_values))
+
+        corner_normals = get_corner_normals_compatible(mesh_data)
+        if corner_normals:
+            normal_values = []
+            for normal in corner_normals:
+                n = normal_matrix @ mathutils.Vector((normal[0], normal[1], normal[2]))
+                normal_values.append((n[0], n[1], n[2]))
+            mesh_api.CreateNormalsAttr().Set(Vt.Vec3fArray(normal_values))
+            mesh_api.SetNormalsInterpolation(UsdGeom.Tokens.faceVarying)
+        else:
+            print("  Could not read corner normals - Remix will compute them.")
+
+        material_path = None
+        if inherit_material:
+            print("  [Inherit Parent Material] no material is written into the asset")
+        else:
+            if bl_mat is not None:
+                material_path = export_material(
+                    bl_mat,
+                    stage,
+                    project_root,
+                    mesh_file_path,
+                    obj=obj,
+                    material_scope_path=looks_path,
+                    bind_prim_path=mesh_prim_path,
+                    bind_strength="weakerThanDescendants",
+                    material_name="%s__" % mesh_name_sanitized,
+                )
+            if not material_path:
+                material_path = create_asset_default_material(stage, mesh_prim_path, mesh_name_sanitized)
+
+        stage.SetDefaultPrim(ref_target_prim)
+        stage.GetRootLayer().Save()
+        print("  Saved mesh data to: %s" % mesh_file_path)
+        return mesh_prim_path, material_path
+    except Exception as e:
+        report_fn({'ERROR'}, "Failed to write mesh asset %s: %s" % (mesh_file_path, e))
+        traceback.print_exc()
+        return None
+    finally:
+        to_mesh_clear_compatible(eval_obj)
+
+
 # --- Material Export Helper ---
 
 def get_mesh_name_from_object(obj):
@@ -147,32 +663,66 @@ def get_mesh_name_from_object(obj):
             mesh_name_to_use = mesh_data_name
     return mesh_name_to_use
 
-def export_material(blender_material, sublayer_stage, project_root, sublayer_path, parent_mesh_path=None, obj=None):
-    """Exports material to global /RootNode/Looks where RTX Remix runtime indexes it."""
+def export_material(blender_material, sublayer_stage, project_root, sublayer_path, parent_mesh_path=None, obj=None,
+                    material_scope_path=None, bind_prim_path=None,
+                    bind_strength="weakerThanDescendants", material_name=None):
+    """Export a Blender material into `sublayer_stage`.
+
+    Two destinations are supported, both matching what the RTX Remix Toolkit
+    writes:
+
+    * `material_scope_path` + `bind_prim_path` - material that belongs to an
+      ingested mesh asset (`<asset>/ReferenceTarget/Looks/<name>`, bound on the
+      asset mesh). This is where the material of a replacement mesh lives.
+    * otherwise - a global `/RootNode/Looks/mat_<uuid>` material, used by the
+      material replacement flow and by lights.
+    """
     if not blender_material:
         return None
 
-    print(f"Exporting Material to /RootNode/Looks: {blender_material.name}")
     ensure_mdl_files(project_root)
 
-    looks_path = Sdf.Path("/RootNode/Looks")
-    sublayer_stage.OverridePrim(looks_path)
-    
-    mat_base_name = sanitize_prim_name(blender_material.name)
-    mat_name_sanitized = generate_uuid_name(mat_base_name, prefix="mat_")
-    mat_path = looks_path.AppendPath(mat_name_sanitized)
-    
-    material_prim = sublayer_stage.OverridePrim(mat_path)
-    material_prim.SetTypeName("Material")
-    
+    if material_scope_path is not None:
+        scope_path = Sdf.Path(material_scope_path)
+        if not sublayer_stage.GetPrimAtPath(scope_path):
+            sublayer_stage.DefinePrim(scope_path, "Scope")
+        mat_name_sanitized = sanitize_prim_name(material_name or blender_material.name) or "Material"
+        print(f"Exporting Material to {scope_path}: {blender_material.name}")
+    else:
+        scope_path = Sdf.Path(REMIX_LOOKS_PATH)
+        sublayer_stage.OverridePrim(scope_path)
+        mat_name_sanitized = generate_uuid_name(sanitize_prim_name(blender_material.name), prefix="mat_")
+        print(f"Exporting Material to {scope_path}: {blender_material.name}")
+
+    mat_path = scope_path.AppendPath(mat_name_sanitized)
+    # Inside an asset every prim has to be *defined*, an `over` alone would not
+    # compose once the asset is referenced.
+    if material_scope_path is not None:
+        material_prim = sublayer_stage.DefinePrim(mat_path, "Material")
+    else:
+        material_prim = sublayer_stage.OverridePrim(mat_path)
+        material_prim.SetTypeName("Material")
+
     shader_path = mat_path.AppendPath("Shader")
-    shader_prim = sublayer_stage.OverridePrim(shader_path)
-    shader_prim.SetTypeName("Shader")
+    if material_scope_path is not None:
+        shader_prim = sublayer_stage.DefinePrim(shader_path, "Shader")
+    else:
+        shader_prim = sublayer_stage.OverridePrim(shader_path)
+        shader_prim.SetTypeName("Shader")
+
+    if bind_prim_path is not None:
+        target_prim = sublayer_stage.GetPrimAtPath(bind_prim_path)
+        if target_prim:
+            bind_material_on_prim(target_prim, material_prim, bind_strength)
+            print(f"  Bound {mat_path} to {bind_prim_path} ({bind_strength})")
+        else:
+            print(f"  WARNING: cannot bind material, prim {bind_prim_path} was not found")
 
     material_api = UsdShade.Material(material_prim)
     shader_output = UsdShade.Shader(shader_prim).CreateOutput("out", Sdf.ValueTypeNames.Token)
     shader_output.SetRenderType("material")
-    
+
+    # `Create*Output` takes a render context: "mdl" produces `outputs:mdl:surface`.
     material_api.CreateSurfaceOutput("mdl").ConnectToSource(shader_output)
     material_api.CreateDisplacementOutput("mdl").ConnectToSource(shader_output)
     material_api.CreateVolumeOutput("mdl").ConnectToSource(shader_output)
@@ -763,24 +1313,10 @@ class ExportRemixAsset(Operator):
 
     def export_mesh(self, context, obj, sublayer_stage, project_root, target_sublayer_path):
         print(f"\n--- Exporting Mesh: {obj.name} ---")
-        remix_export_scale = context.scene.remix_export_scale
-
+        remix_export_scale = context.scene.remix_export_scale or 1.0
         anchor_obj = context.scene.remix_anchor_object_target
-        rel_loc = None
-        rel_rot = None
-        rel_scale_vec = None
-
-        if anchor_obj:
-            try:
-                inv_anchor = get_safe_matrix_inverse(anchor_obj.matrix_world)
-                relative_matrix = inv_anchor @ obj.matrix_world
-                rel_loc, rel_rot, rel_scale_vec = relative_matrix.decompose()
-                print(f"  Calculated relative transform to anchor '{anchor_obj.name}': RelLoc={rel_loc[:]}")
-            except Exception as e:
-                print(f"  WARNING: Fallback for relative transform: {e}")
-                rel_loc = obj.location - anchor_obj.location
-                rel_rot = obj.rotation_quaternion if obj.rotation_mode == 'QUATERNION' else obj.rotation_euler.to_quaternion()
-                rel_scale_vec = obj.scale
+        hide_original = getattr(context.scene, "remix_hide_original_mesh", True)
+        inherit_material = getattr(context.scene, "remix_inherit_parent_material", False)
 
         if obj.type == 'MESH' and context.scene.remix_auto_apply_transforms:
             original_selection = context.selected_objects[:]
@@ -804,12 +1340,6 @@ class ExportRemixAsset(Operator):
 
                     if "remix_processed" in obj:
                         del obj["remix_processed"]
-
-                    if anchor_obj:
-                        inv_anchor = get_safe_matrix_inverse(anchor_obj.matrix_world)
-                        relative_matrix = inv_anchor @ obj.matrix_world
-                        rel_loc, rel_rot, rel_scale_vec = relative_matrix.decompose()
-
             except Exception as e:
                 print(f"  WARNING: Failed to apply rotation/scale: {e}")
             finally:
@@ -836,250 +1366,87 @@ class ExportRemixAsset(Operator):
         if obj.material_slots and obj.material_slots[0].material:
             bl_mat = obj.material_slots[0].material
 
-        # --- Export Mesh Geometry File ---
+        # --- Which captured Remix mesh does this object replace? ---------------
+        game_stage, target_mesh_path, target_instance_world = resolve_replacement_target(
+            context, obj, anchor_obj
+        )
+
+        # Geometry is authored in game units and, for a replacement, in the local
+        # space of the mesh prototype being replaced. The prototype is instanced,
+        # so its own space is the only one shared by every instance of it; the
+        # `ref_` holder then stays at identity.
+        points_matrix = mathutils.Matrix.Scale(1.0 / remix_export_scale, 4) @ obj.matrix_world
+        if target_instance_world is not None:
+            points_matrix = get_safe_matrix_inverse(target_instance_world) @ points_matrix
+
+        # --- Ingested mesh asset (geometry + material) -------------------------
         mesh_stage = self.get_or_create_stage(mesh_file_path)
         if not mesh_stage:
             return False
 
-        ref_target_path = Sdf.Path("/ReferenceTarget")
-        xforms_path = ref_target_path.AppendPath("XForms")
-        mesh_prim_path = xforms_path.AppendPath(mesh_name_sanitized)
-
-        ref_target_prim = mesh_stage.DefinePrim(ref_target_path, "Xform")
-        ref_target_prim.SetMetadata(Sdf.PrimSpec.KindKey, "group")
-
-        xforms_prim = mesh_stage.DefinePrim(xforms_path, "Xform")
-        xforms_prim.SetMetadata(Sdf.PrimSpec.KindKey, "group")
-
-        mesh_prim = mesh_stage.DefinePrim(mesh_prim_path, "Mesh")
-        if not mesh_prim:
-            self.report({'ERROR'}, f"Failed to define mesh prim {mesh_prim_path}")
-            return False
-
-        ref_target_xform_api = UsdGeom.XformCommonAPI(ref_target_prim)
-        ref_target_xform_api.SetTranslate(Gf.Vec3d(0, 0, 0), Usd.TimeCode.Default())
-        ref_target_xform_api.SetRotate(Gf.Vec3f(0, 0, 0), UsdGeom.XformCommonAPI.RotationOrderXYZ, Usd.TimeCode.Default())
-        ref_target_xform_api.SetScale(Gf.Vec3f(1, 1, 1), Usd.TimeCode.Default())
-        ref_target_prim.CreateAttribute("xformOpOrder", Sdf.ValueTypeNames.TokenArray).Set(
-            ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
+        up_axis = UsdGeom.GetStageUpAxis(game_stage) if game_stage else UsdGeom.Tokens.z
+        written = write_ingested_mesh_asset(
+            mesh_stage,
+            obj,
+            context,
+            mesh_name_sanitized,
+            points_matrix,
+            bl_mat,
+            inherit_material,
+            project_root,
+            mesh_file_path,
+            up_axis,
+            self.report,
         )
-
-        UsdShade.MaterialBindingAPI.Apply(mesh_prim)
-
-        root_layer = mesh_stage.GetRootLayer()
-        if not context:
-            context = bpy.context
-
-        root_layer.customLayerData = {
-            'lightspeed_game_name': context.scene.remix_game_name,
-            'lightspeed_layer_type': "data",
-        }
-        root_layer.startTimeCode = 0
-        root_layer.endTimeCode = 100
-        root_layer.timeCodesPerSecond = 24
-
-        xforms_prim.CreateAttribute("xformOp:translate", Sdf.ValueTypeNames.Double3).Set(Gf.Vec3d(0, 0, 0))
-        xforms_prim.CreateAttribute("xformOp:rotateXYZ", Sdf.ValueTypeNames.Float3).Set(Gf.Vec3f(0, 0, 0))
-        xforms_prim.CreateAttribute("xformOp:scale", Sdf.ValueTypeNames.Float3).Set(Gf.Vec3f(1, 1, 1))
-        xforms_prim.CreateAttribute("xformOpOrder", Sdf.ValueTypeNames.TokenArray).Set(
-            ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
-        )
-
-        try:
-            depsgraph = context.evaluated_depsgraph_get()
-            eval_obj = obj.evaluated_get(depsgraph)
-            mesh_data = eval_obj.to_mesh()
-        except Exception as e:
-            self.report({'ERROR'}, f"Failed to get evaluated mesh for {obj.name}: {e}")
+        if not written:
             return False
+        asset_mesh_prim_path, material_path = written
 
-        if not mesh_data.vertices or not mesh_data.polygons:
-            self.report({'WARNING'}, f"Skipping mesh {obj.name}: No vertices or polygons.")
-            to_mesh_clear_compatible(eval_obj)
-            return False
+        obj["remix_processed"] = True
+        obj["remix_mesh_file_path"] = mesh_file_path
+        obj["remix_material_path"] = str(material_path) if material_path else ""
 
-        points = [v.co[:] for v in mesh_data.vertices]
-        mesh_prim.CreateAttribute("points", Sdf.ValueTypeNames.Point3fArray).Set(Vt.Vec3fArray(points))
+        # --- Author the replacement in the target layer ------------------------
+        #
+        # Remix mesh replacement is two layer edits on the *captured* prim path
+        # (see lightspeed.trex.asset_replacements.core.shared.Setup.add_new_reference):
+        #
+        #   over "mesh_<HASH>" ( references = None )
+        #   {
+        #       def Xform "ref_<uuid4hex>" ( prepend references = @./assets/ingested/x.usda@ )
+        #       {
+        #           custom bool IsRemixRef = 1
+        #           <identity translate/rotateXYZ/scale + xformOpOrder>
+        #       }
+        #   }
+        #
+        # The holder is a child of the captured mesh prim, so it inherits every
+        # instance transform and needs no transform of its own.
+        relative_mesh_path = get_relative_path(target_sublayer_path, mesh_file_path)
+        if not relative_mesh_path.startswith(("./", "../")):
+            relative_mesh_path = "./" + relative_mesh_path
 
-        face_vertex_counts = [len(p.vertices) for p in mesh_data.polygons]
-        face_vertex_indices = [v for p in mesh_data.polygons for v in p.vertices]
-        mesh_prim.CreateAttribute("faceVertexCounts", Sdf.ValueTypeNames.IntArray).Set(Vt.IntArray(face_vertex_counts))
-        mesh_prim.CreateAttribute("faceVertexIndices", Sdf.ValueTypeNames.IntArray).Set(Vt.IntArray(face_vertex_indices))
-        mesh_prim.CreateAttribute("orientation", Sdf.ValueTypeNames.Token).Set(UsdGeom.Tokens.rightHanded)
-
-        if mesh_data.uv_layers and mesh_data.uv_layers.active:
-            active_uv_layer = mesh_data.uv_layers.active
-            uv_data_flat = [(0.0, 0.0)] * len(mesh_data.loops)
-            for poly in mesh_data.polygons:
-                for loop_index in poly.loop_indices:
-                    uv_data_flat[loop_index] = active_uv_layer.data[loop_index].uv[:]
-            if uv_data_flat:
-                uv_attr = UsdGeom.PrimvarsAPI(mesh_prim).CreatePrimvar("st", Sdf.ValueTypeNames.TexCoord2fArray)
-                uv_attr.Set(Vt.Vec2fArray(uv_data_flat))
-                uv_attr.SetInterpolation(UsdGeom.Tokens.faceVarying)
-
-        try:
-            calc_normals_split_compatible(mesh_data)
-            normals = [l.normal[:] for l in mesh_data.loops]
-            if normals:
-                normals_attr = mesh_prim.CreateAttribute("normals", Sdf.ValueTypeNames.Normal3fArray)
-                normals_attr.Set(Vt.Vec3fArray(normals))
-                normals_attr.SetMetadata("interpolation", UsdGeom.Tokens.faceVarying)
-        except Exception as e:
-            print(f"  Could not export normals: {e}")
-
-        try:
-            mesh_stage.GetRootLayer().Save()
-            obj["remix_processed"] = True
-            obj["remix_mesh_file_path"] = mesh_file_path
-            print(f"  Saved mesh data to: {mesh_file_path}")
-        except Exception as e:
-            self.report({'ERROR'}, f"Failed to save mesh stage {mesh_file_path}: {e}")
-            to_mesh_clear_compatible(eval_obj)
-            return False
-
-        to_mesh_clear_compatible(eval_obj)
-
-        # --- Anchor Resolution and Export into Sublayer ---
-        anchor_path_str = resolve_anchor_prim_path(anchor_obj)
-        
-        # Проверяем, хочет ли пользователь наследовать материал родителя
-        inherit_material = getattr(context.scene, "remix_inherit_parent_material", False)
-        
-        if anchor_obj and anchor_path_str:
-            try:
-                parent_group_path = Sdf.Path(anchor_path_str)
-                over_parent_group = sublayer_stage.OverridePrim(parent_group_path)
-                if not over_parent_group:
-                    self.report({'ERROR'}, f"Failed to override parent group at {parent_group_path}.")
-                    return False
-
-                p = over_parent_group
-                while p and p.GetPath() != Sdf.Path("/"):
-                    p.SetSpecifier(Sdf.SpecifierOver)
-                    p = p.GetParent()
-                print(f"  Ensured 'over' on anchor hierarchy: {parent_group_path}")
-
-                if context.scene.remix_hide_original_mesh:
-                    path_str = str(parent_group_path)
-                    path_parts = path_str.split('/')
-                    mesh_prim_path_str = None
-                    for i, part in enumerate(path_parts):
-                        if part.startswith('mesh_'):
-                            mesh_prim_path_str = '/'.join(path_parts[:i+1])
-                            break
-                    if mesh_prim_path_str:
-                        mesh_prim_path = Sdf.Path(mesh_prim_path_str)
-                        over_mesh_prim = sublayer_stage.OverridePrim(mesh_prim_path)
-                        if over_mesh_prim:
-                            over_mesh_prim.SetSpecifier(Sdf.SpecifierOver)
-                            over_mesh_prim.GetReferences().SetReferences([])
-                            print(f"  Hidden original mesh via references = None on {mesh_prim_path}")
-
-                new_instance_name = generate_uuid_name(sanitize_prim_name(obj.name), prefix="ref_")
-                new_instance_path = parent_group_path.AppendPath(new_instance_name)
-                new_instance_xform_prim = sublayer_stage.DefinePrim(new_instance_path, "Xform")
-
-                relative_mesh_data_path = get_relative_path(target_sublayer_path, mesh_file_path)
-                new_instance_xform_prim.GetReferences().AddReference(assetPath=relative_mesh_data_path)
-                new_instance_xform_prim.CreateAttribute("IsRemixRef", Sdf.ValueTypeNames.Bool, custom=True).Set(True)
-
-                # 1. Экспорт материала в /RootNode/Looks (ТОЛЬКО ЕСЛИ НЕ ВКЛЮЧЕНО НАСЛЕДОВАНИЕ)
-                material_path = None
-                if bl_mat and not inherit_material:
-                    material_path = export_material(bl_mat, sublayer_stage, project_root, target_sublayer_path, parent_mesh_path=None, obj=obj)
-                    if material_path:
-                        obj["remix_material_path"] = str(material_path)
-                        
-                        # 2. ПРИВЯЗКА НА ИНСТАНС:
-                        UsdShade.MaterialBindingAPI.Apply(new_instance_xform_prim)
-                        b_rel_inst = new_instance_xform_prim.CreateRelationship("material:binding")
-                        b_rel_inst.SetTargets([material_path])
-                        new_instance_xform_prim.CreateAttribute("material:binding:bindMaterialAs", Sdf.ValueTypeNames.Token).Set("strongerThanDescendants")
-                elif inherit_material:
-                    print(f"  [Inherit Parent Material] Skipping material export: object will inherit from anchor '{anchor_obj.name}'")
-
-                # 3. Внешний ref_... имеет чистый единичный трансформ
-                new_instance_xform_prim.CreateAttribute(UsdGeom.Tokens.xformOpOrder, Sdf.ValueTypeNames.TokenArray).Set(
-                    ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
-                )
-                new_instance_xform_prim.CreateAttribute("xformOp:translate", Sdf.ValueTypeNames.Double3).Set(Gf.Vec3d(0, 0, 0))
-                new_instance_xform_prim.CreateAttribute("xformOp:rotateXYZ", Sdf.ValueTypeNames.Float3).Set(Gf.Vec3f(0, 0, 0))
-                new_instance_xform_prim.CreateAttribute("xformOp:scale", Sdf.ValueTypeNames.Float3).Set(Gf.Vec3f(1, 1, 1))
-
-                # 4. Внутренний XForms получает честное смещение относительно якоря
-                internal_xforms_group_path = new_instance_path.AppendPath("XForms")
-                over_internal_xforms_group = sublayer_stage.OverridePrim(internal_xforms_group_path)
-
-                local_offset_translate = Gf.Vec3d(
-                    rel_loc[0] * remix_export_scale,
-                    rel_loc[1] * remix_export_scale,
-                    rel_loc[2] * remix_export_scale
-                )
-                local_offset_rotation_deg = Gf.Vec3f(tuple(math.degrees(a) for a in rel_rot.to_euler('XYZ')))
-                local_offset_scale = Gf.Vec3f(rel_scale_vec[0], rel_scale_vec[1], rel_scale_vec[2])
-
-                over_internal_xforms_group.CreateAttribute(UsdGeom.Tokens.xformOpOrder, Sdf.ValueTypeNames.TokenArray).Set(
-                    ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
-                )
-                over_internal_xforms_group.CreateAttribute("xformOp:translate", Sdf.ValueTypeNames.Double3).Set(local_offset_translate)
-                over_internal_xforms_group.CreateAttribute("xformOp:rotateXYZ", Sdf.ValueTypeNames.Float3).Set(local_offset_rotation_deg)
-                over_internal_xforms_group.CreateAttribute("xformOp:scale", Sdf.ValueTypeNames.Float3).Set(local_offset_scale)
-
-                # 5. ПРИВЯЗКА НА МЕШ ВНУТРИ XFORMS (ЕСЛИ НЕ НАСЛЕДУЕТСЯ):
-                if material_path and not inherit_material:
-                    mesh_sub_prim_path = internal_xforms_group_path.AppendPath(mesh_name_sanitized)
-                    over_mesh_sub_prim = sublayer_stage.OverridePrim(mesh_sub_prim_path)
-                    UsdShade.MaterialBindingAPI.Apply(over_mesh_sub_prim)
-                    b_rel_mesh = over_mesh_sub_prim.CreateRelationship("material:binding")
-                    b_rel_mesh.SetTargets([material_path])
-                    over_mesh_sub_prim.CreateAttribute("material:binding:bindMaterialAs", Sdf.ValueTypeNames.Token).Set("strongerThanDescendants")
-                    print(f"  Bound material {material_path} to instance and mesh with strongerThanDescendants")
-
-                print(f"  Exported mesh under anchor {parent_group_path} at RelT={local_offset_translate[:]}")
-
-            except Exception as e:
-                self.report({'ERROR'}, f"Failed to export under anchor: {e}")
-                traceback.print_exc()
+        if target_mesh_path:
+            reference_path = author_mesh_replacement(
+                sublayer_stage,
+                target_mesh_path,
+                relative_mesh_path,
+                self.report,
+                hide_original=hide_original,
+            )
+            if not reference_path:
                 return False
+            obj["remix_reference_prim_path"] = str(reference_path)
+            print(f"  Replacement of {target_mesh_path} authored (asset: {asset_mesh_prim_path})")
         else:
-            self.report({'WARNING'}, f"No Target Mesh selected! Object '{obj.name}' exported to remix_assets and may not render.")
-            remix_assets_path = Sdf.Path("/RootNode/remix_assets")
-            sublayer_stage.OverridePrim(remix_assets_path)
-
-            uuid_style_name = generate_uuid_name(mesh_name_sanitized, prefix="ref_")
-            xform_prim_path = remix_assets_path.AppendPath(uuid_style_name)
-            xform_prim = sublayer_stage.OverridePrim(xform_prim_path)
-
-            if bl_mat:
-                material_path = export_material(bl_mat, sublayer_stage, project_root, target_sublayer_path, parent_mesh_path=None, obj=obj)
-                if material_path:
-                    obj["remix_material_path"] = str(material_path)
-                    UsdShade.MaterialBindingAPI.Apply(xform_prim)
-                    b_rel = xform_prim.CreateRelationship("material:binding")
-                    b_rel.SetTargets([material_path])
-                    xform_prim.CreateAttribute("material:binding:bindMaterialAs", Sdf.ValueTypeNames.Token).Set("strongerThanDescendants")
-
-            xform_prim.CreateAttribute("IsRemixRef", Sdf.ValueTypeNames.Bool, custom=True).Set(True)
-
-            relative_mesh_path = get_relative_path(target_sublayer_path, mesh_file_path)
-            xform_prim.GetReferences().AddReference(assetPath=relative_mesh_path)
-
-            loc, rot, scale_vec = obj.matrix_world.decompose()
-            effective_translate = Gf.Vec3d(
-                loc[0] * remix_export_scale,
-                loc[1] * remix_export_scale,
-                loc[2] * remix_export_scale
+            self.report(
+                {'WARNING'},
+                f"No Target Mesh selected - '{obj.name}' is added as a new Remix mesh and instanced.",
             )
-            effective_scale = Gf.Vec3f(scale_vec[0], scale_vec[1], scale_vec[2])
-            rotation_degrees_xyz = Gf.Vec3f(tuple(math.degrees(a) for a in rot.to_euler('XYZ')))
-
-            xform_prim.CreateAttribute(UsdGeom.Tokens.xformOpOrder, Sdf.ValueTypeNames.TokenArray).Set(
-                ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
-            )
-            xform_prim.CreateAttribute("xformOp:translate", Sdf.ValueTypeNames.Double3).Set(effective_translate)
-            xform_prim.CreateAttribute("xformOp:rotateXYZ", Sdf.ValueTypeNames.Float3).Set(rotation_degrees_xyz)
-            xform_prim.CreateAttribute("xformOp:scale", Sdf.ValueTypeNames.Float3).Set(effective_scale)
+            new_mesh_path = author_new_remix_mesh(sublayer_stage, relative_mesh_path, self.report)
+            if not new_mesh_path:
+                return False
+            obj["remix_mesh_prim_path"] = str(new_mesh_path)
 
         print(f"--- Finished Exporting Mesh: {obj.name} ---")
         return True
@@ -1290,10 +1657,14 @@ def export_material_replacement(operator, context, obj, sublayer_stage, project_
         material_path = export_material(bl_mat, sublayer_stage, project_root, target_sublayer_path, parent_mesh_path=None, obj=obj)
         if material_path:
             target_prim = sublayer_stage.OverridePrim(prim_path)
-            UsdShade.MaterialBindingAPI.Apply(target_prim)
-            b_rel = target_prim.CreateRelationship("material:binding")
-            b_rel.SetTargets([material_path])
-            target_prim.CreateAttribute("material:binding:bindMaterialAs", Sdf.ValueTypeNames.Token).Set("strongerThanDescendants")
+            # `bindMaterialAs` is metadata on the binding relationship, so it has
+            # to be authored through MaterialBindingAPI - a
+            # `material:binding:bindMaterialAs` attribute is inert.
+            bind_material_on_prim(
+                target_prim,
+                sublayer_stage.GetPrimAtPath(material_path),
+                "strongerThanDescendants",
+            )
             print(f"  Successfully replaced material for {obj.name} at {prim_path}")
             obj["remix_material_path"] = str(material_path)
             return True

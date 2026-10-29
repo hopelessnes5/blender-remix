@@ -1477,10 +1477,38 @@ def calc_normals_split_compatible(mesh):
     if hasattr(mesh, 'calc_normals_split'):
         # Blender 4.0 and earlier
         mesh.calc_normals_split()
+    elif hasattr(mesh, 'corner_normals'):
+        # Blender 4.1+ computes corner normals lazily; touching `corner_normals`
+        # is enough, `calc_loop_triangles()` does not produce them.
+        len(mesh.corner_normals)
     else:
-        # Blender 4.1+ - use calc_loop_triangles and normals_split_custom_set with empty list
-        # This ensures the mesh has proper loop data for custom normals
         mesh.calc_loop_triangles()
+
+def get_corner_normals_compatible(mesh):
+    """Return per-loop (corner) normals for any supported Blender version.
+
+    Blender 4.1 removed `Mesh.calc_normals_split()`; corner normals moved to
+    `Mesh.corner_normals`. Returns an empty list when nothing can be read so the
+    caller can skip writing a normals attribute.
+    """
+    try:
+        corner_normals = getattr(mesh, 'corner_normals', None)
+        if corner_normals is not None and len(corner_normals) == len(mesh.loops):
+            return [tuple(cn.vector) for cn in corner_normals]
+    except Exception as e:
+        print(f"  Warning: could not read corner_normals: {e}")
+
+    try:
+        if hasattr(mesh, 'calc_normals_split'):
+            mesh.calc_normals_split()
+    except Exception as e:
+        print(f"  Warning: could not calculate split normals: {e}")
+
+    try:
+        return [tuple(loop.normal) for loop in mesh.loops]
+    except Exception as e:
+        print(f"  Warning: could not read loop normals: {e}")
+        return []
 
 def set_custom_normals_compatible(mesh, normals_data=None, from_vertices=False):
     """Set custom normals in a version-compatible way"""

@@ -86,8 +86,9 @@ def register_properties():
     # Add property to control hiding original mesh on export
     bpy.types.Scene.remix_hide_original_mesh = bpy.props.BoolProperty(
         name="Hide Target Mesh",
-        description="Hide the original mesh by setting 'references = None' when exporting a replacement mesh",
-        default=False,
+        description="Hide the original mesh by setting 'references = None' when exporting a replacement mesh. "
+                    "This is what makes a replacement a replacement; disable only for debugging",
+        default=True,
     )
     
     # Add properties for custom asset export directories
