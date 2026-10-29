@@ -1,5 +1,6 @@
 import bpy
 import os
+import json
 from bpy.utils import previews
 from .. import core_utils
 from .operators.capture_ops import *
@@ -27,6 +28,13 @@ class PT_RemixCapturePanel(bpy.types.Panel):
         setup = layout.box()
         header = setup.row(align=True)
         header.label(text="Game and Capture Setup", icon='SETTINGS')
+        # Always show the quick switcher, including in completed setup mode.
+        quick = setup.row(align=True)
+        quick.menu('REMIX_MT_remix_saved_games',
+                   text='Saved Projects  |  ' + (scene.remix_saved_game_label or 'Choose Game'),
+                   icon='FILE_FOLDER')
+        if scene.remix_saved_game_choice not in ('', '__NO_SAVED_GAME__'):
+            quick.operator('remix.remove_saved_game', text='', icon='REMOVE')
         if scene.remix_setup_finished:
             header.prop(scene, 'remix_setup_finished', text='Edit Setup',
                         icon='PREFERENCES', toggle=True)
@@ -41,10 +49,6 @@ class PT_RemixCapturePanel(bpy.types.Panel):
 
         # Stored outside the .blend in Blender's user config, so different
         # projects and Blender sessions share the same saved game locations.
-        saved_row = setup.row(align=True)
-        saved_row.prop(scene, 'remix_saved_game_choice', text='Saved Games')
-        saved_row.operator('remix.remove_saved_game', text='', icon='REMOVE')
-
         row_game = setup.row(align=True)
         row_game.prop(scene, 'remix_game_folder_path', text='Game Folder')
         row_game.operator('remix.rescan_game_folder', text='', icon='FILE_REFRESH')
@@ -73,7 +77,13 @@ class PT_RemixCapturePanel(bpy.types.Panel):
                 setup.label(text=f'{name}: {relative}', icon='FILE_FOLDER')
 
             if scene.remix_mods_folder_path:
-                setup.prop(scene, 'remix_active_mod_choice', text='Active Mod')
+                try:
+                    mods = len(json.loads(scene.remix_available_mods_json or '[]'))
+                except (ValueError, TypeError):
+                    mods = 0
+                setup.menu('REMIX_MT_remix_detected_mods',
+                           text=f'Active Mod  |  {os.path.basename(os.path.dirname(scene.remix_mod_file_path)) if scene.remix_mod_file_path else "Select mod"} ({mods})',
+                           icon='FILE_3D')
             if scene.remix_mod_file_path:
                 setup.label(text=f'Chosen mod: {os.path.basename(os.path.dirname(bpy.path.abspath(scene.remix_mod_file_path)))}',
                             icon='CHECKMARK')

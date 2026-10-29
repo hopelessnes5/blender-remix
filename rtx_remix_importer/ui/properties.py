@@ -17,7 +17,7 @@ _NO_MOD = "__NONE__"
 _MOD_ITEM_CACHE = {}  # Keep strings alive for Blender's dynamic EnumProperty.
 _RESCANNING = set()
 _NO_SAVED_GAME = '__NO_SAVED_GAME__'
-_SAVED_GAME_ITEM_CACHE = {}  # Blender dynamic EnumProperty requires persistent strings.
+# Suppress the game-path update callback during an explicit project switch.
 _SWITCHING_SAVED_GAME = set()
 
 
@@ -170,7 +170,7 @@ def _on_mod_changed(self, context):
         _save_current_mod_preference(self)
 
 
-def scan_game_folder(scene, context=None):
+def scan_game_folder(scene, context=None, preferred_mod_id=None):
     """Discover the runtime, mods and captures; preserve an existing selection."""
     key = scene.as_pointer()
     if key in _RESCANNING:
@@ -217,8 +217,10 @@ def scan_game_folder(scene, context=None):
         # Clear the old enum value before replacing its item list.
         scene.remix_active_mod_choice = _NO_MOD
         scene.remix_available_mods_json = json.dumps(mods, ensure_ascii=False)
-        preferred = next((m['id'] for m in mods
-                          if _normalized_path(m['path']) == _normalized_path(previous_mod_path)), None)
+        preferred = next((m['id'] for m in mods if m['id'] == preferred_mod_id), None)
+        if preferred is None and not game_changed:
+            preferred = next((m['id'] for m in mods
+                              if _normalized_path(m['path']) == _normalized_path(previous_mod_path)), None)
         if preferred is None and game_changed:
             saved = _find_saved_game(resolved_game)
             if saved and saved['last_mod_id'] in {m['id'] for m in mods}:
@@ -270,6 +272,8 @@ def _choose_mod_force_load(scene, context):
 
 
 def _on_game_folder_changed(self, context):
+    if self.as_pointer() in _SWITCHING_SAVED_GAME:
+        return
     self.remix_saved_games_status = ''
     scan_game_folder(self, context)
     _sync_saved_game_selection(self)
@@ -360,21 +364,131 @@ def _find_saved_game(path, games=None):
                  if _normalized_path(g['path']) == target), None)
 
 
-def _saved_game_enum_items(self, context):
-    games = _read_saved_games()
-    key = tuple((g['id'], g['name'], g['path']) for g in games)
-    if key not in _SAVED_GAME_ITEM_CACHE:
-        items = [(_NO_SAVED_GAME, 'Select saved game...',
-                  'Choose a saved game installation', 'FILE_FOLDER', 0)]
+def _saved_game_display_name(scene):
+    chosen = scene.remix_saved_game_choice
+    game = next((g for g in _read_saved_games() if g['id'] == chosen), None)
+    return game['name'] if game else 'Saved Projects'
+
+
+def _switch_saved_game(scene, context, game_id):
+    """One explicit UI action; never rely on Blender dynamic Enum callbacks."""
+    game = next((g for g in _read_saved_games() if g['id'] == game_id), None)
+    if not game:
+        scene.remix_saved_games_status = 'Saved project not found. Reopen the menu.'
+        return False
+    path = os.path.normpath(game['path'])
+    if not os.path.isdir(path):
+        scene.remix_saved_games_status = f'Game folder not found: {path}'
+        return False
+    remix_dir, _ = _discover_remix_folder(path)
+    if not remix_dir:
+        scene.remix_saved_games_status = f'rtx-remix was not found inside: {path}'
+        return False
+
+    pointer = scene.as_pointer()
+    _SWITCHING_SAVED_GAME.add(pointer)
+    try:
+        scene.remix_game_folder_path = path
+        # Selection must be explicit, even when the game path did not change.
+        scan_game_folder(scene, context, preferred_mod_id=game.get('last_mod_id') or None)
+        scene.remix_saved_game_choice = game['id']
+        scene.remix_saved_game_label = game['name']
+        # Capture browsing is an initial project step, so reopen it after switch.
+        scene.remix_setup_finished = False
+    finally:
+        _SWITCHING_SAVED_GAME.discard(pointer)
+    if not scene.remix_mod_file_path:
+        scene.remix_saved_games_status = 'Project selected. Choose an Active Mod to load it.'
+    elif scene.remix_mod_load_status:
+        scene.remix_saved_games_status = scene.remix_mod_load_status
+    else:
+        scene.remix_saved_games_status = 'Switched to: ' + game['name']
+    # Refresh all 3D sidebars, including when Captures is currently collapsed.
+    if context is not None:
+        for window in context.window_manager.windows:
+            for area in window.screen.areas:
+                if area.type == 'VIEW_3D':
+                    area.tag_redraw()
+    return True
+
+
+class REMIX_OT_SwitchSavedGame(bpy.types.Operator):
+    """Switch to a saved game, reload its mod, and refresh captures and paths"""
+    bl_idname = 'remix.switch_saved_game'
+    bl_label = 'Switch RTX Remix Project'
+    bl_options = {'REGISTER'}
+
+    game_id: bpy.props.StringProperty(name='Saved Game ID')
+
+    def execute(self, context):
+        scene = context.scene
+        if not _switch_saved_game(scene, context, self.game_id):
+            self.report({'ERROR'}, scene.remix_saved_games_status)
+            return {'CANCELLED'}
+        self.report({'INFO'}, scene.remix_saved_games_status)
+        return {'FINISHED'}
+
+
+class REMIX_MT_SavedGames(bpy.types.Menu):
+    """Menu generated at draw time, rather than a dynamic EnumProperty."""
+    bl_idname = 'REMIX_MT_remix_saved_games'
+    bl_label = 'Saved Projects'
+
+    def draw(self, context):
+        layout = self.layout
+        scene = context.scene
+        games = _read_saved_games()
+        if not games:
+            layout.label(text='No saved games yet', icon='INFO')
+            return
         for game in games:
-            state = '' if os.path.isdir(game['path']) else ' [missing folder]'
-            # Stable numeric IDs are required by Blender: dynamic EnumProperty
-            # selections are saved as integers, not string identifiers.
-            numeric_id = (int(game['id'][:8], 16) & 0x7fffffff) or 1
-            items.append((game['id'], game['name'] + state, game['path'],
-                          'FILE_FOLDER', numeric_id))
-        _SAVED_GAME_ITEM_CACHE[key] = items
-    return _SAVED_GAME_ITEM_CACHE[key]
+            exists = os.path.isdir(game['path'])
+            selected = game['id'] == scene.remix_saved_game_choice
+            icon = 'RADIOBUT_ON' if selected else ('FILE_FOLDER' if exists else 'ERROR')
+            op = layout.operator(REMIX_OT_SwitchSavedGame.bl_idname,
+                                 text=game['name'] + ('' if exists else ' [missing]'),
+                                 icon=icon)
+            op.game_id = game['id']
+        layout.separator()
+        layout.label(text='Game locations saved in Blender config', icon='INFO')
+
+
+class REMIX_OT_SelectDetectedMod(bpy.types.Operator):
+    """Select mod explicitly, bypassing dynamic mod enum update issues"""
+    bl_idname = 'remix.select_detected_mod'
+    bl_label = 'Select RTX Remix Mod'
+    bl_options = {'REGISTER'}
+
+    mod_id: bpy.props.StringProperty(name='Mod ID')
+
+    def execute(self, context):
+        scene = context.scene
+        if not any(m['id'] == self.mod_id for m in _available_mods(scene)):
+            self.report({'ERROR'}, 'Mod no longer available; rescan the game')
+            return {'CANCELLED'}
+        scene.remix_active_mod_choice = self.mod_id
+        _choose_mod(scene, context)
+        _save_current_mod_preference(scene)
+        self.report({'INFO'}, 'Active mod: ' + os.path.basename(os.path.dirname(scene.remix_mod_file_path)))
+        return {'FINISHED'}
+
+
+class REMIX_MT_DetectedMods(bpy.types.Menu):
+    bl_idname = 'REMIX_MT_remix_detected_mods'
+    bl_label = 'Available Mods'
+
+    def draw(self, context):
+        layout = self.layout
+        scene = context.scene
+        mods = _available_mods(scene)
+        if not mods:
+            layout.label(text='No mod.usda found', icon='INFO')
+            return
+        for mod in mods:
+            icon = 'RADIOBUT_ON' if mod['id'] == scene.remix_active_mod_choice else 'FILE_3D'
+            op = layout.operator(REMIX_OT_SelectDetectedMod.bl_idname,
+                                 text=mod['label'], icon=icon)
+            op.mod_id = mod['id']
 
 
 def _set_saved_selection(scene, identifier):
@@ -400,29 +514,9 @@ def _sync_saved_game_selection(scene):
 
 
 def _on_saved_game_choice_changed(self, context):
-    if self.as_pointer() in _SWITCHING_SAVED_GAME:
-        return
-    chosen_id = self.remix_saved_game_choice
-    if chosen_id == _NO_SAVED_GAME:
-        return
-    game = next((g for g in _read_saved_games() if g['id'] == chosen_id), None)
-    if not game:
-        self.remix_saved_games_status = 'Saved game no longer exists. Refresh the list.'
-        return
-    if not os.path.isdir(game['path']):
-        self.remix_saved_games_status = f'Missing game folder: {game["path"]}'
-        return
-    # Scan is invoked by the game folder update; its mod preference is read
-    # from saved_games.json, and its capture/project paths are rebuilt there.
-    if _normalized_path(self.remix_game_folder_path) != _normalized_path(game['path']):
-        self.remix_game_folder_path = game['path']
-    else:
-        scan_game_folder(self, context)
-    self.remix_saved_game_label = game['name']
-    if self.remix_remix_folder_path:
-        self.remix_saved_games_status = 'Project switched; Blender scene objects are retained.'
-    else:
-        self.remix_saved_games_status = 'Saved game selected, but rtx-remix was not found.'
+    # Compatibility helper for old scripts. UI uses REMIX_OT_SwitchSavedGame.
+    if self.as_pointer() not in _SWITCHING_SAVED_GAME:
+        _switch_saved_game(self, context, self.remix_saved_game_choice)
 
 
 def _save_current_mod_preference(scene):
@@ -533,9 +627,12 @@ def register_properties():
     bpy.utils.register_class(REMIX_OT_RescanGameFolder)
     bpy.utils.register_class(REMIX_OT_SaveGameLocation)
     bpy.utils.register_class(REMIX_OT_RemoveSavedGame)
-    bpy.types.Scene.remix_saved_game_choice = bpy.props.EnumProperty(
-        name='Saved Games', description='Quick switch between remembered RTX Remix games',
-        items=_saved_game_enum_items, update=_on_saved_game_choice_changed)
+    bpy.utils.register_class(REMIX_OT_SwitchSavedGame)
+    bpy.utils.register_class(REMIX_MT_SavedGames)
+    bpy.utils.register_class(REMIX_OT_SelectDetectedMod)
+    bpy.utils.register_class(REMIX_MT_DetectedMods)
+    bpy.types.Scene.remix_saved_game_choice = bpy.props.StringProperty(
+        name='Selected Saved Game', default=_NO_SAVED_GAME)
     bpy.types.Scene.remix_saved_game_label = bpy.props.StringProperty(
         name='Saved Name', description='Friendly name for this saved game location',
         default='')
@@ -554,9 +651,9 @@ def register_properties():
     bpy.types.Scene.remix_remix_folder_path = bpy.props.StringProperty(options={'HIDDEN'}, default='')
     bpy.types.Scene.remix_mods_folder_path = bpy.props.StringProperty(options={'HIDDEN'}, default='')
     bpy.types.Scene.remix_available_mods_json = bpy.props.StringProperty(options={'HIDDEN'}, default='[]')
-    bpy.types.Scene.remix_active_mod_choice = bpy.props.EnumProperty(
-        name='Active Mod', description='Select the RTX Remix mod to edit and export into',
-        items=_mod_enum_items, update=_on_mod_changed)
+    bpy.types.Scene.remix_active_mod_choice = bpy.props.StringProperty(
+        name='Active Mod ID', description='Relative path of the selected RTX Remix mod',
+        default=_NO_MOD)
     bpy.types.Scene.remix_discovery_status = bpy.props.StringProperty(default='Select a game folder.')
     bpy.types.Scene.remix_mod_load_status = bpy.props.StringProperty(default='')
     bpy.types.Scene.remix_mod_file_path = bpy.props.StringProperty(
@@ -706,7 +803,10 @@ def unregister_properties():
     bpy.utils.unregister_class(REMIX_OT_RemoveSavedGame)
     bpy.utils.unregister_class(REMIX_OT_SaveGameLocation)
     bpy.utils.unregister_class(REMIX_OT_RescanGameFolder)
-    _SAVED_GAME_ITEM_CACHE.clear()
+    bpy.utils.unregister_class(REMIX_MT_DetectedMods)
+    bpy.utils.unregister_class(REMIX_OT_SelectDetectedMod)
+    bpy.utils.unregister_class(REMIX_MT_SavedGames)
+    bpy.utils.unregister_class(REMIX_OT_SwitchSavedGame)
     _SWITCHING_SAVED_GAME.clear()
     _MOD_ITEM_CACHE.clear()
     del bpy.types.Scene.remix_mod_file_path
