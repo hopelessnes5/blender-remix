@@ -38,21 +38,22 @@ The official Toolkit is a Kit-based application (`lightspeed.trex.*` extensions)
 | Mass import + capture browser with previews | `lightspeed.trex.home.widget`, project wizard | ✅ | list with checkboxes, `Batch Import All / Selected`, DDS→PNG thumbnails |
 | Captured materials → viewport materials | `lightspeed.tool.material.core`, `omni.flux.asset_importer.core` | ✅ | AperturePBR Opaque / Translucent / Model / Normal / SpriteSheet (bundled `.mdl`), Principled BSDF fallback |
 | Instance / selection tree editing | `lightspeed.trex.selection_tree.widget` | 🟡 | one Blender object per `inst_<hash>_N`, mesh data shared per prototype; no prototype tree UI |
-| Per-instance render state / material metadata | mesh and material panes | 🟡 | reads `metadata:*` and legacy `primvars:_remix_metadata`; binding resolved from the direct `material:binding` relationship only |
+| Per-instance render state / material metadata | mesh and material panes | 🟡 | reads `metadata:*` and legacy `primvars:_remix_metadata`; binding resolution uses the direct relationship, composed bindings and prototype/child fallbacks |
 | Lights → Blender lights (Sphere / Disk / Cylinder / Rect / Distant) | light replacement | ✅ | intensity, color, radius, shaping cone |
 | Cameras → Blender camera + align view | stage camera | ✅ | `Select Imported Camera`, `Align View to Imported Camera` |
-| Unit handling on import | ingest `ApplyUnitScale` | 🟡 | `Capture Scale` (default `0.01`), `metersPerUnit` is not read |
+| Unit handling on import | ingest `ApplyUnitScale` | 🟡 | direct backend reads the capture's `metersPerUnit`; the legacy backend still uses only `Capture Scale` |
 
 ### Mesh replacement and asset creation
 
 | Feature | Official Toolkit component | Status | Notes in this add-on |
 |---|---|:--:|---|
 | Replace a captured mesh: `over "mesh_<HASH>" ( references = None )` + child `def Xform "ref_<uuid>"` with `prepend references` and `custom bool IsRemixRef = 1` | `lightspeed.trex.asset_replacements.core.shared`, `lightspeed.trex.properties_pane.mesh.widget` | ✅ | `Export Selected Meshes/Lights`; holder prim is reused on repeated exports, duplicates and stale overrides are cleaned up |
+| Hide a captured mesh without exporting geometry | `Setup.remove_reference` (cross-layer branch) | ✅ | `Hide Selected Meshes` writes `references = None` into the mod layer on the reference-owning prim (`inst_<HASH>_<N>` for inline captures); capture layers are never touched |
 | Ingested mesh asset layout: `/ReferenceTarget` → `/XForms` → `Mesh`, `MaterialBindingAPI`, `subdivisionScheme`, `extent`, face-varying UVs and normals | `lightspeed.trex.asset_pipeline.core` (`meta` step), IngestCraft | ✅ | same structure the official ingest pipeline writes, including `defaultPrim` |
 | Unit normalisation of the asset | ingest `ApplyUnitScale` | 🟡 | geometry is converted with `Export Scale` instead of `metersPerUnit` |
 | Add a brand-new instanced mesh | ingest + add reference | ✅ | creates `mesh_<HASH>` + `inst_<HASH>_0` when no target mesh is selected |
 | Add an *extra* reference to a mesh prim (combine assets) | mesh pane "add reference" | ⛔ | only single replace |
-| Restore / unhide the original captured mesh | remove reference | ⛔ | remove the `ref_` child prim manually |
+| Restore / unhide the original captured mesh | remove reference | ✅ | `Restore Hidden Meshes`; removes the `references = None` mask from the mod layer, no geometry is exported |
 | Duplicate a replacement (copy USD overrides) | `copy_replacement_overrides_to_path` | ⛔ | |
 | Skeleton / skinned mesh replacement + automatic joint remap (`skel:remix_joints`) | `lightspeed.trex.skeleton_replacements.widget`, `.../skeleton.py` | ⛔ | |
 | Ingest non-USD sources (FBX, OBJ, glTF, …) via `omni.kit.asset_converter` | `omni.flux.asset_importer.core` | ⛔ | USD in / USD out only |
@@ -105,10 +106,137 @@ The official Toolkit is a Kit-based application (`lightspeed.trex.*` extensions)
 
 ---
 
+## Direct NVIDIA backend (P0)
+
+The importer now has two backends. The default **direct** backend runs NVIDIA's
+capture algorithms inside Blender using the `pxr` (OpenUSD) that ships with
+Blender. It does not start RTX Remix Toolkit, Omniverse Kit, StageCraft, an MCP
+server or any HTTP/REST service, and it writes no intermediate files.
+
+The old importer is preserved verbatim as `rtx_remix_importer/legacy_import_core.py`
+and remains the rollback path.
+
+### Architecture
+
+| Path | Responsibility |
+|---|---|
+| `rtx_remix_importer/nvidia_core/` | Pure `pxr` port: constants, prim classification, capture validation/hashes, layer composition, mesh extraction. Imports neither `omni`, `carb` nor `bpy`. |
+| `rtx_remix_importer/compatibility/kit_adapters.py` | Narrow replacements for the Omniverse helpers (`omni.usd`, `omni.flux`) used by the ported code. |
+| `rtx_remix_importer/blender_bridge/` | Creates Blender meshes, resolves/applies materials and builds the scene (`scene_builder.import_with_direct_backend`). |
+| `rtx_remix_importer/import_core.py` | Facade with backend selection and logged fallback. Keeps the legacy signature and return value. |
+| `rtx_remix_importer/legacy_import_core.py` | The previous importer, unchanged and used for rollback. |
+
+### NVIDIA code reuse matrix
+
+Source paths refer to RTX Remix Toolkit 1.6.1 (`source/extensions/...`, Apache-2.0).
+
+| NVIDIA source | Ported to | Reuse |
+|---|---|---|
+| `lightspeed.common.lightspeed.common.constants` | `nvidia_core/constants.py` | Values and regexes copied; the `omni.ui` import that made the module unusable outside Kit was removed. |
+| `lightspeed.trex.utils.common.prim_utils` | `nvidia_core/prim_utils.py` | Algorithms ported (classification, prototype lookup, reference discovery, transferable specs, ghost detection). The implicit `omni.usd` context and selection were replaced by explicit `stage` / `selection` arguments. |
+| `lightspeed.trex.capture.core.shared.setup` | `nvidia_core/capture.py` | Capture detection, layer metadata, hash discovery, stage-metadata copy and `remix_config` publishing ported. Kit layer manager, thumbnails, `omni.client` listing and undo are not ported. |
+| `lightspeed.layer_manager.core` layer ordering | `nvidia_core/composition.py` | Reimplemented with `pxr`: capture is always the weakest sublayer, the mod/replacement layer is the edit target, and the capture is locked read-only. The full layer model, mute/reorder UI and events are not ported. |
+| `omni.usd.get_composed_references_from_prim`, `omni.usd.get_introducing_layer` | `compatibility/kit_adapters.py` | Reimplemented with `Sdf` / `Usd.PrimCompositionQuery`, including authoring-layer resolution and relative asset paths. |
+| `omni.flux.utils.common.lights.get_light_type` | `compatibility/kit_adapters.py` | Light type enum and the historical `DomeLight_1` alias ported. |
+| Toolkit mesh/prim conventions | `nvidia_core/geometry.py` | Blender extraction written against the same `mesh_<HASH>` / `inst_<HASH>_<N>` layout. N-gons are preserved, left-handed winding is reversed, and per-corner UV/normal arrays stay aligned with `faceVertexIndices`. |
+
+**Not ported (P1+):** asset replacement transfer, ingest/packaging pipelines,
+skeleton replacement, material/texture override transfer, ComfyUI integration,
+StageCraft, Kit undo, and the properties panes. Material *conversion* remains the
+add-on's existing `material_utils.py` code, not an NVIDIA port.
+
+### Backend switch and rollback
+
+Resolution order:
+
+1. `REMIX_IMPORT_BACKEND` environment variable.
+2. `scene["remix_import_backend"]` custom property.
+3. `direct` (default).
+
+| Value | Behaviour |
+|---|---|
+| `direct` (default) | NVIDIA algorithms in process; on an unexpected error the import is logged and retried with the legacy importer. |
+| `direct-only` | Strict direct backend; errors are raised and never fall back. |
+| `legacy` | Old importer only — use this to roll back instantly. |
+
+```powershell
+# strict direct backend
+$env:REMIX_IMPORT_BACKEND = "direct-only"
+
+# rollback to the previous importer
+$env:REMIX_IMPORT_BACKEND = "legacy"
+```
+
+To roll back permanently, set the same value in the scene property or remove the
+`blender_bridge` / `nvidia_core` / `compatibility` packages and restore
+`import_core.py` from `legacy_import_core.py`. All changes are additive apart from
+the `import_core.py` rename, so `git revert` of the integration commit is enough.
+
+### Import semantics
+
+- The capture layer is locked in memory. Only the mod/replacement layer is an
+  edit target; `ProjectComposition.add_capture_sublayer()` appends a capture as
+  the **weakest** sublayer after removing any previous capture.
+- With the UI default `Capture Scale = 0.01`, the direct backend uses the
+  capture's own `metersPerUnit` and `upAxis` (captures commonly author `0.01`
+  and Y-up). Any other UI value is treated as an explicit override.
+- One Blender mesh datablock is shared by every instance of a prototype.
+  Materials are linked per object (`slot.link = 'OBJECT'`) so instances can
+  differ without duplicating geometry.
+- Capture materials are resolved through the direct `material:binding`, composed
+  bindings, then prototype and mesh-child fallbacks. Invalid targets (for
+  example a stale `/RootNode/Looks/...` path) are rejected.
+
+### Tests
+
+Tests live in `tests/` and must run inside Blender because the add-on package
+imports `bpy`:
+
+```powershell
+& "C:\Blender 4.5 LTS\blender.exe" `
+  --background --factory-startup --python tests/run_tests.py
+```
+
+The fixtures in `tests/data/full_project/` are copied from the Toolkit's
+`lightspeed.layer_manager.core` test data (Apache-2.0). The suite covers the
+Kit adapters, prim utilities, capture helpers, composition/locking, geometry
+(n-gons, left-handed winding, primvar indices), capture immutability, backend
+selection/fallback and real Blender imports of both `capture.usda` and
+`full_project.usda`; composition tests also verify that saving a project writes only the mod layer and that authoring into the locked capture raises. `tests/blender/test_ui_operators.py` drives the actual UI
+operators (`remix.import_capture`, `remix.scan_capture_folder`) end to end,
+including the scene-property backend switch and the `direct-only` error path.
+`tests/unit/test_hide.py` and `TestHideMeshOperators` cover hiding/restoring
+captured meshes: the mask is authored on the reference-owning instance prim, the
+capture file hash is unchanged, no `assets/` output appears, and the composed
+geometry disappears/returns.
+
+**Executed result:** 87 tests pass on both Blender 4.5.5 LTS (bundled OpenUSD
+25.02) and Blender 5.1.2 (bundled OpenUSD 25.08) on Windows, exit code `0`;
+`register()` / `unregister()` was smoke-tested on both as well. A freshly built
+`rtx_remix_importer.zip` was installed through `preferences.addon_install` into a
+clean profile on both versions and imported the fixture (763 vertices, 1
+material, `direct` backend). `git diff --check` and `python -m compileall` also
+pass.
+
+**Not verified:**
+
+- No real game capture with textures was available; only the Toolkit fixture
+  (two DDS files) was exercised. Blender 4.0–4.4 and Linux/Wine were not run.
+- In this environment the `Aperture Opaque` node group could not be appended, so
+  material conversion exercised the existing Principled BSDF fallback.
+- The Toolkit `omni_layer` **muteness** metadata is not applied by `pxr`; a
+  composed project therefore includes muted sublayers. Layer locking, ordering
+  and edit targets are applied, but mute parity is P1 work.
+- Light import delegates to the existing `light_utils.py`, which still warns
+  about Y-up rotation.
+- Non-ASCII Windows paths and Linux/Wine were not tested.
+
+---
+
 ## Requirements
 
 - Windows (or Wine on Linux)
-- Blender 4.0 or newer (developed and tested on 4.5 LTS)
+- Blender 4.0 or newer (verified in background mode on 4.5.5 LTS and 5.1.2)
 - [texconv from DirectXTex](https://github.com/microsoft/DirectXTex/releases/latest) — only needed for the source install, it ships inside the release zip
 
 ## Installation
@@ -187,6 +315,32 @@ def Xform "ReferenceTarget" ( kind = "group" )      # defaultPrim
     def "Looks" { def Material "<mesh>__" { ... } }
 }
 ```
+
+### Hide / restore captured meshes (no export)
+
+1. Select one or more imported capture meshes
+2. Press `Hide Selected Meshes` — the add-on only writes into the mod layer:
+
+```usda
+over "RootNode"
+{
+    over "instances"
+    {
+        over "inst_<16HEX>_<N>" ( references = None )
+        {
+        }
+    }
+}
+```
+
+3. Press `Restore Hidden Meshes` with the same selection to remove the mask
+
+No mesh, material or texture is exported. The capture layer is opened read-only
+and is never modified; hiding is refused if the prim already owns a replacement
+reference. For inline captures the `mesh_<HASH>` prototype holds the geometry and
+the `inst_<HASH>_<N>` prim owns the `prepend references` that makes it visible,
+which is why the instance carries the mask. A `mesh_<HASH>` path is still
+accepted for captures whose prototype references external geometry.
 
 ### Export materials
 

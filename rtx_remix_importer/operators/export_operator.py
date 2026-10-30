@@ -226,6 +226,24 @@ def get_game_stage(context):
     return stage
 
 
+def invalidate_game_stage_cache(path=None):
+    """Drop the cached read-only project stage(s).
+
+    Hiding/showing a captured mesh edits the mod layer behind the cached stage,
+    so the cache has to be invalidated or the next export would still see the
+    pre-edit composition.  Passing *path* drops just that project.
+    """
+    if path is None:
+        _GAME_STAGE_CACHE.clear()
+        return
+    try:
+        key = os.path.normcase(os.path.abspath(bpy.path.abspath(path)))
+    except TypeError:
+        _GAME_STAGE_CACHE.clear()
+        return
+    _GAME_STAGE_CACHE.pop(key, None)
+
+
 def get_prim_world_matrix(stage, prim_path):
     """World matrix of a prim converted to Blender space, or None."""
     if stage is None or not prim_path:

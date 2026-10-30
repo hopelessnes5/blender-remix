@@ -9,6 +9,11 @@ try:
 except ImportError:
     USD_AVAILABLE = False
 
+if USD_AVAILABLE:
+    from ...nvidia_core.capture import is_capture_file
+else:  # pragma: no cover - Blender always ships pxr
+    is_capture_file = None
+
 
 def auto_scan_capture_folder(self, context):
     """Auto-scan capture folder when path changes"""
@@ -16,7 +21,7 @@ def auto_scan_capture_folder(self, context):
         # Use the scan operator to do the actual scanning
         try:
             bpy.ops.remix.scan_capture_folder()
-        except:
+        except Exception:
             # If operator fails, just clear the captures list
             if hasattr(context.scene, "remix_captures"):
                 context.scene.remix_captures.clear()
@@ -56,6 +61,11 @@ class ScanCaptureFolder(bpy.types.Operator):
                     full_path = os.path.join(capture_folder, file)
                     # Verify it's actually a file (not a directory with USD extension)
                     if os.path.isfile(full_path):
+                        # Only list actual RTX Remix captures. The same folder
+                        # also holds per-asset USD files that cannot be
+                        # imported on their own.
+                        if not is_capture_file(full_path):
+                            continue
                         # Get file size and modification time for display
                         try:
                             stat = os.stat(full_path)
@@ -83,8 +93,8 @@ class ScanCaptureFolder(bpy.types.Operator):
                 item.full_path = f['full_path']
                 item.size_mb = f['size_mb']
             
-            self.report({'INFO'}, f"Found {len(usd_files)} USD files in capture folder")
-            print(f"Found USD files: {[f['name'] for f in usd_files[:5]]}{'...' if len(usd_files) > 5 else ''}")
+            self.report({'INFO'}, f"Found {len(usd_files)} RTX Remix capture files in capture folder")
+            print(f"Found capture files: {[f['name'] for f in usd_files[:5]]}{'...' if len(usd_files) > 5 else ''}")
             
         except Exception as e:
             self.report({'ERROR'}, f"Error scanning capture folder: {e}")

@@ -17,6 +17,10 @@ from .operators.asset_ops import (
     SelectObjectByName,
     InvalidateRemixSingleAsset,
 )
+from .operators.hide_ops import (
+    HideCapturedMesh,
+    ShowCapturedMesh,
+)
 from .operators.capture_ops import (
     ScanCaptureFolder,
     ImportCaptureFile,
@@ -71,6 +75,8 @@ operator_classes = [
     ApplyRemixModChanges,
     SelectObjectByName,
     InvalidateRemixSingleAsset,
+    HideCapturedMesh,
+    ShowCapturedMesh,
     ScanCaptureFolder,
     ImportCaptureFile,
     ClearCaptureList,

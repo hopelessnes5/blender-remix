@@ -1,6 +1,7 @@
 import bpy
 from .operators.project_ops import *
 from .operators.sync_ops import *
+from .operators.hide_ops import HideCapturedMesh, ShowCapturedMesh
 
 class PT_RemixProjectPanel(bpy.types.Panel):
     """Creates a Panel in the Scene properties window for Remix Project Management"""
@@ -181,7 +182,23 @@ class PT_RemixProjectPanel(bpy.types.Panel):
             row_mesh.enabled = bool(scene.remix_active_sublayer_path)
             mesh_op = row_mesh.operator("export_scene.rtx_remix_asset", text="Export Selected Meshes/Lights", icon='EXPORT')
             mesh_op.material_replacement_mode = False
-            
+
+            # --- Hide / restore captured meshes (mod layer only) ---
+            row_mask = layout.row(align=True)
+            row_mask.scale_y = 1.3
+            row_mask.operator(
+                HideCapturedMesh.bl_idname,
+                text="Hide Selected Meshes",
+                icon='HIDE_ON',
+            )
+            show_row = layout.row()
+            show_row.scale_y = 1.1
+            show_row.operator(
+                ShowCapturedMesh.bl_idname,
+                text="Restore Hidden Meshes",
+                icon='HIDE_OFF',
+            )
+
             if not scene.remix_active_sublayer_path:
                 # Show warning if no sublayer is selected
                 warning_row = layout.row()

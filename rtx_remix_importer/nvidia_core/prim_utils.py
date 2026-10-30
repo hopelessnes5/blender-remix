@@ -1,0 +1,712 @@
+"""Direct port of NVIDIA RTX Remix Toolkit ``lightspeed.trex.utils.common.prim_utils``.
+
+SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES.
+SPDX-License-Identifier: Apache-2.0
+
+The algorithms and behaviour are NVIDIA's; the Omniverse Kit dependencies were
+replaced by :mod:`rtx_remix_importer.compatibility.kit_adapters`, and functions
+that used to reach for the current ``omni.usd`` context now take an explicit
+``stage`` argument.  Nothing here imports Kit, ``bpy`` or calls a service.
+"""
+
+from __future__ import annotations
+
+__all__ = [
+    "PrimTypes",
+    "filter_prims_paths",
+    "find_prim_with_references",
+    "get_children_prims",
+    "get_extended_selection",
+    "get_prim_paths",
+    "get_prototype",
+    "get_reference_file_paths",
+    "get_transferable_prim_specs",
+    "get_transferable_property_specs",
+    "get_transferable_reference_specs",
+    "has_replacement_ref_edits",
+    "is_empty_mesh_prim",
+    "is_ghost_prim",
+    "is_in_light_group",
+    "is_in_mesh_group",
+    "is_instance",
+    "is_light",
+    "is_light_asset",
+    "is_light_prototype",
+    "is_material_prototype",
+    "is_mesh_asset",
+    "is_mesh_prototype",
+    "is_shader_prototype",
+]
+
+import re
+from collections.abc import Callable, Iterable, Sequence
+from enum import Enum
+
+from pxr import Sdf, Usd, UsdGeom, UsdShade
+
+from ..compatibility import kit_adapters
+from ..compatibility.kit_adapters import get_light_type as _get_light_type
+from . import constants
+
+
+class PrimTypes(Enum):
+    LIGHTS = "lights"
+    MATERIALS = "materials"
+    MODELS = "models"
+
+
+def get_prim_paths(
+    stage: Usd.Stage,
+    prim_hashes: set[str] = None,
+    prim_type: PrimTypes = None,
+    selection: list[str] | None = None,
+    filter_session_prims: bool = True,
+    layer_id: str = None,
+    exists: bool = True,
+) -> list[str]:
+    """Get the list of prim paths of a given type in the stage or current selection.
+
+    Args:
+        stage: The composed stage to query (replaces the ``omni.usd`` context).
+        prim_hashes: A set of hashes to filter for.
+        prim_type: The type of prim to fetch.
+        selection: Prim paths to search. If not set, every prim in the stage is used.
+        filter_session_prims: Whether to filter out prims defined on the session layer.
+        layer_id: Only return assets that exist (or don't exist) on this layer.
+        exists: Invert the ``layer_id`` filter.
+
+    Returns:
+        A list of prim paths.
+    """
+    if prim_type is not None:
+        match prim_type:
+            case PrimTypes.LIGHTS:
+                return filter_prims_paths(
+                    stage,
+                    lambda prim: is_light_prototype(prim) and includes_hash(prim, prim_hashes),
+                    prim_paths=selection,
+                    filter_session_prims=filter_session_prims,
+                    layer_id=layer_id,
+                    exists=exists,
+                )
+            case PrimTypes.MATERIALS:
+                return filter_prims_paths(
+                    stage,
+                    lambda prim: is_material_prototype(prim) and includes_hash(prim, prim_hashes),
+                    prim_paths=selection,
+                    filter_session_prims=filter_session_prims,
+                    layer_id=layer_id,
+                    exists=exists,
+                )
+            case PrimTypes.MODELS:
+                return filter_prims_paths(
+                    stage,
+                    lambda prim: is_mesh_prototype(prim) and includes_hash(prim, prim_hashes),
+                    prim_paths=selection,
+                    filter_session_prims=filter_session_prims,
+                    layer_id=layer_id,
+                    exists=exists,
+                )
+
+    # All types
+    return filter_prims_paths(
+        stage,
+        lambda prim: (
+            (is_light_prototype(prim) or is_material_prototype(prim) or is_mesh_prototype(prim))
+            and includes_hash(prim, prim_hashes)
+        ),
+        prim_paths=selection,
+        filter_session_prims=filter_session_prims,
+        layer_id=layer_id,
+        exists=exists,
+    )
+
+
+def filter_prims_paths(
+    stage: Usd.Stage,
+    predicate: Callable[[Usd.Prim], bool],
+    prim_paths: list[str] | None = None,
+    filter_session_prims: bool = False,
+    layer_id: str | None = None,
+    exists: bool = True,
+) -> list[str]:
+    """Get the prim paths that match *predicate* in the stage or given selection.
+
+    Args:
+        stage: The composed stage to query.
+        predicate: The predicate to match prims.
+        prim_paths: Prim paths to filter. If not set, every prim is used.
+        filter_session_prims: Whether to filter out prims defined on the session layer.
+        layer_id: Look for assets that exist or not on a given layer.
+        exists: Use with *layer_id* to select existing/non-existing assets.
+
+    Returns:
+        A list of prim paths.
+    """
+    session_layer = stage.GetSessionLayer()
+
+    if prim_paths is not None:
+        prims = [stage.GetPrimAtPath(path) for path in prim_paths]
+    else:
+        prims = stage.TraverseAll()
+
+    def layer_predicate(prim: Usd.Prim) -> bool:
+        is_valid = True
+        # If we're filtering session prims and the prim exists on the session layer, it's not valid
+        if filter_session_prims and session_layer.GetPrimAtPath(prim.GetPath()):
+            is_valid = False
+        # If we're filtering for a given layer, make sure the prim spec exists/doesn't exist on the layer
+        if layer_id is not None:
+            layer = Sdf.Layer.FindOrOpen(str(layer_id))
+            # If the layer doesn't exist, just ignore the filter
+            if not layer:
+                return is_valid
+            introducing_layer, _ = kit_adapters.get_introducing_layer(prim)
+            if exists:
+                is_valid = bool(layer.GetPrimAtPath(prim.GetPath())) or (layer == introducing_layer)
+            else:
+                is_valid = not bool(layer.GetPrimAtPath(prim.GetPath())) and (layer != introducing_layer)
+        return is_valid
+
+    return [str(prim.GetPath()) for prim in prims if prim and layer_predicate(prim) and predicate(prim)]
+
+
+def includes_hash(prim: Usd.Prim, prim_hashes: set[str]) -> bool:
+    """
+    Returns:
+        Whether the prim can be found in the set of hashes or not
+    """
+    if not prim:
+        return False
+    if prim_hashes is None:
+        return True
+    return bool(any(True for asset_hash in prim_hashes if asset_hash in str(prim.GetPath())))
+
+
+def is_light_prototype(prim: Usd.Prim) -> bool:
+    """
+    Returns:
+        Whether the prim is a light prototype prim or not. This is narrower than is_light() because
+        prototype queries exclude light prims under instance paths.
+    """
+    if not prim:
+        return False
+    return is_light(prim) and not is_instance(prim)
+
+
+def is_light(prim: Usd.Prim) -> bool:
+    """
+    Returns:
+        Whether the prim is a USD Lux light or not, including nested or referenced lights. This does
+        not filter instance paths; callers that need a non-instance prototype light should use
+        is_light_prototype().
+    """
+    if not prim:
+        return False
+    return _get_light_type(prim.GetTypeName()) is not None or "LightAPI" in prim.GetAppliedSchemas()
+
+
+def is_material_prototype(prim: Usd.Prim) -> bool:
+    """
+    Returns:
+        Whether the prim is a material or not
+    """
+    if not prim:
+        return False
+    return bool(prim.IsA(UsdShade.Material) and not is_instance(prim))
+
+
+def is_shader_prototype(prim: Usd.Prim) -> bool:
+    """
+    Returns:
+        Whether the prim is a material prototype prim or not
+    """
+    if not prim:
+        return False
+    return bool(prim.IsA(UsdShade.Shader) and not is_instance(prim))
+
+
+def is_mesh_prototype(prim: Usd.Prim, *, prim_path: str | None = None) -> bool:
+    """Return whether a prim is a Mesh or GeomSubset under a mesh path.
+
+    Args:
+        prim: Prim to classify.
+        prim_path: Optional precomputed prim path.
+
+    Returns:
+        Whether the prim is under a mesh_HASH path and is a Mesh prim type.
+    """
+    if not prim:
+        return False
+    prim_path = prim_path if prim_path is not None else str(prim.GetPath())
+    return bool(
+        re.match(constants.REGEX_IN_MESH_PATH, prim_path) and (prim.IsA(UsdGeom.Subset) or prim.IsA(UsdGeom.Mesh))
+    )
+
+
+def is_a_prototype(prim: Usd.Prim) -> bool:
+    """
+    Returns:
+        Whether the prim is under a mesh_HASH path
+    """
+    if not prim:
+        return False
+    return bool(re.match(constants.REGEX_IN_MESH_CHILDREN_PATH, str(prim.GetPath())))
+
+
+def is_instance(prim: Usd.Prim, *, prim_path: str | None = None) -> bool:
+    """Return whether a prim is under an instance path.
+
+    Args:
+        prim: Prim to classify.
+        prim_path: Optional precomputed prim path.
+
+    Returns:
+        Whether the prim is under an inst_HASH path.
+    """
+    if not prim:
+        return False
+    prim_path = prim_path if prim_path is not None else str(prim.GetPath())
+    return bool(re.match(constants.REGEX_IN_INSTANCE_PATH, prim_path))
+
+
+def is_mesh_asset(prim: Usd.Prim) -> bool:
+    """
+    Returns:
+        Whether the prim is a mesh asset
+    """
+    if not prim:
+        return False
+    return bool(re.match(constants.REGEX_MESH_PATH, str(prim.GetPath())))
+
+
+def is_empty_mesh_prim(prim: Usd.Prim, *, prim_path: str | None = None) -> bool:
+    """Return whether *prim* is a mesh asset whose capture reference has been removed.
+
+    A mesh_HASH prim whose reference is still active will have at least one
+    child with a ``Mesh`` or ``GeomSubset`` schema.  When the reference is
+    deleted those children disappear, leaving only the ``Xform`` shell.
+
+    Args:
+        prim: Prim to classify.
+        prim_path: Optional precomputed prim path.
+
+    Returns:
+        Whether the prim is an empty mesh-root container.
+    """
+    if not prim:
+        return False
+    prim_path = prim_path if prim_path is not None else str(prim.GetPath())
+    if not re.match(constants.REGEX_MESH_PATH, prim_path):
+        return False
+    return all(not (child.IsA(UsdGeom.Mesh) or child.IsA(UsdGeom.Subset)) for child in prim.GetChildren())
+
+
+def is_light_asset(prim: Usd.Prim) -> bool:
+    """
+    Returns:
+        Whether the prim is a light asset
+    """
+    if not prim:
+        return False
+    return bool(re.match(constants.REGEX_LIGHT_PATH, str(prim.GetPath())))
+
+
+def is_in_mesh_group(prim: Usd.Prim) -> bool:
+    """
+    Returns:
+        Whether the prim is under a mesh_HASH path or matches the root mesh path
+    """
+    if not prim:
+        return False
+    return bool(re.match(f"{constants.REGEX_MESH_PATH_AND_CHILDREN}", str(prim.GetPath())))
+
+
+def is_in_light_group(prim: Usd.Prim, *, prim_path: str | None = None) -> bool:
+    """Return whether a prim is in a light group.
+
+    Args:
+        prim: Prim to classify.
+        prim_path: Optional precomputed prim path.
+
+    Returns:
+        Whether the prim is under a light_HASH path or matches the root light path.
+    """
+    if not prim:
+        return False
+    prim_path = prim_path if prim_path is not None else str(prim.GetPath())
+    # Match if the path matches either the children or root light path regex
+    return bool(re.match(f"{constants.REGEX_LIGHT_PATH_AND_CHILDREN}", prim_path))
+
+
+def get_extended_selection(stage: Usd.Stage, selection: Iterable[str]) -> list[str]:
+    """Get the given selection and related prims.
+
+    - If an instance is selected, select the mesh, material, and shader associated to it
+    - If a mesh is selected, select the material, and shader associated to it
+    - If a material is selected, select the shader associated to it
+    - Select all children prims that are meshes, materials, shaders or lights
+
+    Replaces ``omni.usd`` selection access with an explicit *selection* argument.
+    """
+    result = set(selection)
+
+    # Expand the selection to get meshes, materials and shaders from instances
+    selection_size = -1
+    while len(result) != selection_size:
+        selection_size = len(result)
+        for path in result.copy():
+            prim = stage.GetPrimAtPath(path)
+            if not prim:
+                continue
+
+            result = result.union([str(p.GetPath()) for p in get_children_prims(prim)])
+
+            if is_instance(prim):
+                # Get mesh from instance
+                result.add(
+                    str(constants.COMPILED_REGEX_INSTANCE_TO_MESH_SUB.sub(rf"{constants.MESH_PATH}\2", path))
+                )
+            elif is_mesh_prototype(prim):
+                # Get material from mesh
+                material, _ = UsdShade.MaterialBindingAPI(prim).ComputeBoundMaterial()
+                if material:
+                    result.add(str(material.GetPrim().GetPath()))
+                # Get children prims
+            elif is_material_prototype(prim):
+                # Get shader from material
+                shader = kit_adapters.get_shader_from_material(prim, True)
+                if shader:
+                    result.add(str(shader.GetPath()))
+
+    return list(result)
+
+
+def get_children_prims(
+    prim: Usd.Prim,
+    from_reference_layer_path: str = None,
+    level: int | None = None,
+    skip_remix_ref: bool = False,
+    only_prim_not_from_ref: bool = False,
+) -> list[Usd.Prim]:
+    """Get all children prims for any given prim.
+
+    Args:
+        prim: Prim to get children from
+        from_reference_layer_path: Reference layer path
+        level: Recursive level to get children from
+        skip_remix_ref: Whether to skip remix references or not
+        only_prim_not_from_ref: Whether to only get children prims not from reference
+    """
+    current_level = 0
+
+    def get_parent_ref_layers(_prim) -> list[str]:
+        refs_and_layers = kit_adapters.get_composed_references_from_prim(_prim)
+        result = []
+        if refs_and_layers:
+            for ref, layer in refs_and_layers:
+                if not ref.assetPath:
+                    continue
+                result.append(kit_adapters.normalize_url(layer.ComputeAbsolutePath(ref.assetPath)))
+        parent = _prim.GetParent()
+        if parent and parent.IsValid():
+            result.extend(get_parent_ref_layers(parent))
+        return result
+
+    def traverse_instanced_children(_prim, _current_level, _skip_remix_ref):
+        if level is not None and _current_level == level:
+            return
+        _current_level += 1
+        parent_reference_layers = None
+        for child in _prim.GetFilteredChildren(Usd.PrimAllPrimsPredicate):
+            # it can happen that we added the same reference multiple time. But USD can't do that.
+            # As a workaround, we had to create a xform child and add the reference to it.
+            # Check the children and find the attribute that define that
+            is_remix_ref = False
+            if _skip_remix_ref:
+                is_remix_ref = child.GetAttribute(constants.IS_REMIX_REF_ATTR)
+                if is_remix_ref.IsValid():
+                    _current_level -= 1
+
+            if only_prim_not_from_ref or from_reference_layer_path is not None:
+                layer_stack = [kit_adapters.normalize_url(stack.layer.realPath) for stack in child.GetPrimStack()]
+            if only_prim_not_from_ref:
+                if parent_reference_layers is None:
+                    parent_reference_layers = set(get_parent_ref_layers(_prim))
+                if not parent_reference_layers.isdisjoint(layer_stack):
+                    yield from traverse_instanced_children(child, _current_level, _skip_remix_ref)
+                    continue
+
+            if (
+                from_reference_layer_path is not None
+                and not only_prim_not_from_ref
+                and from_reference_layer_path not in layer_stack
+            ):
+                yield from traverse_instanced_children(child, _current_level, _skip_remix_ref)
+                continue
+            if not is_remix_ref:
+                yield child
+            yield from traverse_instanced_children(child, _current_level, _skip_remix_ref)
+
+    return list(traverse_instanced_children(prim, current_level, skip_remix_ref))
+
+
+def get_reference_file_paths(
+    prim: Usd.Prim,
+) -> tuple[list[tuple[Usd.Prim, Sdf.Reference, Sdf.Layer, int]], int]:
+    """Collects file references from a USD prim and its reference children.
+
+    Handles special child prims for multiple identical references.
+
+    Args:
+        prim (Usd.Prim): The USD prim to get references from.
+
+    Returns:
+        Tuple[List[Tuple[Usd.Prim, Sdf.Reference, Sdf.Layer, int]], int]:
+            List of (prim, reference, layer, index) tuples and total reference count.
+    """
+    prim_paths = []
+    ref_and_layers = kit_adapters.get_composed_references_from_prim(prim, False)
+    i = 0
+    for ref, layer in ref_and_layers:
+        if not ref.assetPath:
+            continue
+        prim_paths.append((prim, ref, layer, i))
+        i += 1
+
+    # It can happen that we added the same reference multiple time. But USD can't do that.
+    # As a workaround, we had to create a xform child and add the reference to it.
+    # Check the children and find the attribute that define that
+    for child in prim.GetFilteredChildren(Usd.PrimAllPrimsPredicate):
+        is_remix_ref = child.GetAttribute(constants.IS_REMIX_REF_ATTR)
+        if is_remix_ref.IsValid():
+            ref_and_layers = kit_adapters.get_composed_references_from_prim(child, False)
+            for ref, layer in ref_and_layers:
+                if not ref.assetPath:
+                    continue
+                prim_paths.append((child, ref, layer, i))
+                i += 1
+
+    return prim_paths, i
+
+
+def get_transferable_property_specs(
+    property_stack: Sequence[Sdf.PropertySpec],
+    valid_layer_identifiers: Iterable[str],
+    allowed_layer_identifiers: Iterable[str] | None = None,
+) -> tuple[Sdf.PropertySpec, ...]:
+    """Return authored property specs from transfer-eligible layers.
+
+    Args:
+        property_stack: Composed property stack to filter.
+        valid_layer_identifiers: Layer identifiers accepted as transfer sources.
+        allowed_layer_identifiers: Optional source-layer identifiers accepted by the caller.
+
+    Returns:
+        Property specs authored in eligible source layers.
+    """
+    valid_layer_identifiers = set(valid_layer_identifiers)
+    if allowed_layer_identifiers is not None:
+        valid_layer_identifiers.intersection_update(allowed_layer_identifiers)
+    if not valid_layer_identifiers:
+        return ()
+
+    transferable_specs = []
+    override_specs = []
+    for spec in property_stack:
+        if spec is None or spec.layer.identifier not in valid_layer_identifiers:
+            continue
+        transferable_specs.append(spec)
+        if not _property_spec_belongs_to_definition(spec):
+            override_specs.append(spec)
+    return tuple(override_specs or transferable_specs)
+
+
+def get_transferable_prim_specs(
+    prim: Usd.Prim,
+    valid_layer_identifiers: Iterable[str],
+) -> tuple[Sdf.PrimSpec, ...]:
+    """Return authored prim specs from transfer-eligible layers.
+
+    Args:
+        prim: Prim whose authored stack should be filtered.
+        valid_layer_identifiers: Layer identifiers accepted as transfer sources.
+
+    Returns:
+        Prim specs authored in eligible source layers.
+    """
+    if not prim or not prim.IsValid():
+        return ()
+
+    valid_layer_identifiers = set(valid_layer_identifiers)
+    if not valid_layer_identifiers:
+        return ()
+    return tuple(
+        prim_spec
+        for prim_spec in prim.GetPrimStack()
+        if prim_spec.layer.identifier in valid_layer_identifiers and _prim_spec_has_definition_opinion(prim_spec)
+    )
+
+
+def get_transferable_reference_specs(
+    prim: Usd.Prim,
+    reference: Sdf.Reference,
+    valid_layer_identifiers: Iterable[str],
+) -> tuple[Sdf.PrimSpec, ...]:
+    """Return authored reference specs from transfer-eligible layers.
+
+    Args:
+        prim: Prim whose authored stack should be filtered.
+        reference: Reference edit that must exist on the returned specs.
+        valid_layer_identifiers: Layer identifiers accepted as transfer sources.
+
+    Returns:
+        Prim specs that author the reference in eligible source layers.
+    """
+    if not prim or not prim.IsValid():
+        return ()
+
+    valid_layer_identifiers = set(valid_layer_identifiers)
+    if not valid_layer_identifiers:
+        return ()
+    return tuple(
+        prim_spec
+        for prim_spec in prim.GetPrimStack()
+        if prim_spec.layer.identifier in valid_layer_identifiers and _prim_spec_has_reference(prim_spec, reference)
+    )
+
+
+def _prim_spec_has_reference(prim_spec: Sdf.PrimSpec, reference: Sdf.Reference) -> bool:
+    if prim_spec is None or not prim_spec.hasReferences:
+        return False
+    return prim_spec.GetInfo(Sdf.PrimSpec.ReferencesKey).HasItem(reference)
+
+
+def _property_spec_belongs_to_definition(property_spec: Sdf.PropertySpec) -> bool:
+    prim_spec = property_spec.layer.GetPrimAtPath(property_spec.path.GetPrimPath())
+    return bool(prim_spec and prim_spec.specifier == Sdf.SpecifierDef)
+
+
+def _prim_spec_has_definition_opinion(prim_spec: Sdf.PrimSpec) -> bool:
+    if prim_spec.specifier == Sdf.SpecifierDef:
+        return True
+    if not prim_spec.HasInfo(Usd.Tokens.apiSchemas):
+        return False
+
+    # Particle systems are the special case this guards: applying the particle-system API to a
+    # captured prim is a transferable particle-system definition even though USD stores it on
+    # an over prim. Particle property edits also use over prims, but they do not apply that API
+    # and must stay modification transfers. Sdf stores the registered API token, not the
+    # user-facing schema name used by Usd.Prim.HasAPI().
+    return prim_spec.GetInfo(Usd.Tokens.apiSchemas).HasItem(constants.PARTICLE_SCHEMA_NAME)
+
+
+def get_prototype(prim: Usd.Prim) -> Usd.Prim | None:
+    """Idempotent function to retrieve the prototype (mesh_hash) version of a prim, if existent, else None.
+
+    I.e:
+
+    - /RootNode/instances/inst_HASH_0/hovercraft -> /RootNode/meshes/mesh_HASH/hovercraft
+    - /RootNode/instances/inst_HASH_0 -> /RootNode/meshes/mesh_HASH
+    - /RootNode/meshes/mesh_HASH/hovercraft -> /RootNode/meshes/mesh_HASH/hovercraft
+    - /RootNode/meshes/mesh_HASH -> /RootNode/meshes/mesh_HASH
+    - /RootNode/other -> /RootNode/other
+
+    Returns:
+        - The equivalent prototype prim instance.
+    """
+    if not prim.IsValid():
+        return None
+
+    if is_a_prototype(prim):
+        return prim
+
+    prototype_path = constants.COMPILED_REGEX_INSTANCE_TO_MESH_SUB.sub(rf"{constants.MESH_PATH}\2", str(prim.GetPath()))
+    stage = prim.GetStage()
+    prototype_prim = stage.GetPrimAtPath(prototype_path)
+    if not prototype_prim.IsValid():
+        return None
+
+    return prototype_prim
+
+
+def is_ghost_prim(prim: Usd.Prim) -> bool:
+    """Detect a ghost prim -- a valid, typeless instance child whose prototype was deleted.
+
+    A ghost appears when a capture reference is removed from a prototype
+    but the capture layer still holds an ``over`` spec for the corresponding
+    instance child.  Only instance children can become ghosts; the prototype
+    must no longer exist for the prim to qualify.
+    """
+    if not is_instance(prim):
+        return False
+    if get_prototype(prim) is not None:
+        return False
+    return prim.IsValid() and not prim.GetTypeName()
+
+
+def find_prim_with_references(
+    prim: Usd.Prim,
+) -> tuple[Usd.Prim, list[tuple[Usd.Prim, Sdf.Reference, Sdf.Layer, int]]]:
+    """Walk up the prim hierarchy to find the nearest ancestor that holds references.
+
+    At each level the prim itself is checked first.  If it has no references
+    and is an instance, its prototype is checked as a fallback so that
+    callers operating on instance paths can discover prototype-owned refs.
+
+    Returns the prim that owns the references and its reference items, or
+    the original prim with an empty list if no references are found.
+    """
+    if not prim:
+        return prim, []
+    current = prim
+    while current and current.IsValid() and current.GetPath() != Sdf.Path("/"):
+        ref_items, _ = get_reference_file_paths(current)
+
+        if not ref_items:
+            proto = get_prototype(current)
+            if proto is not None and proto != current:
+                ref_items, _ = get_reference_file_paths(proto)
+                if ref_items:
+                    return proto, ref_items
+
+        if ref_items:
+            return current, ref_items
+        current = current.GetParent()
+    return prim, []
+
+
+def has_replacement_ref_edits(prim: Usd.Prim, rep_layers: set[Sdf.Layer]) -> bool:
+    """Check whether any replacement layer has reference-list edits for *prim*.
+
+    Detects edits such as an explicitly emptied reference list (from a
+    delete-capture operation) or any added/deleted/prepended/appended
+    reference entries.  Instance prims are resolved to their prototype
+    before inspecting layers.
+
+    Returns ``False`` for bare ``over`` specs with no reference opinions,
+    such as those left behind by Kit undo operations.
+
+    Args:
+        prim: The USD prim to inspect.
+        rep_layers: Replacement layers to search for reference list edits.
+    """
+    if not prim:
+        return False
+    proto = get_prototype(prim)
+    if proto is not None and proto is not prim:
+        prim = proto
+    path = prim.GetPath()
+    for layer in rep_layers:
+        prim_spec = layer.GetPrimAtPath(path)
+        if prim_spec:
+            ref_list = prim_spec.referenceList
+            if (
+                ref_list.isExplicit
+                or ref_list.addedItems
+                or ref_list.deletedItems
+                or ref_list.prependedItems
+                or ref_list.appendedItems
+            ):
+                return True
+    return False
