@@ -9,6 +9,7 @@
 - Автор / сопровождающий: [hopelessnes5](https://github.com/hopelessnes5/)
 - Репозиторий: [github.com/hopelessnes5/blender-remix](https://github.com/hopelessnes5/blender-remix)
 - Версия: 0.4
+- Страница прогресса (HTML): [progress.html](../progress.html) (откройте в браузере)
 
 ---
 
@@ -24,7 +25,7 @@
 |---|---|:--:|---|
 | Создание / открытие проекта мода (`mod.usda`) | `lightspeed.trex.project_wizard.core`, `lightspeed.trex.replacement.core.shared` | ✅ | `Load Remix Project`, `Create New Mod File`; корневой каталог проекта определяется по расположению `mod.usda` |
 | Стек подслоёв: добавление существующего, создание нового, выбор целевого слоя для редактирования | `lightspeed.trex.layer_manager.core`, менеджер сцены (stage manager) | 🟡 | Можно создавать и добавлять подслои, а также назначать активный целевой слой; нет дерева с перетаскиванием и изменения порядка слоёв |
-| Отключение / блокировка слоёв, изменение порядка перетаскиванием | `lightspeed.trex.layer_manager.core` | ⛔ | |
+| Отключение / блокировка слоёв, изменение порядка перетаскиванием | `lightspeed.trex.layer_manager.core` | 🟡 | Метаданные `omni_layer` `muteness` / `locked` применяются при открытии проекта; переключателей mute/lock и перетаскивания слоёв в интерфейсе нет |
 | Автосохранение, проверка проекта, события очистки слоёв | `lightspeed.event.autosave`, `lightspeed.event.validate_project`, `lightspeed.event.layers_cleanup` | ⛔ | |
 | Упаковка мода в один файл `.usd` (со сбором зависимостей) | `lightspeed.trex.packaging.core`, `lightspeed.trex.mod_packaging_*` | ⛔ | |
 | Настраиваемые каталоги экспорта ресурсов | контекст импорта ресурсов (ingest context) | ✅ | `Mesh Directory` (`assets/ingested`), `Texture Directory` (`rtx-remix/textures`) |
@@ -134,7 +135,7 @@ StageCraft, MCP-сервер или HTTP/REST-сервис, и не создаю
 | `lightspeed.common.lightspeed.common.constants` | `nvidia_core/constants.py` | Значения и регулярные выражения скопированы; удалён импорт `omni.ui`, из-за которого модуль нельзя было использовать вне Kit. |
 | `lightspeed.trex.utils.common.prim_utils` | `nvidia_core/prim_utils.py` | Перенесены алгоритмы: классификация, поиск прототипа, поиск ссылок, transferable-спецификации, обнаружение «ghost»-объектов. Неявный контекст `omni.usd` и выделение заменены явными аргументами `stage` / `selection`. |
 | `lightspeed.trex.capture.core.shared.setup` | `nvidia_core/capture.py` | Перенесены определение захвата, метаданные слоя, поиск хешей, копирование метаданных сцены и публикация `remix_config`. Менеджер слоёв Kit, миниатюры, листинг через `omni.client` и undo не переносились. |
-| Порядок слоёв `lightspeed.layer_manager.core` | `nvidia_core/composition.py` | Повторно реализовано на `pxr`: захват всегда является самым слабым подслоем, mod/replacement-слой становится целевым для редактирования, захват блокируется от записи. Полная модель слоёв, интерфейс mute/reorder и события не переносились. |
+| Порядок слоёв `lightspeed.layer_manager.core` | `nvidia_core/composition.py` | Повторно реализовано на `pxr`: захват всегда является самым слабым подслоем, mod/replacement-слой становится целевым для редактирования, захват блокируется от записи, а метаданные `omni_layer.muteness` / `omni_layer.locked` рабочего файла применяются при открытии. Полная модель слоёв, интерфейс mute/lock/reorder и события не переносились. |
 | `omni.usd.get_composed_references_from_prim`, `omni.usd.get_introducing_layer` | `compatibility/kit_adapters.py` | Повторно реализовано через `Sdf` / `Usd.PrimCompositionQuery`, включая определение слоя-автора и относительные пути к ресурсам. |
 | `omni.flux.utils.common.lights.get_light_type` | `compatibility/kit_adapters.py` | Перенесены перечисление типов источников света и исторический псевдоним `DomeLight_1`. |
 | Соглашения Toolkit о mesh/prim | `nvidia_core/geometry.py` | Извлечение для Blender написано под ту же структуру `mesh_<HASH>` / `inst_<HASH>_<N>`. N-угольники сохраняются, левосторонняя намотка (`leftHanded`) разворачивается, массивы UV/нормалей на угол остаются согласованными с `faceVertexIndices`. |
@@ -204,8 +205,10 @@ $env:REMIX_IMPORT_BACKEND = "legacy"
 утилиты prim, помощники захвата, композицию/блокировку, геометрию (N-угольники,
 левосторонняя намотка, индексы primvar), неизменность захвата, выбор/откат
 backend и реальный импорт в Blender файлов `capture.usda` и
-`full_project.usda`. Тесты композиции также проверяют, что сохранение проекта
-пишет только mod-слой, а запись в заблокированный захват вызывает ошибку.
+`full_project.usda`. Тесты композиции также проверяют, что muteness из
+`omni_layer` действительно исключает отключённые подслои, что слои из
+`omni_layer.locked` становятся read-only, что сохранение проекта пишет только
+mod-слой, а запись в заблокированный захват вызывает ошибку.
 `tests/blender/test_ui_operators.py` прогоняет настоящие
 UI-операторы (`remix.import_capture`, `remix.scan_capture_folder`) целиком,
 включая переключение backend через свойство сцены и путь ошибки `direct-only`.
@@ -214,7 +217,7 @@ UI-операторы (`remix.import_capture`, `remix.scan_capture_folder`) це
 владеющий ссылкой, хеш capture-файла не меняется, каталог `assets/` не
 появляется, а скомпонованная геометрия исчезает и возвращается.
 
-**Фактический результат:** 87 тестов проходят и на Blender 4.5.5 LTS
+**Фактический результат:** 89 тестов проходят и на Blender 4.5.5 LTS
 (встроенный OpenUSD 25.02), и на Blender 5.1.2 (встроенный OpenUSD 25.08) под
 Windows, код возврата `0`; `register()` / `unregister()` также проверены на обеих
 версиях. Свежесобранный `rtx_remix_importer.zip` установлен через
@@ -229,10 +232,10 @@ Windows, код возврата `0`; `register()` / `unregister()` также �
 - В этом окружении группа узлов `Aperture Opaque` не подключалась, поэтому
   преобразование материалов проверялось через существующий резервный
   Principled BSDF.
-- Метаданные **muteness** из `omni_layer` Toolkit не применяются средствами
-  `pxr`; поэтому в составе проекта учитываются и отключённые (muted) подслои.
-  Блокировка, порядок и целевой слой применяются, но полное соответствие mute —
-  задача P1.
+- Применение `omni_layer` muteness/locked проверено на фикстуре Toolkit. Проекты,
+  в которых отключён или заблокирован сам capture либо mod-слой, не покрыты: эти
+  слои защищены и намеренно не отключаются, тогда как официальный Toolkit может
+  предлагать для них другую политику интерфейса.
 - Импорт источников света делегируется существующему `light_utils.py`, который
   по-прежнему предупреждает о возможном неверном повороте для Y-up.
 - Пути Windows с не-ASCII символами и Linux/Wine не проверялись.

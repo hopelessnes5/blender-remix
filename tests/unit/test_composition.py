@@ -76,6 +76,38 @@ class TestComposedProject(unittest.TestCase):
         self.assertIsNotNone(layer)
         self.assertEqual(layer.customLayerData[constants.LAYER_TYPE_KEY], constants.LAYER_TYPE_REPLACEMENT)
 
+    def test_omni_layer_muteness_is_applied(self):
+        project = composition.ProjectComposition.open(str(FULL_PROJECT))
+        try:
+            muted = {Path(identifier).name for identifier in project.muted_layers}
+            self.assertEqual(muted, {"mod_capture_baker.usda", "sublayer_child_01.usda"})
+            for identifier in project.muted_layers:
+                self.assertTrue(project.stage.IsLayerMuted(identifier))
+
+            # sublayer_child_01 would override the texture if it composed.
+            shader = project.stage.GetPrimAtPath(
+                "/RootNode/Looks/mat_8D1946B4993CE5A3/Shader"
+            )
+            texture = shader.GetAttribute("inputs:diffuse_texture").Get()
+            self.assertTrue(str(texture.path).endswith("8D1946B4993CE5A3.dds"))
+
+            # The mod edit target is never muted.
+            self.assertNotIn(Path(project.mod_layer.identifier).name, muted)
+            self.assertFalse(project.stage.IsLayerMuted(project.mod_layer.identifier))
+        finally:
+            project.close()
+
+    def test_omni_layer_locked_layers_are_read_only(self):
+        project = composition.ProjectComposition.open(str(FULL_PROJECT))
+        try:
+            locked = {Path(layer.identifier).name for layer in project.locked_layers}
+            self.assertEqual(locked, {"capture.usda", "sublayer_child_02.usda"})
+            for layer in project.locked_layers:
+                self.assertFalse(layer.permissionToEdit)
+            self.assertTrue(project.mod_layer.permissionToEdit)
+        finally:
+            project.close()
+
 
 class TestAddCaptureSublayer(unittest.TestCase):
     def test_capture_is_appended_as_weakest_sublayer(self):

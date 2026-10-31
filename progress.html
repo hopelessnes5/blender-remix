@@ -1,0 +1,496 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Remix Toolkit for Blender — progress</title>
+<style>
+  body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;max-width:1000px;margin:auto;padding:16px;line-height:1.5;color:#1f2328;background:#fff}
+  a{color:#0969da;text-decoration:none}
+  a:hover{text-decoration:underline}
+  h1{font-size:2rem;line-height:1.15;margin:.15em 0 .3em}
+  h2{margin-top:2.2rem;padding-bottom:.3rem;border-bottom:1px solid #d8dee4}
+  h3{margin-top:1.6rem}
+  p,ul,ol{max-width:880px}
+  code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:.9em;background:#f6f8fa;padding:1px 4px;border-radius:3px;overflow-wrap:break-word}
+  pre{background:#f6f8fa;border:1px solid #d8dee4;border-radius:6px;padding:12px;overflow:auto;line-height:1.35}
+  pre code{background:none;padding:0;font-size:.85rem;overflow-wrap:normal}
+  table{border-collapse:collapse;width:100%;margin:1rem 0;font-size:.94rem}
+  th,td{border:1px solid #ccc;padding:4px 8px;vertical-align:top;text-align:left}
+  th{background:#f6f8fa}
+  table.numbers td+td,table.numbers th+th{text-align:right}
+  table.numbers th:first-child,table.numbers td:first-child{text-align:left}
+  .scroll{overflow-x:auto}
+  .scroll table{min-width:760px}
+  .scroll.summary table{min-width:0}
+  .eyebrow{text-transform:uppercase;letter-spacing:.08em;font-size:.75rem;color:#57606a;margin:0}
+  .lede{font-size:1.1rem;max-width:850px}
+  .links{margin:.5rem 0}
+  .fine{color:#57606a;font-size:.9rem}
+  .note{color:#57606a;font-size:.9rem}
+  .status{text-align:center;white-space:nowrap}
+  .ok{color:#1a7f37}
+  .partial{color:#9a6700}
+  .none{color:#cf222e}
+  .pass{color:#1a7f37;font-weight:600}
+  .fail{color:#cf222e;font-weight:600}
+  .callout{border-left:4px solid #0969da;background:#f6f8fa;padding:10px 14px;margin:1rem 0}
+  .callout p{margin:.25rem 0}
+  .meter{display:flex;height:16px;border:1px solid #ccc;border-radius:3px;overflow:hidden;margin:14px 0 8px;background:#d0d7de}
+  .meter span{display:block;height:100%}
+  .meter .full{background:#2da44e}
+  .meter .partial{background:#d4a72c}
+  .meter .none{background:#d0d7de}
+  .legend{display:flex;flex-wrap:wrap;gap:8px 18px;font-size:.9rem;color:#57606a;margin:0 0 14px}
+  .legend i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:5px}
+  nav{font-size:.9rem;margin:1rem 0 0}
+  nav a{margin-right:.35rem}
+  .narrow{display:none}
+  footer{margin-top:3rem;padding-top:1rem;border-top:1px solid #d8dee4;color:#57606a;font-size:.85rem}
+  @media (max-width:640px){body{padding:12px}h1{font-size:1.65rem}table{font-size:.85rem}th,td{padding:3px 5px}.wide{display:none}.narrow{display:inline}}
+</style>
+</head>
+<body>
+
+<header>
+  <p class="eyebrow">Blender add-on · v0.4 · progress snapshot 31 October 2026</p>
+  <h1>Remix Toolkit for Blender</h1>
+  <p class="lede">A Blender add-on that imports RTX Remix captures and exports meshes, materials and lights back into a Remix mod (<code>mod.usda</code>).</p>
+  <p class="links"><a href="README.md">README</a> · <a href="docs/README.ru.md">Русский</a> · <a href="https://github.com/hopelessnes5/blender-remix">GitHub</a> · <a href="https://github.com/hopelessnes5/blender-remix/releases">Releases</a> · <a href="https://github.com/hopelessnes5/blender-remix/issues">Issues</a></p>
+  <p class="fine">This project uses AI-generated code. Not affiliated with NVIDIA. RTX Remix, the RTX Remix Toolkit and the AperturePBR materials belong to NVIDIA.</p>
+  <nav>
+    <a href="#progress">Progress</a> ·
+    <a href="#parity">Feature parity</a> ·
+    <a href="#backend">Direct backend</a> ·
+    <a href="#tests">Tests</a> ·
+    <a href="#usage">Usage</a> ·
+    <a href="#issues">Known issues</a>
+  </nav>
+</header>
+
+<h2 id="progress">Progress at a glance</h2>
+
+<div class="meter" role="img" aria-label="20 features fully implemented, 9 partial, 16 not implemented out of 45">
+  <span class="full" style="width:44.44%"></span><span class="partial" style="width:20%"></span><span class="none" style="width:35.56%"></span>
+</div>
+<div class="legend">
+  <span><i style="background:#2da44e"></i>20 implemented</span>
+  <span><i style="background:#d4a72c"></i>9 partial</span>
+  <span><i style="background:#d0d7de"></i>16 not implemented</span>
+</div>
+
+<div class="scroll summary">
+<table class="numbers">
+  <thead>
+    <tr><th>Area</th><th aria-label="Implemented"><span class="wide">Implemented</span><span class="narrow" aria-hidden="true">✅</span></th><th aria-label="Partial"><span class="wide">Partial</span><span class="narrow" aria-hidden="true">🟡</span></th><th aria-label="Not implemented"><span class="wide">Not implemented</span><span class="narrow" aria-hidden="true">⛔</span></th><th>Total</th><th>%</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Project and layers</td><td>2</td><td>2</td><td>2</td><td>6</td><td>33%</td></tr>
+    <tr><td>Capture import</td><td>5</td><td>3</td><td>0</td><td>8</td><td>63%</td></tr>
+    <tr><td>Mesh replacement</td><td>5</td><td>1</td><td>4</td><td>10</td><td>50%</td></tr>
+    <tr><td>Materials</td><td>3</td><td>1</td><td>2</td><td>6</td><td>50%</td></tr>
+    <tr><td>Textures</td><td>3</td><td>1</td><td>2</td><td>6</td><td>50%</td></tr>
+    <tr><td>Assets and integration</td><td>2</td><td>1</td><td>6</td><td>9</td><td>22%</td></tr>
+    <tr><th>Total</th><th>20</th><th>9</th><th>16</th><th>45</th><th>44%</th></tr>
+  </tbody>
+</table>
+</div>
+
+<p>45 Toolkit features are compared one by one below. <strong>20 are fully implemented (44%)</strong>, 9 are partial or use a different approach, and 16 are not implemented. If partial features are counted as coverage, 29 of 45 (64%) have a working path in the add-on.</p>
+<p class="note">A partial feature is never counted as implemented. The counts are derived from the parity tables in <a href="README.md">README.md</a>; the notes in those tables are the authority.</p>
+
+<h2 id="parity">Feature parity with the official RTX Remix Toolkit</h2>
+<p>The official Toolkit is a Kit-based application (<code>lightspeed.trex.*</code> extensions). This add-on re-implements the parts that make sense inside Blender.</p>
+<p><strong>Legend:</strong> <span class="ok">✅ implemented</span> · <span class="partial">🟡 partial / different approach</span> · <span class="none">⛔ not implemented</span></p>
+
+<h3>Project and layers</h3>
+<div class="scroll">
+<table>
+  <thead><tr><th>Feature</th><th>Official Toolkit component</th><th>Status</th><th>Notes in this add-on</th></tr></thead>
+  <tbody>
+    <tr><td>Create / open a mod project (<code>mod.usda</code>)</td><td><code>lightspeed.trex.project_wizard.core</code>, <code>lightspeed.trex.replacement.core.shared</code></td><td class="status ok" aria-label="Implemented">✅</td><td><code>Load Remix Project</code>, <code>Create New Mod File</code>; the project root is derived from <code>mod.usda</code></td></tr>
+    <tr><td>Sub-layer stack: add existing, create new, pick edit target</td><td><code>lightspeed.trex.layer_manager.core</code>, stage manager</td><td class="status partial" aria-label="Partial">🟡</td><td>Create + add + set active target layer; no drag-and-drop tree, no reordering</td></tr>
+    <tr><td>Layer mute / lock, reorder by drag and drop</td><td><code>lightspeed.trex.layer_manager.core</code></td><td class="status partial" aria-label="Partial">🟡</td><td><code>omni_layer</code> <code>muteness</code> / <code>locked</code> metadata is applied when a project opens; no mute/lock toggles and no drag-and-drop reorder UI</td></tr>
+    <tr><td>Autosave, project validation, layer cleanup events</td><td><code>lightspeed.event.autosave</code>, <code>lightspeed.event.validate_project</code>, <code>lightspeed.event.layers_cleanup</code></td><td class="status none" aria-label="Not implemented">⛔</td><td></td></tr>
+    <tr><td>Mod packaging into a single <code>.usd</code> (+ dependency collection)</td><td><code>lightspeed.trex.packaging.core</code>, <code>lightspeed.trex.mod_packaging_*</code></td><td class="status none" aria-label="Not implemented">⛔</td><td></td></tr>
+    <tr><td>Configurable asset output directories</td><td>ingest context</td><td class="status ok" aria-label="Implemented">✅</td><td><code>Mesh Directory</code> (<code>assets/ingested</code>), <code>Texture Directory</code> (<code>rtx-remix/textures</code>)</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h3>Capture import</h3>
+<div class="scroll">
+<table>
+  <thead><tr><th>Feature</th><th>Official Toolkit component</th><th>Status</th><th>Notes in this add-on</th></tr></thead>
+  <tbody>
+    <tr><td>Import a capture file</td><td><code>lightspeed.trex.capture.core.shared</code></td><td class="status ok" aria-label="Implemented">✅</td><td><code>Import RTX Remix Capture</code>; <code>.usd</code>, <code>.usda</code>, <code>.usdc</code></td></tr>
+    <tr><td>Mass import + capture browser with previews</td><td><code>lightspeed.trex.home.widget</code>, project wizard</td><td class="status ok" aria-label="Implemented">✅</td><td>List with checkboxes, <code>Batch Import All / Selected</code>, DDS→PNG thumbnails</td></tr>
+    <tr><td>Captured materials → viewport materials</td><td><code>lightspeed.tool.material.core</code>, <code>omni.flux.asset_importer.core</code></td><td class="status ok" aria-label="Implemented">✅</td><td>AperturePBR Opaque / Translucent / Model / Normal / SpriteSheet (bundled <code>.mdl</code>), Principled BSDF fallback</td></tr>
+    <tr><td>Instance / selection tree editing</td><td><code>lightspeed.trex.selection_tree.widget</code></td><td class="status partial" aria-label="Partial">🟡</td><td>One Blender object per <code>inst_&lt;hash&gt;_N</code>, mesh data shared per prototype; no prototype tree UI</td></tr>
+    <tr><td>Per-instance render state / material metadata</td><td>mesh and material panes</td><td class="status partial" aria-label="Partial">🟡</td><td>Reads <code>metadata:*</code> and legacy <code>primvars:_remix_metadata</code>; binding resolution uses the direct relationship, composed bindings and prototype/child fallbacks</td></tr>
+    <tr><td>Lights → Blender lights (Sphere / Disk / Cylinder / Rect / Distant)</td><td>light replacement</td><td class="status ok" aria-label="Implemented">✅</td><td>Intensity, color, radius, shaping cone</td></tr>
+    <tr><td>Cameras → Blender camera + align view</td><td>stage camera</td><td class="status ok" aria-label="Implemented">✅</td><td><code>Select Imported Camera</code>, <code>Align View to Imported Camera</code></td></tr>
+    <tr><td>Unit handling on import</td><td>ingest <code>ApplyUnitScale</code></td><td class="status partial" aria-label="Partial">🟡</td><td>Direct backend reads the capture's <code>metersPerUnit</code>; the legacy backend still uses only <code>Capture Scale</code></td></tr>
+  </tbody>
+</table>
+</div>
+
+<h3>Mesh replacement and asset creation</h3>
+<div class="scroll">
+<table>
+  <thead><tr><th>Feature</th><th>Official Toolkit component</th><th>Status</th><th>Notes in this add-on</th></tr></thead>
+  <tbody>
+    <tr><td>Replace a captured mesh: <code>over "mesh_&lt;HASH&gt;" ( references = None )</code> + child <code>def Xform "ref_&lt;uuid&gt;"</code> with <code>prepend references</code> and <code>custom bool IsRemixRef = 1</code></td><td><code>lightspeed.trex.asset_replacements.core.shared</code>, <code>lightspeed.trex.properties_pane.mesh.widget</code></td><td class="status ok" aria-label="Implemented">✅</td><td><code>Export Selected Meshes/Lights</code>; holder prim is reused on repeated exports, duplicates and stale overrides are cleaned up</td></tr>
+    <tr><td>Hide a captured mesh without exporting geometry</td><td><code>Setup.remove_reference</code> (cross-layer branch)</td><td class="status ok" aria-label="Implemented">✅</td><td><code>Hide Selected Meshes</code> writes <code>references = None</code> into the mod layer on the reference-owning prim (<code>inst_&lt;HASH&gt;_&lt;N&gt;</code> for inline captures); capture layers are never touched</td></tr>
+    <tr><td>Ingested mesh asset layout: <code>/ReferenceTarget</code> → <code>/XForms</code> → <code>Mesh</code>, <code>MaterialBindingAPI</code>, <code>subdivisionScheme</code>, <code>extent</code>, face-varying UVs and normals</td><td><code>lightspeed.trex.asset_pipeline.core</code> (<code>meta</code> step), IngestCraft</td><td class="status ok" aria-label="Implemented">✅</td><td>Same structure the official ingest pipeline writes, including <code>defaultPrim</code></td></tr>
+    <tr><td>Unit normalisation of the asset</td><td>ingest <code>ApplyUnitScale</code></td><td class="status partial" aria-label="Partial">🟡</td><td>Geometry is converted with <code>Export Scale</code> instead of <code>metersPerUnit</code></td></tr>
+    <tr><td>Add a brand-new instanced mesh</td><td>ingest + add reference</td><td class="status ok" aria-label="Implemented">✅</td><td>Creates <code>mesh_&lt;HASH&gt;</code> + <code>inst_&lt;HASH&gt;_0</code> when no target mesh is selected</td></tr>
+    <tr><td>Add an <em>extra</em> reference to a mesh prim (combine assets)</td><td>mesh pane “add reference”</td><td class="status none" aria-label="Not implemented">⛔</td><td>Only single replace</td></tr>
+    <tr><td>Restore / unhide the original captured mesh</td><td>remove reference</td><td class="status ok" aria-label="Implemented">✅</td><td><code>Restore Hidden Meshes</code>; removes the <code>references = None</code> mask from the mod layer, no geometry is exported</td></tr>
+    <tr><td>Duplicate a replacement (copy USD overrides)</td><td><code>copy_replacement_overrides_to_path</code></td><td class="status none" aria-label="Not implemented">⛔</td><td></td></tr>
+    <tr><td>Skeleton / skinned mesh replacement + automatic joint remap (<code>skel:remix_joints</code>)</td><td><code>lightspeed.trex.skeleton_replacements.widget</code>, <code>.../skeleton.py</code></td><td class="status none" aria-label="Not implemented">⛔</td><td></td></tr>
+    <tr><td>Ingest non-USD sources (FBX, OBJ, glTF, …) via <code>omni.kit.asset_converter</code></td><td><code>omni.flux.asset_importer.core</code></td><td class="status none" aria-label="Not implemented">⛔</td><td>USD in / USD out only</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h3>Materials</h3>
+<div class="scroll">
+<table>
+  <thead><tr><th>Feature</th><th>Official Toolkit component</th><th>Status</th><th>Notes in this add-on</th></tr></thead>
+  <tbody>
+    <tr><td>Author <code>AperturePBR_Opacity</code> / <code>AperturePBR_Translucent</code> materials (texture slots + constants)</td><td><code>lightspeed.tool.material.core</code></td><td class="status ok" aria-label="Implemented">✅</td><td>Diffuse, metallic, roughness, normal, emissive, opacity, specular; transmittance, IOR, thin-walled</td></tr>
+    <tr><td>Replace the material of a captured mesh</td><td><code>lightspeed.tool.material.core</code></td><td class="status partial" aria-label="Partial">🟡</td><td>Exports a new <code>mat_&lt;uuid&gt;</code> and binds it with <code>strongerThanDescendants</code>; it does not <code>over</code> the captured <code>mat_&lt;HASH&gt;</code></td></tr>
+    <tr><td>Correct material binding strength (<code>bindMaterialAs</code> as relationship metadata)</td><td>USD material binding</td><td class="status ok" aria-label="Implemented">✅</td><td>Authored through <code>MaterialBindingAPI</code>, not as an attribute</td></tr>
+    <tr><td>Aperture node group inside Blender + Principled ⇄ Aperture conversion</td><td>— (Blender-side authoring)</td><td class="status ok" aria-label="Implemented">✅</td><td><code>Create Aperture Opaque / Translucent</code></td></tr>
+    <tr><td>Copy / transfer material overrides between prims</td><td><code>transfer_property_spec_to_layer</code>, <code>transfer_reference_spec_to_layer</code></td><td class="status none" aria-label="Not implemented">⛔</td><td></td></tr>
+    <tr><td>MDL parameter browser / material presets</td><td>material tool</td><td class="status none" aria-label="Not implemented">⛔</td><td></td></tr>
+  </tbody>
+</table>
+</div>
+
+<h3>Textures</h3>
+<div class="scroll">
+<table>
+  <thead><tr><th>Feature</th><th>Official Toolkit component</th><th>Status</th><th>Notes in this add-on</th></tr></thead>
+  <tbody>
+    <tr><td>Convert textures to DDS (BC7 / BC5 / BC4) on export</td><td>ingest <code>ConvertToDDS</code></td><td class="status ok" aria-label="Implemented">✅</td><td><code>texconv</code> wrapper, per-channel formats, background jobs</td></tr>
+    <tr><td>Reuse existing textures by base material name</td><td>—</td><td class="status ok" aria-label="Implemented">✅</td><td><code>Reuse Existing Textures</code></td></tr>
+    <tr><td>Replace a captured texture asset</td><td><code>lightspeed.trex.texture_replacements.core.shared</code></td><td class="status partial" aria-label="Partial">🟡</td><td>New textures are authored on the exported material; texture paths on captured <code>mat_&lt;HASH&gt;</code> prims are not swapped</td></tr>
+    <tr><td>Octahedral normal encoding</td><td>ingest <code>ConvertToOctahedral</code></td><td class="status none" aria-label="Not implemented">⛔</td><td></td></tr>
+    <tr><td>RTXIO texture compression</td><td><code>lightspeed.trex.rtxio.core</code></td><td class="status none" aria-label="Not implemented">⛔</td><td></td></tr>
+    <tr><td>DDS → PNG previews, broken DDS repair</td><td>— (Blender-side)</td><td class="status ok" aria-label="Implemented">✅</td><td><code>Convert DDS to PNG</code>, <code>Fix Broken Textures</code>, texture cache cleanup</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h3>Assets, utilities, integration</h3>
+<div class="scroll">
+<table>
+  <thead><tr><th>Feature</th><th>Official Toolkit component</th><th>Status</th><th>Notes in this add-on</th></tr></thead>
+  <tbody>
+    <tr><td>List / inspect the assets a mod replaces</td><td>stage manager, <code>get_replaced_hashes</code></td><td class="status ok" aria-label="Implemented">✅</td><td><code>Exported Assets</code> box: scan, filter “not in scene”, select, delete</td></tr>
+    <tr><td>Read the mod back into the scene</td><td>stage manager reload</td><td class="status partial" aria-label="Partial">🟡</td><td><code>Apply Mod File Changes</code> (experimental)</td></tr>
+    <tr><td>Force re-export of an asset</td><td>—</td><td class="status ok" aria-label="Implemented">✅</td><td><code>Invalidate Remix Assets</code></td></tr>
+    <tr><td>Undo / redo of USD edits</td><td><code>lightspeed.trex.commands</code>, Kit undo stack</td><td class="status none" aria-label="Not implemented">⛔</td><td>Blender operator undo only</td></tr>
+    <tr><td>Properties panes for raw USD attributes</td><td><code>lightspeed.trex.properties_pane.*</code></td><td class="status none" aria-label="Not implemented">⛔</td><td></td></tr>
+    <tr><td>ComfyUI integration</td><td><code>lightspeed.trex.comfyui.*</code></td><td class="status none" aria-label="Not implemented">⛔</td><td></td></tr>
+    <tr><td>Particle system authoring (<code>ParticleSystemAPI</code>)</td><td>particle editors</td><td class="status none" aria-label="Not implemented">⛔</td><td></td></tr>
+    <tr><td>Stagecraft service / multi-user collaboration</td><td><code>lightspeed.trex.service.host</code>, stagecraft</td><td class="status none" aria-label="Not implemented">⛔</td><td></td></tr>
+    <tr><td>Presets, project settings import/export</td><td>project settings</td><td class="status none" aria-label="Not implemented">⛔</td><td></td></tr>
+  </tbody>
+</table>
+</div>
+
+<h3>Add-on specific features (no Toolkit equivalent)</h3>
+<div class="scroll">
+<table>
+  <thead><tr><th>Feature</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>Capture browser with thumbnails directly in Blender</td><td><code>Captures</code> panel</td></tr>
+    <tr><td>Aperture node group authoring and Principled BSDF fallback</td><td><code>RTX Remix Materials</code> panel, Shader Editor sidebar</td></tr>
+    <tr><td>Background / parallel texture processing with job status UI</td><td><code>Texture Management</code> panel</td></tr>
+    <tr><td>Export scale, auto-apply transforms, “inherit parent material”</td><td><code>Export Settings</code></td></tr>
+    <tr><td>Texture cache and duplicate texture cleanup</td><td><code>Texture Management</code> panel</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h2 id="backend">Direct NVIDIA backend (P0)</h2>
+
+<p>The importer has two backends. The default <strong>direct</strong> backend runs NVIDIA's capture algorithms inside Blender using the <code>pxr</code> (OpenUSD) that ships with Blender. It does not start RTX Remix Toolkit, Omniverse Kit, StageCraft, an MCP server or any HTTP/REST service, and it writes no intermediate files. Only Blender's bundled <code>pxr</code> is used; <code>pxr</code> binaries are never mixed.</p>
+<p>The old importer is preserved verbatim as <code>rtx_remix_importer/legacy_import_core.py</code> and remains the rollback path.</p>
+
+<h3>Architecture</h3>
+<div class="scroll">
+<table>
+  <thead><tr><th>Path</th><th>Responsibility</th></tr></thead>
+  <tbody>
+    <tr><td><code>rtx_remix_importer/nvidia_core/</code></td><td>Pure <code>pxr</code> port: constants, prim classification, capture validation/hashes, layer composition, mesh extraction. Imports neither <code>omni</code>, <code>carb</code> nor <code>bpy</code>.</td></tr>
+    <tr><td><code>rtx_remix_importer/compatibility/kit_adapters.py</code></td><td>Narrow replacements for the Omniverse helpers (<code>omni.usd</code>, <code>omni.flux</code>) used by the ported code.</td></tr>
+    <tr><td><code>rtx_remix_importer/blender_bridge/</code></td><td>Creates Blender meshes, resolves/applies materials and builds the scene (<code>scene_builder.import_with_direct_backend</code>).</td></tr>
+    <tr><td><code>rtx_remix_importer/import_core.py</code></td><td>Facade with backend selection and logged fallback. Keeps the legacy signature and return value.</td></tr>
+    <tr><td><code>rtx_remix_importer/legacy_import_core.py</code></td><td>The previous importer, unchanged and used for rollback.</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h3>NVIDIA code reuse matrix</h3>
+<p class="note">Source paths refer to RTX Remix Toolkit 1.6.1 (<code>source/extensions/...</code>, Apache-2.0). NVIDIA copyright and Apache-2.0 headers are retained in the ported files.</p>
+<div class="scroll">
+<table>
+  <thead><tr><th>NVIDIA source</th><th>Ported to</th><th>Reuse</th></tr></thead>
+  <tbody>
+    <tr><td><code>lightspeed.common.lightspeed.common.constants</code></td><td><code>nvidia_core/constants.py</code></td><td>Values and regexes copied; the <code>omni.ui</code> import that made the module unusable outside Kit was removed.</td></tr>
+    <tr><td><code>lightspeed.trex.utils.common.prim_utils</code></td><td><code>nvidia_core/prim_utils.py</code></td><td>Algorithms ported (classification, prototype lookup, reference discovery, transferable specs, ghost detection). The implicit <code>omni.usd</code> context and selection were replaced by explicit <code>stage</code> / <code>selection</code> arguments.</td></tr>
+    <tr><td><code>lightspeed.trex.capture.core.shared.setup</code></td><td><code>nvidia_core/capture.py</code></td><td>Capture detection, layer metadata, hash discovery, stage-metadata copy and <code>remix_config</code> publishing ported. Kit layer manager, thumbnails, <code>omni.client</code> listing and undo are not ported.</td></tr>
+    <tr><td><code>lightspeed.layer_manager.core</code> layer ordering</td><td><code>nvidia_core/composition.py</code></td><td>Reimplemented with <code>pxr</code>: capture is always the weakest sublayer, the mod/replacement layer is the edit target, capture is locked read-only, and the workfile's <code>omni_layer.muteness</code> / <code>omni_layer.locked</code> metadata is applied on open. The full layer model, mute/lock/reorder UI and events are not ported.</td></tr>
+    <tr><td><code>omni.usd.get_composed_references_from_prim</code>, <code>omni.usd.get_introducing_layer</code></td><td><code>compatibility/kit_adapters.py</code></td><td>Reimplemented with <code>Sdf</code> / <code>Usd.PrimCompositionQuery</code>, including authoring-layer resolution and relative asset paths.</td></tr>
+    <tr><td><code>omni.flux.utils.common.lights.get_light_type</code></td><td><code>compatibility/kit_adapters.py</code></td><td>Light type enum and the historical <code>DomeLight_1</code> alias ported.</td></tr>
+    <tr><td>Toolkit mesh/prim conventions</td><td><code>nvidia_core/geometry.py</code></td><td>Blender extraction written against the same <code>mesh_&lt;HASH&gt;</code> / <code>inst_&lt;HASH&gt;_&lt;N&gt;</code> layout. N-gons are preserved, left-handed winding is reversed, and per-corner UV/normal arrays stay aligned with <code>faceVertexIndices</code>.</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p><strong>Not ported (P1+):</strong> asset replacement transfer, ingest/packaging pipelines, skeleton replacement, material/texture override transfer, ComfyUI integration, StageCraft, Kit undo, and the properties panes. Material <em>conversion</em> remains the add-on's existing <code>material_utils.py</code> code, not an NVIDIA port.</p>
+
+<h3>Layer state from the Toolkit workfile (P1)</h3>
+<p>Toolkit workfiles store per-project layer state in the root layer's <code>customLayerData</code>:</p>
+<pre><code>dictionary omni_layer = {
+    dictionary locked = { bool "./capture.usda" = 1 }
+    dictionary muteness = { bool "./baker.usda" = 1 }
+}</code></pre>
+<p>The direct backend applies this state when a project opens:</p>
+<ul>
+  <li><code>omni_layer.muteness</code> → <code>Usd.Stage.MuteAndUnmuteLayers</code>; muted sublayers no longer participate in composition.</li>
+  <li><code>omni_layer.locked</code> → <code>Sdf.Layer.SetPermissionToEdit(False)</code>; locked layers become read-only in memory.</li>
+  <li>The mod/replacement layer and the capture layer are deliberately protected: they are never muted by this code.</li>
+  <li>There is no mute/lock toggle UI and no drag-and-drop layer reordering yet.</li>
+</ul>
+<p class="note">Muting invalidates the Python handles of muted layers in some OpenUSD builds, so the backend reports muted layers by identifier. Metadata-locked layers are not rewritten when the capture sublayer is re-appended.</p>
+
+<h3>Backend switch and rollback</h3>
+<p>Resolution order:</p>
+<ol>
+  <li><code>REMIX_IMPORT_BACKEND</code> environment variable.</li>
+  <li><code>scene["remix_import_backend"]</code> custom property.</li>
+  <li><code>direct</code> (default).</li>
+</ol>
+<div class="scroll">
+<table>
+  <thead><tr><th>Value</th><th>Behaviour</th></tr></thead>
+  <tbody>
+    <tr><td><code>direct</code> (default)</td><td>NVIDIA algorithms in process; on an unexpected error the import is logged and retried with the legacy importer.</td></tr>
+    <tr><td><code>direct-only</code></td><td>Strict direct backend; errors are raised and never fall back.</td></tr>
+    <tr><td><code>legacy</code></td><td>Old importer only — use this to roll back instantly.</td></tr>
+  </tbody>
+</table>
+</div>
+<pre><code># strict direct backend
+$env:REMIX_IMPORT_BACKEND = "direct-only"
+
+# rollback to the previous importer
+$env:REMIX_IMPORT_BACKEND = "legacy"</code></pre>
+<p>To roll back permanently, set the same value in the scene property or remove the <code>blender_bridge</code> / <code>nvidia_core</code> / <code>compatibility</code> packages and restore <code>import_core.py</code> from <code>legacy_import_core.py</code>. All changes are additive apart from the <code>import_core.py</code> rename, so <code>git revert</code> of the integration commit is enough.</p>
+
+<h3>Import semantics</h3>
+<ul>
+  <li>The capture layer is locked in memory. Only the mod/replacement layer is an edit target; <code>ProjectComposition.add_capture_sublayer()</code> appends a capture as the <strong>weakest</strong> sublayer after removing any previous capture.</li>
+  <li>With the UI default <code>Capture Scale = 0.01</code>, the direct backend uses the capture's own <code>metersPerUnit</code> and <code>upAxis</code> (captures commonly author <code>0.01</code> and Y-up). Any other UI value is treated as an explicit override.</li>
+  <li>One Blender mesh datablock is shared by every instance of a prototype. Materials are linked per object (<code>slot.link = 'OBJECT'</code>) so instances can differ without duplicating geometry.</li>
+  <li>Capture materials are resolved through the direct <code>material:binding</code>, composed bindings, then prototype and mesh-child fallbacks. Invalid targets (for example a stale <code>/RootNode/Looks/...</code> path) are rejected.</li>
+</ul>
+
+<h2 id="tests">Tests and verification</h2>
+<p>Tests live in <code>tests/</code> and must run inside Blender because the add-on package imports <code>bpy</code>:</p>
+<pre><code>&amp; "C:\Blender 4.5 LTS\blender.exe" `
+  --background --factory-startup --python tests/run_tests.py</code></pre>
+
+<div class="scroll">
+<table>
+  <thead><tr><th>Check</th><th>Environment</th><th>Result</th></tr></thead>
+  <tbody>
+    <tr><td>Full suite</td><td>Blender 4.5.5 LTS, OpenUSD 25.02, Windows</td><td><span class="pass">89 / 89 passed</span>, 0 failed, 0 errors, exit 0</td></tr>
+    <tr><td>Full suite</td><td>Blender 5.1.2, OpenUSD 25.08, Windows</td><td><span class="pass">89 / 89 passed</span>, 0 failed, 0 errors, exit 0</td></tr>
+    <tr><td>ZIP install smoke test</td><td>Clean profile, 4.5.5 LTS and 5.1.2</td><td><span class="pass">Passed</span>: install, enable, import fixture (763 vertices, 1 material, <code>direct</code>), hide mask present, restore</td></tr>
+    <tr><td>Static checks</td><td>Windows</td><td><span class="pass">Passed</span>: <code>git diff --check</code>, <code>python -m compileall rtx_remix_importer tests</code></td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>The fixtures in <code>tests/data/full_project/</code> are copied from the Toolkit's <code>lightspeed.layer_manager.core</code> test data (Apache-2.0). The suite covers the Kit adapters, prim utilities, capture helpers, composition/locking, geometry (n-gons, left-handed winding, primvar indices), capture immutability, backend selection/fallback and real Blender imports of both <code>capture.usda</code> and <code>full_project.usda</code>.</p>
+<p>Composition tests verify that <code>omni_layer</code> muteness hides muted sublayers, that metadata-locked sublayers become read-only, that saving a project writes only the mod layer, and that authoring into the locked capture raises. <code>tests/blender/test_ui_operators.py</code> drives the actual UI operators (<code>remix.import_capture</code>, <code>remix.scan_capture_folder</code>) end to end, including the scene-property backend switch and the <code>direct-only</code> error path. <code>tests/unit/test_hide.py</code> and <code>TestHideMeshOperators</code> cover hiding/restoring captured meshes: the mask is authored on the reference-owning instance prim, the capture file hash is unchanged, no <code>assets/</code> output appears, and the composed geometry disappears and returns.</p>
+
+<h3>Not verified</h3>
+<ul>
+  <li>No real game capture with textures was available; only the Toolkit fixture (two DDS files) was exercised.</li>
+  <li>Blender 4.0–4.4, Linux/Wine and non-ASCII Windows paths were not run.</li>
+  <li>Interactive UI clicking was not exercised; the operators are tested in <code>--background</code>.</li>
+  <li>In the test environment the <code>Aperture Opaque</code> node group could not be appended, so material conversion exercised the existing Principled BSDF fallback.</li>
+  <li><code>omni_layer</code> muteness/locking is exercised on the Toolkit fixture. Projects that mute the capture or the mod authoring layer are not covered: those layers are protected and deliberately never muted, while the reference Toolkit may expose a different UI policy for them.</li>
+  <li>Light import delegates to the existing <code>light_utils.py</code>, which still warns about Y-up rotation.</li>
+  <li>The resulting mod has not been loaded in the RTX Remix runtime or a game.</li>
+</ul>
+
+<h2 id="requirements">Requirements and installation</h2>
+<h3>Requirements</h3>
+<ul>
+  <li>Windows (or Wine on Linux)</li>
+  <li>Blender 4.0 or newer (verified in background mode on 4.5.5 LTS and 5.1.2)</li>
+  <li><a href="https://github.com/microsoft/DirectXTex/releases/latest">texconv from DirectXTex</a> — only needed for the source install; it ships inside the release zip</li>
+</ul>
+
+<h3>From a release</h3>
+<ol>
+  <li>Download the latest release from <a href="https://github.com/hopelessnes5/blender-remix/releases">github.com/hopelessnes5/blender-remix/releases</a></li>
+  <li>In Blender: <code>Edit &gt; Preferences &gt; Add-ons &gt; Install...</code>, pick <code>rtx_remix_importer.zip</code></li>
+  <li>Enable <strong>Remix Toolkit for Blender</strong></li>
+</ol>
+
+<h3>From source</h3>
+<ol>
+  <li>Clone the repository</li>
+  <li>Put <code>texconv.exe</code> into <code>rtx_remix_importer/texconv/</code> (create the folder); <code>texconv.exe</code> is git-ignored, so it is not part of the clone</li>
+  <li><code>Edit &gt; Preferences &gt; Add-ons &gt; Install...</code> and select the <code>rtx_remix_importer</code> folder (or copy it into <code>scripts/addons/</code>)</li>
+  <li>Enable <strong>Remix Toolkit for Blender</strong></li>
+</ol>
+<p>If Blender ever refuses to pick up a code change, clear the bytecode cache with <code>delete-py-cache-and-open-blender.ps1</code> in the repository root.</p>
+
+<h2 id="usage">Usage</h2>
+
+<h3>Import captures</h3>
+<ul>
+  <li>Open the <strong>RTX Remix</strong> panel in the 3D viewport sidebar (<code>N</code> key)</li>
+  <li>Set <code>Captures &gt; Capture Folder</code> to your game's capture folder</li>
+  <li>Import a single capture, or tick several and use <code>Batch Import Selected</code></li>
+</ul>
+
+<h3>Project and sub-layers</h3>
+<ul>
+  <li><code>RTX Remix Project &gt; Remix Mod File</code> — point at an existing <code>mod.usda</code> or create a new one</li>
+  <li><code>RTX Remix Project &gt; Sublayers</code> — pick the target sub-layer, or create a new one</li>
+  <li>The active target layer receives every export</li>
+</ul>
+
+<h3>Export meshes and lights</h3>
+<ol>
+  <li>Select an imported object as <code>Export Settings &gt; Target Mesh</code> (the captured mesh whose hash has to be replaced). If you export an object that was imported from a capture, it is used automatically</li>
+  <li>Import or create meshes / lights and place them in the scene</li>
+  <li>Select them and press <code>Export Selected Meshes/Lights</code></li>
+</ol>
+<p>What gets written in the target layer:</p>
+<pre><code>over "RootNode"
+{
+    over "meshes"
+    {
+        over "mesh_&lt;16HEX&gt;" ( references = None )
+        {
+            def Xform "ref_&lt;32HEX&gt;" ( prepend references = @./assets/ingested/&lt;mesh&gt;.usda@ )
+            {
+                custom bool IsRemixRef = 1
+                ... identity translate / rotateXYZ / scale ...
+            }
+        }
+    }
+}</code></pre>
+<p>The ingested asset referenced from there is a self-contained mesh asset:</p>
+<pre><code>def Xform "ReferenceTarget" ( kind = "group" )      # defaultPrim
+{
+    def Xform "XForms" ( kind = "group" )
+    {
+        def Mesh "&lt;mesh&gt;" ( prepend apiSchemas = ["MaterialBindingAPI"] )
+        {
+            rel material:binding = &lt;/ReferenceTarget/Looks/&lt;mesh&gt;__&gt; (
+                bindMaterialAs = "weakerThanDescendants"
+            )
+            uniform token subdivisionScheme = "none"
+        }
+    }
+    def "Looks" { def Material "&lt;mesh&gt;__" { ... } }
+}</code></pre>
+
+<h3>Hide / restore captured meshes (no export)</h3>
+<ol>
+  <li>Select one or more imported capture meshes</li>
+  <li>Press <code>Hide Selected Meshes</code> — the add-on only writes into the mod layer:</li>
+</ol>
+<pre><code>over "RootNode"
+{
+    over "instances"
+    {
+        over "inst_&lt;16HEX&gt;_&lt;N&gt;" ( references = None )
+        {
+        }
+    }
+}</code></pre>
+<ol start="3">
+  <li>Press <code>Restore Hidden Meshes</code> with the same selection to remove the mask</li>
+</ol>
+<p>No mesh, material or texture is exported. The capture layer is opened read-only and is never modified; hiding is refused if the prim already owns a replacement reference. For inline captures the <code>mesh_&lt;HASH&gt;</code> prototype holds the geometry and the <code>inst_&lt;HASH&gt;_&lt;N&gt;</code> prim owns the <code>prepend references</code> that makes it visible, which is why the instance carries the mask. A <code>mesh_&lt;HASH&gt;</code> path is still accepted for captures whose prototype references external geometry.</p>
+
+<h3>Export materials</h3>
+<ol>
+  <li>Select the mesh whose material you want to replace and open the Shader Editor</li>
+  <li>Captured materials come in as Aperture node groups; <code>Principled BSDF</code> works too</li>
+  <li>Use <code>Create Aperture Opaque / Translucent</code> from the Shader Editor sidebar when authoring a material from scratch</li>
+  <li>Press <code>Export Selected Materials</code></li>
+</ol>
+
+<h3>Export settings</h3>
+<div class="scroll">
+<table>
+  <thead><tr><th>Setting</th><th>Default</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td><code>Target Mesh</code></td><td>–</td><td>Captured <code>mesh_&lt;HASH&gt;</code> this export replaces</td></tr>
+    <tr><td><code>Export Scale</code></td><td><code>0.01</code></td><td>Game units per Blender unit; <code>0.01</code> suits most Remix games</td></tr>
+    <tr><td><code>Auto Apply Transforms</code></td><td>on</td><td>Bakes rotation/scale into the exported geometry</td></tr>
+    <tr><td><code>Hide Target Mesh</code></td><td>on</td><td>Writes <code>references = None</code> so the captured mesh is replaced instead of overlapped</td></tr>
+    <tr><td><code>Inherit Parent Material</code></td><td>off</td><td>Keep the captured material instead of exporting a new one</td></tr>
+    <tr><td><code>Reuse Existing Textures</code></td><td>on</td><td>Reuse DDS files by base material name</td></tr>
+    <tr><td><code>Mesh Directory</code></td><td><code>assets/ingested</code></td><td>Where ingested mesh assets are written</td></tr>
+    <tr><td><code>Texture Directory</code></td><td><code>rtx-remix/textures</code></td><td>Where exported DDS textures are written</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h3>Exported assets</h3>
+<p><code>Exported Assets</code> lists every mesh and light reference the selected layers author, with a select / delete action and a <code>Show Assets Not in Scene</code> filter.</p>
+
+<h2 id="issues">Known issues</h2>
+<ul>
+  <li>Skinned mesh export is not supported yet (no skeleton replacement / joint remapping)</li>
+  <li><code>Apply Mod File Changes</code> is experimental and may behave unexpectedly</li>
+  <li>Light replacement is not wired to <code>/RootNode/lights/light_&lt;HASH&gt;</code> yet — lights exported without a target mesh end up under <code>/RootNode/remix_assets</code></li>
+  <li>Albedo textures with an alpha channel may not round-trip correctly</li>
+  <li>Some <code>.dds</code> textures appear purple; use <code>Captures &gt; Fix Broken Textures</code></li>
+  <li>The <code>Aperture Opaque</code> node group is incomplete (animation, iridescence, flags, …)</li>
+  <li>Non-USD source assets (FBX/OBJ/glTF) are not ingested</li>
+  <li>Only one reference per mesh prim can be authored; combining assets into one mesh is not supported</li>
+</ul>
+
+<h2 id="troubleshooting">Troubleshooting</h2>
+<div class="scroll">
+<table>
+  <thead><tr><th>Symptom</th><th>Fix</th></tr></thead>
+  <tbody>
+    <tr><td><code>NameError</code> / add-on fails to enable after updating</td><td>Clear the bytecode cache: <code>delete-py-cache-and-open-blender.ps1</code>, restart Blender</td></tr>
+    <tr><td>Textures are not converted to DDS</td><td><code>texconv.exe</code> is missing in <code>rtx_remix_importer/texconv/</code></td></tr>
+    <tr><td>Purple textures in the viewport</td><td><code>Captures &gt; Fix Broken Textures</code></td></tr>
+    <tr><td>Export says “No Target Mesh selected”</td><td>Select the captured mesh in <code>Export Settings &gt; Target Mesh</code></td></tr>
+  </tbody>
+</table>
+</div>
+
+<h2 id="credits">Credits</h2>
+<ul>
+  <li>Uncle Burrito (RTX Remix Showcase Discord) — the Aperture Opaque node group</li>
+  <li>Based on the original <em>Remix Toolkit for Blender</em> by sambow23; this fork is maintained by <a href="https://github.com/hopelessnes5/">hopelessnes5</a></li>
+</ul>
+<p>Issues and pull requests: <a href="https://github.com/hopelessnes5/blender-remix/issues">github.com/hopelessnes5/blender-remix/issues</a></p>
+
+<footer>
+  Progress snapshot compiled from <a href="README.md">README.md</a> and the test run of 31 October 2026. Русская версия: <a href="docs/README.ru.md">docs/README.ru.md</a>. This page is a hand-maintained status document; the detailed notes above take precedence over the summary percentages.
+</footer>
+
+</body>
+</html>

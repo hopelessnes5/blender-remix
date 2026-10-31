@@ -37,7 +37,7 @@ def apply_omni_layer_state(
     stage: Usd.Stage,
     *,
     protected_layers=(),
-) -> tuple[list[Sdf.Layer], list[Sdf.Layer]]:
+) -> tuple[list[str], list[Sdf.Layer]]:
     """Apply the Toolkit ``omni_layer`` lock/mute metadata to *stage*.
 
     The official layer manager stores per-project layer state in the workfile's
@@ -59,7 +59,9 @@ def apply_omni_layer_state(
             authoring layer and the capture layer).
 
     Returns:
-        ``(muted_layers, locked_layers)`` that were applied.
+        ``(muted_layer_ids, locked_layers)`` that were applied.  Muting
+        invalidates the Python handles of the muted layers in some OpenUSD
+        builds, so identifiers are returned instead.
     """
     if stage is None:
         return [], []
@@ -74,19 +76,6 @@ def apply_omni_layer_state(
             if identifier:
                 by_path[_norm_layer_path(identifier)] = layer
 
-    muted: list[Sdf.Layer] = []
-    for relative_path, enabled in (metadata.get("muteness") or {}).items():
-        if not enabled:
-            continue
-        layer = by_path.get(_norm_layer_path(root_layer.ComputeAbsolutePath(relative_path)))
-        if layer is None or id(layer) in protected:
-            continue
-        muted.append(layer)
-
-    if muted:
-        stage.MuteAndUnmuteLayers([layer.identifier for layer in muted], [])
-        muted = [layer for layer in muted if stage.IsLayerMuted(layer)]
-
     locked: list[Sdf.Layer] = []
     for relative_path, enabled in (metadata.get("locked") or {}).items():
         if not enabled:
@@ -97,7 +86,22 @@ def apply_omni_layer_state(
         if _lock_layer(layer):
             locked.append(layer)
 
-    return muted, locked
+    muted_layers: list[Sdf.Layer] = []
+    for relative_path, enabled in (metadata.get("muteness") or {}).items():
+        if not enabled:
+            continue
+        layer = by_path.get(_norm_layer_path(root_layer.ComputeAbsolutePath(relative_path)))
+        if layer is None or id(layer) in protected:
+            continue
+        muted_layers.append(layer)
+
+    muted_ids: list[str] = []
+    if muted_layers:
+        muted_ids = [layer.identifier for layer in muted_layers]
+        stage.MuteAndUnmuteLayers(muted_ids, [])
+        muted_ids = [identifier for identifier in muted_ids if stage.IsLayerMuted(identifier)]
+
+    return muted_ids, locked
 
 
 
@@ -298,8 +302,9 @@ class ProjectComposition:
             if current.identifier in visited:
                 return
             visited.add(current.identifier)
+            original = list(current.subLayerPaths)
             kept = []
-            for path in current.subLayerPaths:
+            for path in original:
                 # ``FindRelativeToLayer`` resolves relative sublayer paths
                 # against the layer that authors them, which a bare
                 # ``Sdf.Layer.Find`` does not.
@@ -310,7 +315,10 @@ class ProjectComposition:
                 kept.append(path)
                 if child is not None:
                     remove_from(child)
-            current.subLayerPaths[:] = kept
+            # Do not touch layers whose stack is unchanged: a project may lock
+            # unrelated sublayers through omni_layer metadata.
+            if kept != original:
+                current.subLayerPaths[:] = kept
 
         remove_from(root_layer)
 
@@ -362,9 +370,11 @@ def _layer_is_locked(layer: Sdf.Layer | None) -> bool:
 
 
 def _lock_layer(layer: Sdf.Layer | None) -> bool:
-    """Make *layer* read-only in memory; return whether it was newly locked."""
-    if layer is None or _layer_is_locked(layer):
+    """Make *layer* read-only in memory; return whether it is locked."""
+    if layer is None:
         return False
+    if _layer_is_locked(layer):
+        return True
     try:
         if hasattr(layer, "SetPermissionToEdit"):
             layer.SetPermissionToEdit(False)
@@ -373,7 +383,7 @@ def _lock_layer(layer: Sdf.Layer | None) -> bool:
     except Tf.ErrorException as exc:  # pragma: no cover - only on exotic USD builds
         _LOG.warning("Could not lock layer %s: %s", layer.identifier, exc)
         return False
-    return True
+    return _layer_is_locked(layer)
 
 
 def _norm_layer_path(path: str | None) -> str:

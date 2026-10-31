@@ -10,6 +10,7 @@ Not affiliated with NVIDIA. RTX Remix, the RTX Remix Toolkit and the AperturePBR
 - Author / maintainer: [hopelessnes5](https://github.com/hopelessnes5/)
 - Repository: [github.com/hopelessnes5/blender-remix](https://github.com/hopelessnes5/blender-remix)
 - Version: 0.4
+- Progress dashboard (HTML): [progress.html](progress.html) (open in a browser)
 
 ---
 
@@ -25,7 +26,7 @@ The official Toolkit is a Kit-based application (`lightspeed.trex.*` extensions)
 |---|---|:--:|---|
 | Create / open a mod project (`mod.usda`) | `lightspeed.trex.project_wizard.core`, `lightspeed.trex.replacement.core.shared` | ✅ | `Load Remix Project`, `Create New Mod File`; project root is derived from `mod.usda` |
 | Sub-layer stack: add existing, create new, pick edit target | `lightspeed.trex.layer_manager.core`, stage manager | 🟡 | create + add + set active target layer; no drag-and-drop tree, no reordering |
-| Layer mute / lock, reorder by drag and drop | `lightspeed.trex.layer_manager.core` | ⛔ | |
+| Layer mute / lock, reorder by drag and drop | `lightspeed.trex.layer_manager.core` | 🟡 | `omni_layer` `muteness` / `locked` metadata is applied when a project opens; no mute/lock toggles and no drag-and-drop reorder UI |
 | Autosave, project validation, layer cleanup events | `lightspeed.event.autosave`, `lightspeed.event.validate_project`, `lightspeed.event.layers_cleanup` | ⛔ | |
 | Mod packaging into a single `.usd` (+ dependency collection) | `lightspeed.trex.packaging.core`, `lightspeed.trex.mod_packaging_*` | ⛔ | |
 | Configurable asset output directories | ingest context | ✅ | `Mesh Directory` (`assets/ingested`), `Texture Directory` (`rtx-remix/textures`) |
@@ -135,7 +136,7 @@ Source paths refer to RTX Remix Toolkit 1.6.1 (`source/extensions/...`, Apache-2
 | `lightspeed.common.lightspeed.common.constants` | `nvidia_core/constants.py` | Values and regexes copied; the `omni.ui` import that made the module unusable outside Kit was removed. |
 | `lightspeed.trex.utils.common.prim_utils` | `nvidia_core/prim_utils.py` | Algorithms ported (classification, prototype lookup, reference discovery, transferable specs, ghost detection). The implicit `omni.usd` context and selection were replaced by explicit `stage` / `selection` arguments. |
 | `lightspeed.trex.capture.core.shared.setup` | `nvidia_core/capture.py` | Capture detection, layer metadata, hash discovery, stage-metadata copy and `remix_config` publishing ported. Kit layer manager, thumbnails, `omni.client` listing and undo are not ported. |
-| `lightspeed.layer_manager.core` layer ordering | `nvidia_core/composition.py` | Reimplemented with `pxr`: capture is always the weakest sublayer, the mod/replacement layer is the edit target, and the capture is locked read-only. The full layer model, mute/reorder UI and events are not ported. |
+| `lightspeed.layer_manager.core` layer ordering | `nvidia_core/composition.py` | Reimplemented with `pxr`: capture is always the weakest sublayer, the mod/replacement layer is the edit target, capture is locked read-only, and the workfile's `omni_layer.muteness` / `omni_layer.locked` metadata is applied on open. The full layer model, mute/lock/reorder UI and events are not ported. |
 | `omni.usd.get_composed_references_from_prim`, `omni.usd.get_introducing_layer` | `compatibility/kit_adapters.py` | Reimplemented with `Sdf` / `Usd.PrimCompositionQuery`, including authoring-layer resolution and relative asset paths. |
 | `omni.flux.utils.common.lights.get_light_type` | `compatibility/kit_adapters.py` | Light type enum and the historical `DomeLight_1` alias ported. |
 | Toolkit mesh/prim conventions | `nvidia_core/geometry.py` | Blender extraction written against the same `mesh_<HASH>` / `inst_<HASH>_<N>` layout. N-gons are preserved, left-handed winding is reversed, and per-corner UV/normal arrays stay aligned with `faceVertexIndices`. |
@@ -202,7 +203,7 @@ The fixtures in `tests/data/full_project/` are copied from the Toolkit's
 Kit adapters, prim utilities, capture helpers, composition/locking, geometry
 (n-gons, left-handed winding, primvar indices), capture immutability, backend
 selection/fallback and real Blender imports of both `capture.usda` and
-`full_project.usda`; composition tests also verify that saving a project writes only the mod layer and that authoring into the locked capture raises. `tests/blender/test_ui_operators.py` drives the actual UI
+`full_project.usda`; composition tests also verify that `omni_layer` muteness hides muted sublayers, that metadata-locked sublayers become read-only, that saving a project writes only the mod layer, and that authoring into the locked capture raises. `tests/blender/test_ui_operators.py` drives the actual UI
 operators (`remix.import_capture`, `remix.scan_capture_folder`) end to end,
 including the scene-property backend switch and the `direct-only` error path.
 `tests/unit/test_hide.py` and `TestHideMeshOperators` cover hiding/restoring
@@ -210,7 +211,7 @@ captured meshes: the mask is authored on the reference-owning instance prim, the
 capture file hash is unchanged, no `assets/` output appears, and the composed
 geometry disappears/returns.
 
-**Executed result:** 87 tests pass on both Blender 4.5.5 LTS (bundled OpenUSD
+**Executed result:** 89 tests pass on both Blender 4.5.5 LTS (bundled OpenUSD
 25.02) and Blender 5.1.2 (bundled OpenUSD 25.08) on Windows, exit code `0`;
 `register()` / `unregister()` was smoke-tested on both as well. A freshly built
 `rtx_remix_importer.zip` was installed through `preferences.addon_install` into a
@@ -224,9 +225,10 @@ pass.
   (two DDS files) was exercised. Blender 4.0–4.4 and Linux/Wine were not run.
 - In this environment the `Aperture Opaque` node group could not be appended, so
   material conversion exercised the existing Principled BSDF fallback.
-- The Toolkit `omni_layer` **muteness** metadata is not applied by `pxr`; a
-  composed project therefore includes muted sublayers. Layer locking, ordering
-  and edit targets are applied, but mute parity is P1 work.
+- `omni_layer` muteness/locking is exercised on the Toolkit fixture. Projects that
+  mute the capture or the mod authoring layer are not covered: those layers are
+  protected and deliberately never muted, while the reference Toolkit may expose
+  a different UI policy for them.
 - Light import delegates to the existing `light_utils.py`, which still warns
   about Y-up rotation.
 - Non-ASCII Windows paths and Linux/Wine were not tested.
