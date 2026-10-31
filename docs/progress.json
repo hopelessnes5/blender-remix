@@ -1,0 +1,64 @@
+{
+  "snapshot": "2026-10-31",
+  "areas": [
+    {
+      "name": "Project and layers",
+      "full": 2,
+      "partial": 2,
+      "none": 2,
+      "total": 6,
+      "percent": 33.3
+    },
+    {
+      "name": "Capture import",
+      "full": 5,
+      "partial": 3,
+      "none": 0,
+      "total": 8,
+      "percent": 62.5
+    },
+    {
+      "name": "Mesh replacement",
+      "full": 5,
+      "partial": 1,
+      "none": 4,
+      "total": 10,
+      "percent": 50.0
+    },
+    {
+      "name": "Materials",
+      "full": 3,
+      "partial": 1,
+      "none": 2,
+      "total": 6,
+      "percent": 50.0
+    },
+    {
+      "name": "Textures",
+      "full": 3,
+      "partial": 1,
+      "none": 2,
+      "total": 6,
+      "percent": 50.0
+    },
+    {
+      "name": "Assets and utilities",
+      "full": 2,
+      "partial": 1,
+      "none": 6,
+      "total": 9,
+      "percent": 22.2
+    }
+  ],
+  "totals": {
+    "full": 20,
+    "partial": 9,
+    "none": 16,
+    "total": 45,
+    "percent": 44.4
+  },
+  "tests": {
+    "passed": 89,
+    "total": 89
+  }
+}
