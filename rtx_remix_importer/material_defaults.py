@@ -8,6 +8,8 @@ DEFAULTS = {
         'opacity_constant': 1.0,
         'reflection_roughness_constant': 0.5,
         'metallic_constant': 0.0,
+        'displace_in': 0.05,
+        'displace_out': 0.0,
         'enable_emission': False,
         'emissive_color_constant': (1.0, 0.1, 0.1),
         'emissive_intensity': 40.0,

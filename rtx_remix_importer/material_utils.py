@@ -560,9 +560,29 @@ def process_pbr(shader, bl_material, shader_node, usd_file_path_context):
             if isinstance(value, (bool, int, float)):
                 bl_material['rtx_' + name] = value
 
-    # NOTE: the Aperture "Height Map" displacement chain from the removed node
-    # groups is intentionally dropped - Principled BSDF has no displacement
-    # subsurface; height maps are rendered through the toolkit's mesh tooling.
+    if not is_translucent:
+        from .displacement import apply_imported_displacement, load_height_image
+        height = get_input_value(shader, 'inputs:height_texture')
+        inward = get_input_value(shader, 'inputs:displace_in')
+        outward = get_input_value(shader, 'inputs:displace_out')
+        image = None
+        if height:
+            path = (height.resolvedPath or height.path) if isinstance(height, Sdf.AssetPath) else str(height).strip('@')
+            source_context = usd_file_path_context
+            height_input = shader.GetInput('height_texture')
+            if height_input:
+                for spec in height_input.GetAttr().GetPropertyStack():
+                    if spec.HasInfo('default') and spec.layer.realPath:
+                        source_context = spec.layer.realPath
+                        break
+            resolved = resolve_material_asset_path(path, source_context)
+            image = load_height_image(resolved)
+            if image is None:
+                print(f'  Warning: could not load height texture {path}')
+        try:
+            apply_imported_displacement(bl_material, inward, outward, image)
+        except ValueError as error:
+            print(f'  Warning: could not apply displacement: {error}')
 
 
 # --- New Main Function ---

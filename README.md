@@ -12,11 +12,11 @@ Not affiliated with NVIDIA. RTX Remix, the RTX Remix Toolkit and AperturePBR mat
 
 ## Status
 
-[![Toolkit parity: 38%](docs/badge-parity.svg)](docs/PARITY.md) [![Tests: 137/137](docs/badge-tests.svg)](docs/PARITY.md#tests)
+[![Toolkit parity: 38%](docs/badge-parity.svg)](docs/PARITY.md) [![Tests: 153/153](docs/badge-tests.svg)](docs/PARITY.md#tests)
 
 [![Feature parity progress map](docs/progress.svg)](docs/PARITY.md)
 
-17 of 45 tracked Toolkit features are fully implemented, 13 are partial. Snapshot: 1 November 2026. Tested on Blender 4.5.5 LTS and 5.1.2, 137/137 tests. Full tables and unverified items: [docs/PARITY.md](docs/PARITY.md).
+17 of 45 tracked Toolkit features are fully implemented, 13 are partial. Snapshot: 1 November 2026. Tested on Blender 4.5.5 LTS and 5.1.2, 153/153 tests. Full tables and unverified items: [docs/PARITY.md](docs/PARITY.md).
 
 ## How it works
 
@@ -42,6 +42,8 @@ For a source install, put `texconv.exe` into `rtx_remix_importer/texconv/` and i
 4. Use `Hide Selected Meshes` / `Restore Hidden Meshes` to mask captured geometry without exporting it.
 
 `Export Settings` controls the target mesh, scale, transforms and output folders. Every write goes to the active target layer.
+
+In `Export Settings > Normal Encoding`, choose conversion from OpenGL RGB to octahedral (the default), an already octahedral RG texture, or an OpenGL / DirectX RGB texture. The latter three preserve the source channels while saving a linear DDS. The already encoded option requires octahedral coordinates; a zero blue channel alone does not make a texture octahedral. The selection is saved per Blender scene.
 
 ## Known issues
 

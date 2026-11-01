@@ -213,6 +213,7 @@ class PT_RemixProjectPanel(bpy.types.Panel):
             # Add Auto Apply Transforms option
             row_transform = box_export_settings.row()
             row_transform.prop(scene, "remix_auto_apply_transforms")
+            box_export_settings.prop(scene, "remix_normal_export_encoding")
             # Add Hide Original Mesh option
             row_hide_original = box_export_settings.row()
             row_hide_original.prop(scene, "remix_hide_original_mesh")

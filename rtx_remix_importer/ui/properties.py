@@ -736,6 +736,18 @@ def register_properties():
         description="Custom directory for exported textures (relative to mod root). Default: 'rtx-remix/textures'",
         default="rtx-remix/textures",
     )
+
+    bpy.types.Scene.remix_normal_export_encoding = bpy.props.EnumProperty(
+        name="Normal Encoding",
+        description="How the image in the normal node is encoded for Remix",
+        items=[
+            ('OCT_CONVERT', 'Convert OpenGL to Octahedral', 'Convert a three-channel OpenGL normal map to octahedral BC5'),
+            ('OCT_EXISTING', 'Octahedral (Already Encoded)', 'Keep the existing octahedral red and green channels, without converting'),
+            ('OPENGL', 'OpenGL (RGB)', 'Keep a three-channel OpenGL normal map in linear BC7'),
+            ('DIRECTX', 'DirectX (RGB)', 'Keep a three-channel DirectX normal map in linear BC7'),
+        ],
+        default='OCT_CONVERT',
+    )
     
     bpy.types.Scene.remix_show_assets_not_in_scene = bpy.props.BoolProperty(
         name="Show Assets Not in Scene",
@@ -833,6 +845,8 @@ def unregister_properties():
         del bpy.types.Scene.remix_custom_mesh_dir
     if hasattr(bpy.types.Scene, "remix_custom_texture_dir"):
         del bpy.types.Scene.remix_custom_texture_dir
+    if hasattr(bpy.types.Scene, "remix_normal_export_encoding"):
+        del bpy.types.Scene.remix_normal_export_encoding
     if hasattr(bpy.types.Scene, "remix_show_assets_not_in_scene"):
         del bpy.types.Scene.remix_show_assets_not_in_scene
     # if hasattr(bpy.types.Scene, "_remix_loaded_sublayers"): # Clean up temp storage

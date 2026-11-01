@@ -521,6 +521,62 @@ class TextureProcessingQueue:
 class TextureProcessor:
     """Handles texture processing operations asynchronously."""
 
+    def export_height_texture(self, bl_image, output_path, channel='Color'):
+        """Export the height output as linear BC4, without modifying its image."""
+        import numpy as np
+
+        if not self.is_available():
+            return False
+        width, height = bl_image.size
+        if width <= 0 or height <= 0:
+            return False
+        source_path = bpy.path.abspath(bl_image.filepath) if bl_image.filepath else ''
+        if source_path and os.path.normcase(os.path.abspath(source_path)) == os.path.normcase(os.path.abspath(output_path)):
+            raise ValueError('The height export would overwrite its source image')
+        pixels = np.empty(width * height * 4, dtype=np.float32)
+        bl_image.pixels.foreach_get(pixels)
+        pixels = pixels.reshape(height, width, 4)
+        if channel == 'Alpha':
+            scalar = pixels[:, :, 3].copy()
+        elif channel == 'Color':
+            scalar = pixels[:, :, 0] * 0.2126 + pixels[:, :, 1] * 0.7152 + pixels[:, :, 2] * 0.0722
+        else:
+            raise ValueError(f'Unsupported height channel: {channel}')
+        pixels[:, :, 0] = scalar
+        pixels[:, :, 1] = scalar
+        pixels[:, :, 2] = scalar
+        pixels[:, :, 3] = 1.0
+        directory = os.path.dirname(output_path)
+        os.makedirs(directory, exist_ok=True)
+        temporary_image = None
+        try:
+            with tempfile.TemporaryDirectory(prefix='remix_height_') as temp_dir:
+                png = os.path.join(temp_dir, 'height.png')
+                temporary_image = bpy.data.images.new('Remix Height Temporary', width=width, height=height, alpha=True, float_buffer=True)
+                temporary_image.colorspace_settings.name = 'Non-Color'
+                temporary_image.pixels.foreach_set(pixels.ravel())
+                temporary_image.filepath_raw = png
+                temporary_image.file_format = 'PNG'
+                temporary_image.save()
+                result = subprocess.run([self.texconv_path, png, '-o', temp_dir, '-ft', 'dds', '-f', 'BC4_UNORM', '-m', '0', '-y', '-nologo'], capture_output=True, text=True, check=False, shell=False, timeout=120)
+                dds = os.path.join(temp_dir, 'height.dds')
+                if result.returncode != 0 or not os.path.isfile(dds):
+                    print(f'Height DDS conversion failed: {result.stderr}')
+                    return False
+                import shutil
+                with tempfile.NamedTemporaryFile(dir=directory, suffix='.dds', delete=False) as output_temp:
+                    staged = output_temp.name
+                try:
+                    shutil.copyfile(dds, staged)
+                    os.replace(staged, output_path)
+                finally:
+                    if os.path.exists(staged):
+                        os.remove(staged)
+                return True
+        finally:
+            if temporary_image is not None:
+                bpy.data.images.remove(temporary_image)
+
     def texture_filename(self, bl_image):
         """Keep the image's name, replacing its extension with .dds."""
         name = os.path.basename(bl_image.name)
@@ -531,9 +587,16 @@ class TextureProcessor:
 
     def export_octahedral_normal(self, bl_image, output_path):
         """Convert an OpenGL Blender normal map on the main thread to BC5 DDS."""
+        return self.export_normal_map(bl_image, output_path, 'OCT_CONVERT')
+
+    def export_normal_map(self, bl_image, output_path, mode):
+        """Export normals in the requested encoding without applying color transforms."""
         import numpy as np
         from .nvidia_core.octahedral import convert_float_to_octahedral_in_place
+        from .normal_export import MODES
 
+        if mode not in MODES:
+            raise ValueError(f"Unknown normal export encoding: {mode}")
         if not self.is_available():
             return False
         width, height = bl_image.size
@@ -542,9 +605,10 @@ class TextureProcessor:
         pixels = np.empty(width * height * 4, dtype=np.float32)
         bl_image.pixels.foreach_get(pixels)
         pixels = pixels.reshape(height, width, 4)
-        inward = convert_float_to_octahedral_in_place(pixels, opengl=True)
-        if inward:
-            print(f"Warning: mirrored {inward} inward normals in {bl_image.name}")
+        if mode == 'OCT_CONVERT':
+            inward = convert_float_to_octahedral_in_place(pixels, opengl=True)
+            if inward:
+                print(f"Warning: mirrored {inward} inward normals in {bl_image.name}")
         directory = os.path.dirname(output_path)
         os.makedirs(directory, exist_ok=True)
         temporary_image = None
@@ -558,7 +622,7 @@ class TextureProcessor:
             temporary_image.filepath_raw = temp_path
             temporary_image.file_format = 'PNG'
             temporary_image.save()
-            result = subprocess.run([self.texconv_path, temp_path, '-o', directory, '-ft', 'dds', '-f', 'BC5_UNORM', '-m', '0', '-y', '-nologo'], capture_output=True, text=True, check=False, shell=False, timeout=120)
+            result = subprocess.run([self.texconv_path, temp_path, '-o', directory, '-ft', 'dds', '-f', MODES[mode][1], '-m', '0', '-y', '-nologo'], capture_output=True, text=True, check=False, shell=False, timeout=120)
             converted = os.path.join(directory, os.path.splitext(os.path.basename(temp_path))[0] + '.dds')
             if result.returncode != 0 or not os.path.isfile(converted):
                 print(f"Normal DDS conversion failed: {result.stderr}")
@@ -605,6 +669,7 @@ class TextureProcessor:
             'albedo': 'BC7_UNORM_SRGB',
             'normal': 'BC5_UNORM',
             'roughness': 'BC4_UNORM',
+            'height': 'BC4_UNORM',
             'metallic': 'BC4_UNORM',
             'emission': 'BC7_UNORM_SRGB',
             'emissive': 'BC7_UNORM_SRGB',

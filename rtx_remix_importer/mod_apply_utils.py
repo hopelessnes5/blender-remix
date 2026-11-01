@@ -485,6 +485,29 @@ def process_mod_pbr_util(shader_prim_instance, bl_mat_instance, main_shader_node
         if not (en_em and isinstance(en_em.default_value, (float, int, bool)) and not en_em.default_value) and em_i.default_value == 0.0:
             em_i.default_value = 1.0
 
+    if not is_translucent:
+        from .displacement import apply_imported_displacement, load_height_image
+        height, height_attr = get_mod_input_value_util(shader_prim_instance, 'inputs:height_texture')
+        inward, _ = get_mod_input_value_util(shader_prim_instance, 'inputs:displace_in')
+        outward, _ = get_mod_input_value_util(shader_prim_instance, 'inputs:displace_out')
+        image = None
+        if height:
+            path = (height.resolvedPath or height.path) if isinstance(height, Sdf.AssetPath) else str(height).strip('@')
+            authored_layer = mod_file_path_for_tex_p
+            if height_attr:
+                for spec in height_attr.GetPropertyStack():
+                    if spec.HasInfo('default') and spec.layer.realPath:
+                        authored_layer = spec.layer.realPath
+                        break
+            resolved = resolve_mod_material_asset_path_util(path, texture_res_context_path_p, authored_layer, report_fn)
+            image = load_height_image(resolved)
+            if image is None:
+                report_fn({'WARNING'}, f'Could not load height texture {path}')
+        try:
+            apply_imported_displacement(bl_mat_instance, inward, outward, image)
+        except ValueError as error:
+            report_fn({'WARNING'}, f'Could not apply displacement: {error}')
+
 def create_mod_material_nodes_util(material_usd_path_str, current_mod_stage,
                                    texture_res_context_path_p, mod_file_path_for_tex_p, report_fn,
                                    existing_bl_material_param=None):

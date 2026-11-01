@@ -1,3 +1,4 @@
+from .. import normal_export
 import bpy
 import os
 import shutil
@@ -699,6 +700,13 @@ def export_material(blender_material, sublayer_stage, project_root, sublayer_pat
     if not blender_material:
         return None
 
+    from ..displacement import read_displacement
+    from ..export_utils import ShaderSetup
+    displacement = read_displacement(blender_material)
+    material_type = ShaderSetup.detect_material_type(blender_material)
+    if displacement and material_type != 'AperturePBR_Opacity':
+        raise ValueError('Height displacement is not supported by AperturePBR_Translucent')
+
     if override_material_path is None:
         ensure_mdl_files(project_root)
 
@@ -754,9 +762,6 @@ def export_material(blender_material, sublayer_stage, project_root, sublayer_pat
         material_api.CreateDisplacementOutput("mdl").ConnectToSource(shader_output)
         material_api.CreateVolumeOutput("mdl").ConnectToSource(shader_output)
 
-    from ..export_utils import ShaderSetup
-    material_type = ShaderSetup.detect_material_type(blender_material)
-    
     if override_material_path is None:
         shader_prim.CreateAttribute("info:implementationSource", Sdf.ValueTypeNames.Token).Set("sourceAsset")
         shader_prim.CreateAttribute("info:mdl:sourceAsset", Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(f"{material_type}.mdl"))
@@ -873,7 +878,7 @@ def export_material(blender_material, sublayer_stage, project_root, sublayer_pat
             texture_destinations[key] = source
 
             if texture_type == 'normal':
-                if texture_processor.export_octahedral_normal(bl_image, absolute_dds_path):
+                if texture_processor.export_normal_map(bl_image, absolute_dds_path, normal_export.current_mode()):
                     return bl_image, get_relative_path(sublayer_path, absolute_dds_path)
                 return None, None
 
@@ -934,6 +939,18 @@ def export_material(blender_material, sublayer_stage, project_root, sublayer_pat
     if specular_socket and specular_socket.is_linked:
         specular_image, specular_rel_path = find_texture_for_socket(specular_socket.name, 'BC4_UNORM')
 
+    if displacement:
+        height_image, height_channel, displace_in, displace_out = displacement
+        height_path = os.path.normpath(os.path.join(textures_dir, texture_processor.texture_filename(height_image)))
+        key = os.path.normcase(height_path)
+        if key in texture_destinations:
+            raise ValueError(f'Height map conflicts with another texture export: {height_path}')
+        if not texture_processor.export_height_texture(height_image, height_path, height_channel):
+            raise RuntimeError(f'Could not export height map {height_image.name} to DDS')
+        shader_prim.CreateAttribute('inputs:height_texture', Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(get_relative_path(sublayer_path, height_path)))
+        shader_prim.CreateAttribute('inputs:displace_in', Sdf.ValueTypeNames.Float).Set(displace_in)
+        shader_prim.CreateAttribute('inputs:displace_out', Sdf.ValueTypeNames.Float).Set(displace_out)
+
     if texture_tasks and texture_processor:
         background_processor = core_utils.get_background_processor()
         background_processor.start_background_job(texture_tasks)
@@ -981,7 +998,7 @@ def export_material(blender_material, sublayer_stage, project_root, sublayer_pat
         
         if normal_rel_path:
             shader_prim.CreateAttribute("inputs:normalmap_texture", Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(normal_rel_path))
-            shader_prim.CreateAttribute("inputs:encoding", Sdf.ValueTypeNames.Int).Set(0)
+            shader_prim.CreateAttribute("inputs:encoding", Sdf.ValueTypeNames.Int).Set(normal_export.usd_encoding(normal_export.current_mode()))
     else:
         if diffuse_rel_path:
             shader_prim.CreateAttribute("inputs:diffuse_texture", Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(diffuse_rel_path))
@@ -1004,7 +1021,7 @@ def export_material(blender_material, sublayer_stage, project_root, sublayer_pat
 
         if normal_rel_path:
             shader_prim.CreateAttribute("inputs:normalmap_texture", Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(normal_rel_path))
-            shader_prim.CreateAttribute("inputs:encoding", Sdf.ValueTypeNames.Int).Set(0)
+            shader_prim.CreateAttribute("inputs:encoding", Sdf.ValueTypeNames.Int).Set(normal_export.usd_encoding(normal_export.current_mode()))
 
         if enable_emission:
             shader_prim.CreateAttribute("inputs:enable_emission", Sdf.ValueTypeNames.Bool).Set(True)

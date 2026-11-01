@@ -55,7 +55,7 @@ The official Toolkit is a Kit-based application (`lightspeed.trex.*` extensions)
 
 | Feature | Official Toolkit component | Status | Notes in this add-on |
 |---|---|:--:|---|
-| Author `AperturePBR_Opacity` / `AperturePBR_Translucent` materials (texture slots + constants) | `lightspeed.tool.material.core` | ✅ | diffuse, metallic, roughness, normal, emissive, opacity, specular; transmittance, IOR, thin-walled. All parameters are read from the standard Principled BSDF sockets of the Blender material |
+| Author `AperturePBR_Opacity` / `AperturePBR_Translucent` materials (texture slots + constants) | `lightspeed.tool.material.core` | ✅ | diffuse, metallic, roughness, normal, emissive, opacity, specular; transmittance, IOR, thin-walled. Principled BSDF inputs plus an active Material Output → Displacement → image chain; opaque height maps export as BC4 with displace_in/out |
 | Replace the material of a captured mesh | `lightspeed.tool.material.core` | 🟡 | authors an `over` on the original `mat_<HASH>` and its shader; all instances using that material are affected |
 | Correct material binding strength (`bindMaterialAs` as relationship metadata) | USD material binding | ✅ | authored through `MaterialBindingAPI`, not as an attribute |
 | Blender-side Aperture node groups (`Aperture Opaque` / `Aperture Translucent`) + Principled ⇄ Aperture conversion operators | — (Blender-side authoring) | ⛔ | deliberately removed: materials are authored natively as standard Principled BSDF; node groups written by old releases remain readable for re-export |
@@ -217,7 +217,7 @@ USD export values on real Blender nodes. `tests/unit/test_material_defaults.py` 
 checks direct DDS thumbnail lookup, decoding, refresh and missing files without
 a converted-file cache.
 
-**Executed result:** 137 tests pass on both Blender 4.5.5 LTS (bundled OpenUSD
+**Executed result:** 153 tests pass on both Blender 4.5.5 LTS (bundled OpenUSD
 25.02) and Blender 5.1.2 (bundled OpenUSD 25.08) on Windows, exit code `0`;
 `register()` / `unregister()` was smoke-tested on both as well. A freshly built
 `rtx_remix_importer.zip` was installed through `preferences.addon_install` into a
@@ -226,6 +226,15 @@ material, `direct` backend). `git diff --check` and `python -m compileall` also
 pass.
 
 **Not verified:**
+
+- Height export supports an image connected to an Object Space Displacement node
+  on the active output, constant midlevel/scale and optional Value nodes. Negative
+  scales, arbitrary processing and translucent displacement are unsupported.
+  Blender uses object-space distance while Remix uses UV-relative depth, so the
+  mapped values do not guarantee the same visual depth. Real game rendering and
+  Toolkit MAX mip filtering (texconv uses its default mip filter) were not tested.
+  Import reconstructs the height node: Scale = displace_in + displace_out,
+  Midlevel = displace_in / Scale (0.5 when Scale is zero).
 
 - Mesh-prototype masking was checked against a real capture using an anonymous
   mod layer, but the result has not been tested in the RTX Remix game runtime.

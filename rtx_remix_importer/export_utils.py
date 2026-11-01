@@ -1,3 +1,4 @@
+from . import normal_export
 import bpy
 import os
 import asyncio
@@ -263,7 +264,7 @@ class TextureExporter:
             os.makedirs(self.textures_dir, exist_ok=True)
             name = self.texture_processor.texture_filename(bl_image)
             path = os.path.join(self.textures_dir, name)
-            if self.texture_processor.export_octahedral_normal(bl_image, path):
+            if self.texture_processor.export_normal_map(bl_image, path, normal_export.current_mode()):
                 return get_relative_path(self.sublayer_path, path)
             return None
         results = await self.export_textures_parallel(
@@ -452,6 +453,12 @@ class MaterialExporter:
             except TypeError:
                 return True
 
+        from .displacement import read_displacement
+        material = next((mat for mat in bpy.data.materials if mat.node_tree == shader_node.id_data), None)
+        displacement = read_displacement(material) if material else None
+        if displacement and material_type != 'AperturePBR_Opacity':
+            raise ValueError('Height displacement is not supported by AperturePBR_Translucent')
+
         if material_type == "AperturePBR_Translucent":
             # Translucent material texture mappings
             texture_mappings = [
@@ -497,6 +504,24 @@ class MaterialExporter:
         if emission_enabled:
             shader_prim.CreateAttribute('inputs:enable_emission', Sdf.ValueTypeNames.Bool).Set(True)
 
+        if displacement:
+            height_image, height_channel, displace_in, displace_out = displacement
+            processor = self.texture_exporter.texture_processor
+            filename = processor.texture_filename(height_image)
+            for socket_names, _, _, _ in texture_mappings:
+                _, socket = find_socket(*socket_names)
+                image_node = self.node_analyzer.find_connected_image_node(socket) if socket else None
+                if image_node and image_node.image and os.path.normcase(processor.texture_filename(image_node.image)) == os.path.normcase(filename):
+                    raise ValueError(f'Height map conflicts with another texture export: {filename}')
+            os.makedirs(self.texture_exporter.textures_dir, exist_ok=True)
+            output_path = os.path.join(self.texture_exporter.textures_dir, filename)
+            if not processor.export_height_texture(height_image, output_path, height_channel):
+                raise RuntimeError(f'Could not export height map {height_image.name} to DDS')
+            relative = get_relative_path(self.texture_exporter.sublayer_path, output_path)
+            shader_prim.CreateAttribute('inputs:height_texture', Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(relative))
+            shader_prim.CreateAttribute('inputs:displace_in', Sdf.ValueTypeNames.Float).Set(displace_in)
+            shader_prim.CreateAttribute('inputs:displace_out', Sdf.ValueTypeNames.Float).Set(displace_out)
+
         # Process texture mappings
         for socket_names, texture_attr, constant_attr, texture_type in texture_mappings:
             if progress.is_cancelled():
@@ -524,7 +549,7 @@ class MaterialExporter:
                 if texture_path:
                     shader_prim.CreateAttribute(texture_attr, Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(texture_path))
                     if socket_name in ['Normal', 'Normal Map']:
-                        shader_prim.CreateAttribute("inputs:encoding", Sdf.ValueTypeNames.Int).Set(0)
+                        shader_prim.CreateAttribute("inputs:encoding", Sdf.ValueTypeNames.Int).Set(normal_export.usd_encoding(normal_export.current_mode()))
 
             elif constant_attr and socket:
                 # Set constant value
