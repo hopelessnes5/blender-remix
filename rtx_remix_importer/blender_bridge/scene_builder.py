@@ -152,8 +152,8 @@ def _create_camera(
         bl_cam_data.sensor_width = horizontal_aperture
         bl_cam_data.sensor_fit = "HORIZONTAL"
     if clipping_range is not None:
-        bl_cam_data.clip_start = clipping_range[0]
-        bl_cam_data.clip_end = clipping_range[1]
+        bl_cam_data.clip_start = clipping_range[0] * unit_scale
+        bl_cam_data.clip_end = clipping_range[1] * unit_scale
 
     bl_cam_obj = bpy.data.objects.new(name, bl_cam_data)
     bl_cam_obj.matrix_world = _object_matrix(composition, cam_prim, unit_scale)
@@ -267,7 +267,8 @@ def import_with_direct_backend(
                 print("No instances found; imported mesh prototypes directly.")
 
         if import_lights:
-            created_lights = import_lights_from_usd(stage, collections["lights"], unit_scale)
+            axis = UsdGeom.Tokens.y if composition.up_axis_is_y else UsdGeom.Tokens.z
+            created_lights = import_lights_from_usd(stage, collections["lights"], unit_scale, axis)
             for light in created_lights:
                 light[constants.PROP_SOURCE_CAPTURE] = usd_file_path
 

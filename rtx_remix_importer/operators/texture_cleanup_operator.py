@@ -26,36 +26,9 @@ class REMIX_OT_CleanupDuplicateTextures(Operator):
     
     def _cleanup_fallback(self):
         """Fallback cleanup implementation based on community solutions."""
-        removed_count = 0
-        
-        # Group images by base name
-        for image in list(bpy.data.images):
-            if not image.name:
-                continue
-                
-            # Check if this is a numbered duplicate (e.g., "texture.001", "texture.002")
-            name_parts = image.name.rsplit('.', 1)
-            if len(name_parts) == 2 and name_parts[1].isdigit():
-                base_name = name_parts[0]
-                
-                # Find the base image (without number)
-                base_image = None
-                for img in bpy.data.images:
-                    if img.name == base_name:
-                        base_image = img
-                        break
-                
-                if base_image:
-                    # Remap users to base image
-                    try:
-                        image.user_remap(base_image)
-                        bpy.data.images.remove(image)
-                        removed_count += 1
-                        print(f"Removed duplicate: {image.name} -> {base_name}")
-                    except Exception as e:
-                        print(f"Failed to remove duplicate {image.name}: {e}")
-        
-        return removed_count
+        # Without the normal loader, identity cannot be verified safely.
+        print('Texture identity verification unavailable; no images removed')
+        return 0
 
 class REMIX_OT_ClearTextureCache(Operator):
     """Clear the texture loading cache"""

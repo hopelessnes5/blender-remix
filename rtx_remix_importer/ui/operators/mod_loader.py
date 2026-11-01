@@ -366,7 +366,7 @@ class ModFileLoader:
             for prim_path, bl_obj in self.blender_object_map.items():
                 objects_checked.add(bl_obj)
                 if hasattr(bl_obj, 'data') and hasattr(bl_obj.data, 'materials'):
-                    for mat_slot in bl_obj.data.materials:
+                    for mat_slot in (slot.material for slot in bl_obj.material_slots):
                         if mat_slot:
                             # Check if this material matches any changed material
                             # Material names in Blender might have suffixes, so check if changed material path contains the base name
@@ -386,7 +386,7 @@ class ModFileLoader:
                     continue  # Already checked
                 
                 if hasattr(bl_obj, 'data') and hasattr(bl_obj.data, 'materials'):
-                    for mat_slot in bl_obj.data.materials:
+                    for mat_slot in (slot.material for slot in bl_obj.material_slots):
                         if mat_slot:
                             for changed_mat_path in changed_materials:
                                 mat_base_name = changed_mat_path.split('/')[-1]
@@ -461,7 +461,7 @@ class ModFileLoader:
         self.stats['objects_updated'] += 1
         
         # Get the current material from the Blender object
-        current_mat = bl_object.data.materials[0] if bl_object.data.materials else None
+        current_mat = bl_object.material_slots[0].material if bl_object.material_slots else None
         if not current_mat:
             return
         
@@ -497,10 +497,7 @@ class ModFileLoader:
         
         if bl_material:
             # Replace the material
-            if bl_object.data.materials:
-                bl_object.data.materials[0] = bl_material
-            else:
-                bl_object.data.materials.append(bl_material)
+            self._assign_object_material(bl_object, bl_material)
             
             self.stats['materials_applied'] += 1
             self.report({'INFO'}, f"  Applied updated material {material_path} to {bl_object.name}")
@@ -603,7 +600,7 @@ class ModFileLoader:
             # Capture the object's currently-bound material (from capture import,
             # or a previous mod load) BEFORE building the override, so unspecified
             # inputs can be preserved instead of lost (see create_mod_material_nodes_util).
-            current_bl_material = bl_object.data.materials[0] if bl_object.data.materials else None
+            current_bl_material = bl_object.material_slots[0].material if bl_object.material_slots else None
 
             # Get or create Blender material
             bl_material = mod_apply_utils.get_or_create_mod_instance_material_util(
@@ -621,17 +618,21 @@ class ModFileLoader:
             if bl_material:
                 self.stats['materials_applied'] += 1
                 
-                if bl_object.data.materials:
-                    if bl_object.data.materials[0] != bl_material:
-                        bl_object.data.materials[0] = bl_material
-                        print(f"Updated material on '{bl_object.name}'")
-                else:
-                    bl_object.data.materials.append(bl_material)
-                    print(f"Applied material to '{bl_object.name}'")
+                self._assign_object_material(bl_object, bl_material)
+                print(f"Updated material on '{bl_object.name}'")
                     
         except Exception as e:
             self.report({'WARNING'}, f"Failed to apply material to {bl_object.name}: {e}")
     
+    @staticmethod
+    def _assign_object_material(bl_object, material):
+        """Assign an override without changing materials of shared mesh users."""
+        if not bl_object.material_slots:
+            bl_object.data.materials.append(None)
+        slot = bl_object.material_slots[0]
+        slot.link = 'OBJECT'
+        slot.material = material
+
     def _is_specific_light_type(self, prim: Usd.Prim, light_type_name: str) -> bool:
         """Check if a prim is a specific USD light type, handling different USD versions gracefully."""
         if hasattr(UsdLux, light_type_name):

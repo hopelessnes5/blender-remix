@@ -143,11 +143,10 @@ class ShaderSetup:
         if not blender_material.use_nodes:
             return "AperturePBR_Opacity"
 
-        # Look for custom node groups (legacy pre-Principled materials)
-        for node in blender_material.node_tree.nodes:
-            if node.type == 'GROUP' and node.node_tree:
-                if "Aperture Translucent" in node.node_tree.name:
-                    return "AperturePBR_Translucent"
+        active = NodeAnalyzer.find_surface_shader(blender_material)
+        if active and active.type == 'GROUP' and active.node_tree:
+            if "Aperture Translucent" in active.node_tree.name:
+                return "AperturePBR_Translucent"
 
         # Standard Principled BSDF: transmission decides
         principled = NodeAnalyzer.find_principled_bsdf(blender_material)
@@ -314,15 +313,33 @@ class NodeAnalyzer:
     """Analyzes Blender node trees to extract material information."""
 
     @staticmethod
-    def find_principled_bsdf(material: bpy.types.Material) -> Optional[bpy.types.Node]:
-        """Find the Principled BSDF node in a material."""
+    def find_surface_shader(material: bpy.types.Material) -> Optional[bpy.types.Node]:
+        """Find the shader connected to the active material output."""
         if not material.use_nodes or not material.node_tree:
             return None
-
-        for node in material.node_tree.nodes:
-            if node.type == 'BSDF_PRINCIPLED':
+        output = next((node for node in material.node_tree.nodes
+                       if node.type == 'OUTPUT_MATERIAL' and node.is_active_output), None)
+        socket = output.inputs.get('Surface') if output else None
+        visited = set()
+        while socket and socket.is_linked:
+            node = socket.links[0].from_node
+            if node.as_pointer() in visited:
+                raise ValueError('Cycle in material surface nodes')
+            visited.add(node.as_pointer())
+            if node.type == 'REROUTE':
+                socket = node.inputs[0]
+                continue
+            if node.type == 'BSDF_PRINCIPLED' or (node.type == 'GROUP' and node.node_tree and any(
+                key in node.node_tree.name.lower() for key in ('aperture', 'pbr', 'remix')
+            )):
                 return node
+            raise ValueError(f'Unsupported material Surface node: {node.name}')
         return None
+
+    @staticmethod
+    def find_principled_bsdf(material: bpy.types.Material) -> Optional[bpy.types.Node]:
+        node = NodeAnalyzer.find_surface_shader(material)
+        return node if node and node.type == 'BSDF_PRINCIPLED' else None
 
     @staticmethod
     def find_aperture_node_group(material: bpy.types.Material) -> Optional[bpy.types.Node]:
@@ -330,11 +347,8 @@ class NodeAnalyzer:
         if not material.use_nodes or not material.node_tree:
             return None
 
-        for node in material.node_tree.nodes:
-            if node.type == 'GROUP' and node.node_tree:
-                if "Aperture" in node.node_tree.name:
-                    return node
-        return None
+        node = NodeAnalyzer.find_surface_shader(material)
+        return node if node and node.type == 'GROUP' else None
 
     @staticmethod
     def find_connected_image_node(socket: bpy.types.NodeSocket) -> Optional[bpy.types.Node]:
@@ -535,16 +549,29 @@ class MaterialExporter:
             if texture_type == 'emission' and not socket_is_lit(socket_name, socket):
                 continue
 
-            image_node = self.node_analyzer.find_connected_image_node(socket)
+            scalar_channel = None
+            if socket.is_linked and texture_type in ('roughness', 'metallic', 'opacity'):
+                from .scalar_texture import read_scalar_source
+                image_node, scalar_channel = read_scalar_source(socket)
+            else:
+                image_node = self.node_analyzer.find_connected_image_node(socket)
 
             if image_node and image_node.image:
                 # Export texture
                 def progress_cb(msg):
                     progress.update(f"Processing {texture_type}: {msg}")
 
-                texture_path = await self.texture_exporter.export_texture_async(
-                    image_node.image, texture_type, progress_cb
-                )
+                if scalar_channel is not None:
+                    processor = self.texture_exporter.texture_processor
+                    os.makedirs(self.texture_exporter.textures_dir, exist_ok=True)
+                    path = os.path.join(self.texture_exporter.textures_dir, processor.texture_filename(image_node.image))
+                    if not processor.export_height_texture(image_node.image, path, scalar_channel):
+                        raise RuntimeError(f'Could not export scalar texture {image_node.image.name} to DDS')
+                    texture_path = get_relative_path(self.texture_exporter.sublayer_path, path)
+                else:
+                    texture_path = await self.texture_exporter.export_texture_async(
+                        image_node.image, texture_type, progress_cb
+                    )
 
                 if texture_path:
                     shader_prim.CreateAttribute(texture_attr, Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(texture_path))

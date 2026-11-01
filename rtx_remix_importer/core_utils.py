@@ -538,6 +538,8 @@ class TextureProcessor:
         pixels = pixels.reshape(height, width, 4)
         if channel == 'Alpha':
             scalar = pixels[:, :, 3].copy()
+        elif channel in ('R', 'G', 'B'):
+            scalar = pixels[:, :, {'R': 0, 'G': 1, 'B': 2}[channel]].copy()
         elif channel == 'Color':
             scalar = pixels[:, :, 0] * 0.2126 + pixels[:, :, 1] * 0.7152 + pixels[:, :, 2] * 0.0722
         else:
@@ -579,7 +581,15 @@ class TextureProcessor:
 
     def texture_filename(self, bl_image):
         """Keep the image's name, replacing its extension with .dds."""
-        name = os.path.basename(bl_image.name)
+        # Use the source name only while the internal decoded image retains
+        # its generated name. A user rename explicitly selects a new name.
+        generated_name = bl_image.get('remix_normal_decoded_name')
+        name = bl_image.name
+        if generated_name and name == generated_name:
+            name = bl_image.get('remix_normal_source_name', name)
+        elif name == bl_image.get('remix_dds_fallback_name'):
+            name = bl_image.get('remix_dds_original_name', name)
+        name = os.path.basename(name)
         stem, ext = os.path.splitext(name)
         if ext.lower() not in {'.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp', '.tga', '.exr', '.hdr', '.dds', '.webp'}:
             stem = name
@@ -597,6 +607,15 @@ class TextureProcessor:
 
         if mode not in MODES:
             raise ValueError(f"Unknown normal export encoding: {mode}")
+        for source in (bl_image.filepath, bl_image.get('remix_normal_source_path', '')):
+            if not source:
+                continue
+            source_path = bpy.path.abspath(source)
+            same_path = os.path.normcase(os.path.realpath(source_path)) == os.path.normcase(os.path.realpath(output_path))
+            if not same_path and os.path.exists(source_path) and os.path.exists(output_path):
+                same_path = os.path.samefile(source_path, output_path)
+            if same_path:
+                raise ValueError('The normal export would overwrite its source image')
         if not self.is_available():
             return False
         width, height = bl_image.size
@@ -605,10 +624,13 @@ class TextureProcessor:
         pixels = np.empty(width * height * 4, dtype=np.float32)
         bl_image.pixels.foreach_get(pixels)
         pixels = pixels.reshape(height, width, 4)
-        if mode == 'OCT_CONVERT':
+        decoded_opengl = bool(bl_image.get('remix_normal_decoded_opengl', False))
+        if mode == 'OCT_CONVERT' or (mode == 'OCT_EXISTING' and decoded_opengl):
             inward = convert_float_to_octahedral_in_place(pixels, opengl=True)
             if inward:
                 print(f"Warning: mirrored {inward} inward normals in {bl_image.name}")
+        elif mode == 'DIRECTX' and decoded_opengl:
+            pixels[:, :, 1] = 1.0 - pixels[:, :, 1]
         directory = os.path.dirname(output_path)
         os.makedirs(directory, exist_ok=True)
         temporary_image = None

@@ -173,11 +173,14 @@ def get_hashes_from_capture_layer(layer: Sdf.Layer) -> tuple[dict[str, Sdf.Path]
             for child in root_prim.nameChildren:
                 mesh_hash = str(child.path)[-16:]
                 if constants.MATERIAL_RELATIONSHIP in child.relationships:
-                    materials = child.relationships[constants.MATERIAL_RELATIONSHIP].targetPathList.explicitItems
-                    # Always take the first material as there should never be more than 1 material here
-                    mat_hash = str(materials[0])[-16:]
-                    result[mat_hash] = materials[0]
-                    result_switch_grouped.setdefault(mat_hash, set()).add(mesh_hash)
+                    targets = child.relationships[constants.MATERIAL_RELATIONSHIP].targetPathList
+                    materials = list(targets.explicitItems) if targets.isExplicit else (
+                        list(targets.prependedItems) + list(targets.appendedItems) + list(targets.addedItems)
+                    )
+                    if materials:
+                        mat_hash = str(materials[0])[-16:]
+                        result[mat_hash] = materials[0]
+                        result_switch_grouped.setdefault(mat_hash, set()).add(mesh_hash)
                 result[mesh_hash] = child.path
         else:
             for child in root_prim.nameChildren:

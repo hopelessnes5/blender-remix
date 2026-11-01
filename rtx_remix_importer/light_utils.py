@@ -1,13 +1,14 @@
 import bpy
 import math
 import os
+import mathutils
 try:
     from pxr import Usd, UsdGeom, Sdf, Gf
     USD_AVAILABLE = True
 except ImportError:
     USD_AVAILABLE = False
 
-def create_light_from_usd(light_prim, stage, scene_scale=1.0):
+def create_light_from_usd(light_prim, stage, scene_scale=1.0, up_axis=None):
     """
     Create a Blender light from a USD light prim.
 
@@ -40,7 +41,7 @@ def create_light_from_usd(light_prim, stage, scene_scale=1.0):
         # Scale components affect Area light size properties instead.
 
         # Handle potential axis conversion (assuming Blender is Z-up)
-        up_axis = UsdGeom.GetStageUpAxis(stage)
+        up_axis = up_axis or UsdGeom.GetStageUpAxis(stage)
         blender_location = (translate[0], translate[1], translate[2])
         blender_rotation_quat = (rotation_quat.GetReal(), *rotation_quat.GetImaginary())
 
@@ -48,12 +49,8 @@ def create_light_from_usd(light_prim, stage, scene_scale=1.0):
             # Convert Y-up USD to Z-up Blender
             # Swap Y and Z, negate new Y for position
             blender_location = (translate[0], -translate[2], translate[1])
-            # Convert quaternion rotation
-            # Easiest might be to convert USD quat to Euler, then apply axis swap logic, then back to Blender Euler/Quat
-            # For simplicity now, we'll use the direct quat and note it might be wrong for Y-up stages.
-            print(f"Warning: Y-up stage detected for light '{light_name}'. Rotation might be incorrect.")
-            # A common Y-up to Z-up rotation adjustment is rotating -90 degrees around X-axis *after* other rotations.
-            # This needs careful application depending on USD rotation order.
+            basis = mathutils.Quaternion((1, 0, 0), math.pi / 2)
+            blender_rotation_quat = basis @ mathutils.Quaternion(blender_rotation_quat)
 
         # Apply scene scale to location
         blender_location = (
@@ -118,9 +115,9 @@ def create_light_from_usd(light_prim, stage, scene_scale=1.0):
                 light_data.shadow_soft_size = radius * scene_scale # Spotlights also have a radius for shadow softness
                 
                 # Convert USD cone angle (degrees) to Blender spot_size (radians)
-                # USD shaping:cone:angle is the full angle of the cone.
-                # Blender's spot_size is also the full angle, in radians.
-                light_data.spot_size = math.radians(usd_cone_angle)
+                # USD cone angle is measured from the axis; Blender uses the
+                # full opening angle, in radians.
+                light_data.spot_size = min(math.pi, math.radians(2 * usd_cone_angle))
                 light_data.spot_blend = usd_cone_softness # This is a 0-1 value, similar to Blender's
                 print(f"  Info: Creating SPOT light for {light_name} (angle: {usd_cone_angle}, softness: {usd_cone_softness})")
             else:
@@ -258,7 +255,7 @@ def create_light_from_usd(light_prim, stage, scene_scale=1.0):
              bpy.data.lights.remove(light_data)
         return None
 
-def import_lights_from_usd(stage, collection, scene_scale=1.0):
+def import_lights_from_usd(stage, collection, scene_scale=1.0, up_axis=None):
     """
     Import all lights from a USD stage and add them to a collection.
 
@@ -289,7 +286,7 @@ def import_lights_from_usd(stage, collection, scene_scale=1.0):
         prim_type_name = prim.GetTypeName()
         if prim_type_name in light_types:
             print(f"Found light prim: {prim.GetPath()} of type {prim_type_name}")
-            light_obj = create_light_from_usd(prim, stage, scene_scale)
+            light_obj = create_light_from_usd(prim, stage, scene_scale, up_axis)
             if light_obj:
                 try:
                     # Link the light object to the specified collection

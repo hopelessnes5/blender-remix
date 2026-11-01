@@ -180,9 +180,15 @@ def _convert_dds_to_png(
                 # Load the converted PNG
                 image = _load_standard_texture(temp_png_path, is_normal, is_non_color)
                 if image:
+                    # The decoded PNG is temporary; keep its bytes inside the
+                    # blend before deleting it so reopening the file is safe.
+                    image.pack()
+                    image.filepath = dds_path
                     # Rename to match original DDS
                     base_name = os.path.splitext(os.path.basename(dds_path))[0]
                     image.name = _generate_unique_image_name(f"{base_name}_converted")
+                    image['remix_dds_fallback_name'] = image.name
+                    image['remix_dds_original_name'] = os.path.basename(dds_path)
                     print(f"Successfully converted DDS to PNG: {os.path.basename(dds_path)}")
                     return image
             
@@ -284,14 +290,43 @@ def cleanup_duplicate_textures():
                     break
             
             if base_image:
+                # Similar names alone are not proof of identical image data.
+                # Only reuse clean, unpacked file images of the same source
+                # with the same interpretation of their channels.
+                if (image.source != 'FILE' or base_image.source != 'FILE'
+                        or image.packed_file or base_image.packed_file
+                        or image.is_dirty or base_image.is_dirty
+                        or not image.filepath or not base_image.filepath
+                        or image.colorspace_settings.name != base_image.colorspace_settings.name
+                        or image.alpha_mode != base_image.alpha_mode):
+                    continue
+                first = os.path.normcase(os.path.realpath(bpy.path.abspath(image.filepath)))
+                second = os.path.normcase(os.path.realpath(bpy.path.abspath(base_image.filepath)))
+                if first != second or not os.path.isfile(first):
+                    continue
+                # A file can change between two loads; matching paths do not
+                # guarantee that the already loaded pixel buffers match.
+                if tuple(image.size) != tuple(base_image.size) or image.channels != base_image.channels:
+                    continue
+                import numpy as np
+                count = len(image.pixels)
+                if count == 0 or count != len(base_image.pixels):
+                    continue
+                pixels = np.empty(count, dtype=np.float32)
+                base_pixels = np.empty(count, dtype=np.float32)
+                image.pixels.foreach_get(pixels)
+                base_image.pixels.foreach_get(base_pixels)
+                if not np.array_equal(pixels, base_pixels):
+                    continue
                 # Remap users to base image
                 try:
+                    duplicate_name = image.name
                     image.user_remap(base_image)
                     bpy.data.images.remove(image)
                     removed_count += 1
-                    print(f"Removed duplicate: {image.name} -> {base_name}")
+                    print(f"Removed duplicate: {duplicate_name} -> {base_name}")
                 except Exception as e:
-                    print(f"Failed to remove duplicate {image.name}: {e}")
+                    print(f"Failed to remove duplicate {duplicate_name}: {e}")
     
     print(f"Cleanup complete. Removed {removed_count} duplicate textures.")
     return removed_count

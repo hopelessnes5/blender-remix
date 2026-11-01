@@ -1,0 +1,332 @@
+{
+  "base_commit": "bbfd5632a20e0dd58bf939243bdc50cdd4065844",
+  "branch": "dev",
+  "date": "2026-11-01",
+  "method": "Synthetic diagnostic cases, including mocks where stated in audit_repro.py; existing unit/integration suite runs in a project copy.",
+  "syntax_check": {
+    "python_files": 78,
+    "passed": true
+  },
+  "versions": {
+    "4.5.5": {
+      "existing_suite": {
+        "tests": 155,
+        "passed": 155,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0
+      },
+      "diagnostics": [
+        {
+          "probe": "degenerate_face_offsets",
+          "observed": {
+            "actual": [
+              [
+                0,
+                1,
+                2
+              ]
+            ],
+            "expected": [
+              [
+                2,
+                3,
+                4
+              ]
+            ]
+          }
+        },
+        {
+          "probe": "indexed_vertex_uv",
+          "observed": {
+            "actual": [
+              1,
+              0
+            ],
+            "expected": [
+              0.5,
+              0.5
+            ]
+          }
+        },
+        {
+          "probe": "own_export_nested_mesh_lookup",
+          "observed": {
+            "mesh_found": false
+          }
+        },
+        {
+          "probe": "standard_usd_normals",
+          "observed": {
+            "normals_read": null
+          }
+        },
+        {
+          "probe": "material_stale",
+          "observed": {
+            "normalmap_texture": "@old.dds@",
+            "height_texture": "@oldheight.dds@",
+            "enable_opacity": "True"
+          }
+        },
+        {
+          "probe": "material_active",
+          "observed": {
+            "exported_roughness": 0.10000000149011612,
+            "expected": 0.9
+          }
+        },
+        {
+          "probe": "material_failure",
+          "observed": {
+            "material_reported_success": true,
+            "normal_written": false
+          }
+        },
+        {
+          "probe": "normal_source_overwrite",
+          "observed": {
+            "source_overwritten": true,
+            "reported_success": true
+          }
+        },
+        {
+          "probe": "dds_fallback_persistence",
+          "observed": {
+            "packed": false,
+            "filepath_exists": false,
+            "image_source": "FILE"
+          }
+        },
+        {
+          "probe": "duplicate_cleanup_different_pixels",
+          "observed": {
+            "consumer_image": "DifferentContent",
+            "distinct_image_removed": true,
+            "exception": "StructRNA of type Image has been removed"
+          }
+        },
+        {
+          "probe": "default_reset_against_capture",
+          "observed": {
+            "composed_roughness": 0.800000011920929,
+            "expected": 0.5
+          }
+        },
+        {
+          "probe": "light_import_export_units",
+          "observed": {
+            "translate": [
+              0.009999999776482582,
+              0.0,
+              0.0
+            ],
+            "expected_translate": [
+              100,
+              0,
+              0
+            ],
+            "radius": 0.009999999776482582,
+            "expected_radius": 1,
+            "intensity": 10.0,
+            "expected_intensity": 100
+          }
+        },
+        {
+          "probe": "capture_export_guard",
+          "observed": {
+            "capture_accepted_as_export_target": true,
+            "editable": true
+          }
+        },
+        {
+          "probe": "capture_hashes_empty_binding",
+          "error": "Index out of range.",
+          "type": "IndexError"
+        },
+        {
+          "probe": "apply_mod_object_linked_material",
+          "observed": {
+            "actual_object_material": "ObjectOverride",
+            "expected_object_material": "UpdatedOverride",
+            "mesh_material": "UpdatedOverride"
+          }
+        },
+        {
+          "probe": "scalar_texture_import_channel",
+          "observed": {
+            "connected_output": "Alpha",
+            "expected_output": "Color"
+          }
+        },
+        {
+          "probe": "alpha_output_export_channel",
+          "observed": {
+            "exported_opacity": 0.24705883860588074,
+            "expected_opacity": 0.8
+          }
+        }
+      ]
+    },
+    "5.1.2": {
+      "existing_suite": {
+        "tests": 155,
+        "passed": 155,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0
+      },
+      "diagnostics": [
+        {
+          "probe": "degenerate_face_offsets",
+          "observed": {
+            "actual": [
+              [
+                0,
+                1,
+                2
+              ]
+            ],
+            "expected": [
+              [
+                2,
+                3,
+                4
+              ]
+            ]
+          }
+        },
+        {
+          "probe": "indexed_vertex_uv",
+          "observed": {
+            "actual": [
+              1,
+              0
+            ],
+            "expected": [
+              0.5,
+              0.5
+            ]
+          }
+        },
+        {
+          "probe": "own_export_nested_mesh_lookup",
+          "observed": {
+            "mesh_found": false
+          }
+        },
+        {
+          "probe": "standard_usd_normals",
+          "observed": {
+            "normals_read": null
+          }
+        },
+        {
+          "probe": "material_stale",
+          "observed": {
+            "normalmap_texture": "@old.dds@",
+            "height_texture": "@oldheight.dds@",
+            "enable_opacity": "True"
+          }
+        },
+        {
+          "probe": "material_active",
+          "observed": {
+            "exported_roughness": 0.10000000149011612,
+            "expected": 0.9
+          }
+        },
+        {
+          "probe": "material_failure",
+          "observed": {
+            "material_reported_success": true,
+            "normal_written": false
+          }
+        },
+        {
+          "probe": "normal_source_overwrite",
+          "observed": {
+            "source_overwritten": true,
+            "reported_success": true
+          }
+        },
+        {
+          "probe": "dds_fallback_persistence",
+          "observed": {
+            "packed": false,
+            "filepath_exists": false,
+            "image_source": "FILE"
+          }
+        },
+        {
+          "probe": "duplicate_cleanup_different_pixels",
+          "observed": {
+            "consumer_image": "DifferentContent",
+            "distinct_image_removed": true,
+            "exception": "StructRNA of type Image has been removed"
+          }
+        },
+        {
+          "probe": "default_reset_against_capture",
+          "observed": {
+            "composed_roughness": 0.800000011920929,
+            "expected": 0.5
+          }
+        },
+        {
+          "probe": "light_import_export_units",
+          "observed": {
+            "translate": [
+              0.009999999776482582,
+              0.0,
+              0.0
+            ],
+            "expected_translate": [
+              100,
+              0,
+              0
+            ],
+            "radius": 0.009999999776482582,
+            "expected_radius": 1,
+            "intensity": 10.0,
+            "expected_intensity": 100
+          }
+        },
+        {
+          "probe": "capture_export_guard",
+          "observed": {
+            "capture_accepted_as_export_target": true,
+            "editable": true
+          }
+        },
+        {
+          "probe": "capture_hashes_empty_binding",
+          "error": "Index out of range.",
+          "type": "IndexError"
+        },
+        {
+          "probe": "apply_mod_object_linked_material",
+          "observed": {
+            "actual_object_material": "ObjectOverride",
+            "expected_object_material": "UpdatedOverride",
+            "mesh_material": "UpdatedOverride"
+          }
+        },
+        {
+          "probe": "scalar_texture_import_channel",
+          "observed": {
+            "connected_output": "Alpha",
+            "expected_output": "Color"
+          }
+        },
+        {
+          "probe": "alpha_output_export_channel",
+          "observed": {
+            "exported_opacity": 0.24705883860588074,
+            "expected_opacity": 0.8
+          }
+        }
+      ]
+    }
+  }
+}

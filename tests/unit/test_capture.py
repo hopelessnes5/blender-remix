@@ -70,6 +70,24 @@ class TestCaptureHashes(unittest.TestCase):
         self.assertEqual(grouped, {})
 
 
+class TestCaptureBindingListOps(unittest.TestCase):
+    def test_empty_binding_keeps_mesh_hash(self):
+        stage = Usd.Stage.CreateInMemory()
+        prim = stage.DefinePrim('/RootNode/meshes/mesh_1111111111111111', 'Xform')
+        prim.CreateRelationship('material:binding').SetTargets([])
+        hashes, grouped = capture.get_hashes_from_capture_layer(stage.GetRootLayer())
+        self.assertIn('1111111111111111', hashes)
+        self.assertEqual(grouped, {})
+
+    def test_prepended_binding_is_read(self):
+        stage = Usd.Stage.CreateInMemory()
+        prim = stage.DefinePrim('/RootNode/meshes/mesh_1111111111111111', 'Xform')
+        prim.CreateRelationship('material:binding').AddTarget('/RootNode/Looks/mat_2222222222222222')
+        hashes, grouped = capture.get_hashes_from_capture_layer(stage.GetRootLayer())
+        self.assertIn('2222222222222222', hashes)
+        self.assertEqual(grouped['2222222222222222'], {'1111111111111111'})
+
+
 class TestRemixConfig(unittest.TestCase):
     def _stage_with_legacy_config(self):
         layer = Sdf.Layer.CreateAnonymous("project.usda")

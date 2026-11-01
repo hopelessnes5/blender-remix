@@ -115,6 +115,37 @@ class TestMatrixConversion(unittest.TestCase):
         self.assertEqual(converted[3][3], 1.0)
 
 
+class TestGeometryRegressions(unittest.TestCase):
+    def test_skipped_first_face_keeps_topology_and_uv_alignment(self):
+        stage = Usd.Stage.CreateInMemory()
+        mesh = UsdGeom.Mesh.Define(stage, '/Mesh')
+        mesh.CreatePointsAttr([(float(i), 0, 0) for i in range(5)])
+        mesh.CreateFaceVertexCountsAttr([2, 3])
+        mesh.CreateFaceVertexIndicesAttr([0, 1, 2, 3, 4])
+        uv = UsdGeom.PrimvarsAPI(mesh).CreatePrimvar('st', Sdf.ValueTypeNames.TexCoord2fArray, UsdGeom.Tokens.faceVarying)
+        uv.Set([(float(i), 0) for i in range(5)])
+        data = geometry.extract_mesh_data(mesh.GetPrim())
+        self.assertEqual(data.polygons(), [(2, 3, 4)])
+        self.assertEqual(data.corner_uvs(), [(2, 0), (3, 0), (4, 0)])
+
+    def test_indexed_vertex_and_varying_primvars(self):
+        for interpolation in (UsdGeom.Tokens.vertex, UsdGeom.Tokens.varying):
+            with self.subTest(interpolation=interpolation):
+                attr = geometry.InterpolatedAttribute(interpolation, ((1, 0), (0, 1), (.5, .5)), (2, 0, 1))
+                self.assertEqual(attr.resolve(0, 0, 0, 3), (.5, .5))
+                self.assertIsNone(attr.resolve(0, 5, 0, 3))
+
+    def test_standard_mesh_normals_are_preserved(self):
+        stage = Usd.Stage.CreateInMemory()
+        mesh = UsdGeom.Mesh.Define(stage, '/Mesh')
+        mesh.CreatePointsAttr([(0, 0, 0), (1, 0, 0), (0, 1, 0)])
+        mesh.CreateFaceVertexCountsAttr([3])
+        mesh.CreateFaceVertexIndicesAttr([0, 1, 2])
+        mesh.CreateNormalsAttr([(0, 1, 0)] * 3)
+        mesh.SetNormalsInterpolation(UsdGeom.Tokens.faceVarying)
+        self.assertEqual(geometry.extract_mesh_data(mesh.GetPrim()).corner_normals(), [(0, 1, 0)] * 3)
+
+
 class TestFindMeshPrim(unittest.TestCase):
     def test_mesh_direct_and_nested(self):
         stage = Usd.Stage.Open(Sdf.Layer.CreateAnonymous("find.usda"))

@@ -55,6 +55,60 @@ _ALIASES = {
 }
 
 
+class _DirectImportCheckpoint:
+    """Remember existing Blender IDs so a failed direct import can be undone.
+
+    The import runs synchronously on Blender's main thread. Existing IDs are
+    never removed; newly created data with an external user is kept.
+    """
+
+    _ID_COLLECTIONS = ('objects', 'collections', 'meshes', 'lights', 'cameras', 'materials', 'node_groups', 'images')
+    _SCENE_KEYS = ('source_capture_path', 'project_id', 'remix_import_backend', 'remix_import_unit_scale')
+
+    def __init__(self, context):
+        import bpy
+        from . import material_utils, texture_loader
+
+        self._context = context
+        self._existing = {
+            name: {item.as_pointer() for item in getattr(bpy.data, name)}
+            for name in self._ID_COLLECTIONS
+        }
+        self._scene_values = {key: context.scene[key] for key in self._SCENE_KEYS if key in context.scene}
+        self._active_collection = context.view_layer.active_layer_collection
+        self._caches = (
+            (material_utils._material_cache, dict(material_utils._material_cache)),
+            (material_utils._global_material_cache, dict(material_utils._global_material_cache)),
+            (texture_loader._loaded_textures, dict(texture_loader._loaded_textures)),
+        )
+
+    def rollback(self):
+        import bpy
+
+        scene = self._context.scene
+        for key in self._SCENE_KEYS:
+            if key in self._scene_values:
+                scene[key] = self._scene_values[key]
+            elif key in scene:
+                del scene[key]
+        self._context.view_layer.active_layer_collection = self._active_collection
+        for cache, original in self._caches:
+            cache.clear()
+            cache.update(original)
+
+        # Remove new objects first so their mesh/material references are
+        # released, then collections and orphaned import-created datablocks.
+        for name in self._ID_COLLECTIONS:
+            collection = getattr(bpy.data, name)
+            for item in list(collection):
+                if item.as_pointer() in self._existing[name]:
+                    continue
+                if name in ('objects', 'collections'):
+                    collection.remove(item, do_unlink=True)
+                elif item.users == 0:
+                    collection.remove(item)
+
+
 def get_import_backend(context=None) -> str:
     """Resolve the configured import backend.
 
@@ -95,6 +149,7 @@ def import_rtx_remix_usd_with_materials(
     if backend == BACKEND_LEGACY:
         return _legacy_import(context, usd_file_path, import_materials, import_lights, scene_scale)
 
+    checkpoint = _DirectImportCheckpoint(context)
     try:
         from .blender_bridge.scene_builder import import_with_direct_backend
 
@@ -102,6 +157,12 @@ def import_rtx_remix_usd_with_materials(
             context, usd_file_path, import_materials, import_lights, scene_scale
         )
     except Exception as exc:
+        try:
+            checkpoint.rollback()
+        except Exception as rollback_exc:
+            raise USDImportError(
+                f"Direct import failed for '{usd_file_path}' and rollback failed: {rollback_exc}"
+            ) from exc
         if backend == BACKEND_DIRECT_ONLY:
             raise USDImportError(f"Direct import failed for '{usd_file_path}': {exc}") from exc
         print(f"Direct import failed for '{usd_file_path}': {exc}")

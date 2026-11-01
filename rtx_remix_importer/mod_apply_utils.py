@@ -288,7 +288,7 @@ def get_mod_input_value_util(shader_prim_instance, input_name_str):
 
 def process_mod_input_util(usd_input_val, input_type_name, nodes, links, target_node, target_socket_name,
                            texture_res_context_path, mod_file_path_for_tex, # For resolve_mod_material_asset_path_util
-                           node_pos=(-400,0), is_normal=False, is_non_color=False, report_fn=print):
+                           node_pos=(-400,0), is_normal=False, is_non_color=False, report_fn=print, normal_encoding=None):
     target_socket = target_node.inputs.get(target_socket_name)
     if not target_socket or usd_input_val is None: return None
     created_node = None
@@ -302,6 +302,9 @@ def process_mod_input_util(usd_input_val, input_type_name, nodes, links, target_
             if resolved_path and os.path.exists(resolved_path):
                 image = load_mod_texture_util(resolved_path, is_normal, is_non_color, report_fn)
                 if image:
+                    if is_normal:
+                        from .normal_import import decode_to_opengl
+                        image = decode_to_opengl(image, normal_encoding)
                     # FIX: if this socket is already fed by a texture node (from a previous
                     # load of this same material), update its image in place instead of
                     # spawning a duplicate node chain on every reload.
@@ -318,19 +321,31 @@ def process_mod_input_util(usd_input_val, input_type_name, nodes, links, target_
                                     existing_tex_node = cand
                         elif not is_normal and src.type == 'TEX_IMAGE':
                             existing_tex_node = src
+                        elif not is_normal and src.type in ('SEPARATE_COLOR', 'SEPRGB'):
+                            color_in = src.inputs.get('Color') or src.inputs.get('Image')
+                            if color_in and color_in.is_linked and color_in.links[0].from_node.type == 'TEX_IMAGE':
+                                existing_tex_node = color_in.links[0].from_node
 
                     if existing_tex_node:
                         if existing_tex_node.image != image:
                             existing_tex_node.image = image
+                        if is_non_color and not is_normal and target_socket.type == 'VALUE':
+                            current_link = target_socket.links[0]
+                            if current_link.from_node == existing_tex_node or current_link.from_socket.name not in ('Red', 'R'):
+                                from .scalar_texture import connect_scalar_red
+                                connect_scalar_red(nodes, links, existing_tex_node, target_socket)
                         created_node = existing_container_node if is_normal else existing_tex_node
                     else:
                         tex_node = nodes.new(type='ShaderNodeTexImage'); tex_node.image = image
                         tex_node.label = f"{input_type_name.replace('_', ' ').title()} Texture"; tex_node.location = (texture_node_x, node_pos[1])
-                        out_sock_name = 'Alpha' if (is_non_color or is_normal) and target_socket.type=='VALUE' and 'Alpha' in tex_node.outputs else 'Color'
+                        out_sock_name = 'Color'
                         if is_normal:
                             nm = nodes.new(type='ShaderNodeNormalMap'); nm.location = (normal_map_node_x, node_pos[1])
                             links.new(tex_node.outputs[out_sock_name], nm.inputs['Color']); links.new(nm.outputs['Normal'], target_socket)
                             created_node = nm
+                        elif is_non_color and target_socket.type == 'VALUE':
+                            from .scalar_texture import connect_scalar_red
+                            connect_scalar_red(nodes, links, tex_node, target_socket); created_node = tex_node
                         else:
                             links.new(tex_node.outputs[out_sock_name], target_socket); created_node = tex_node
     elif isinstance(usd_input_val, Gf.Vec3f) and target_socket.type == 'RGBA': target_socket.default_value = (usd_input_val[0], usd_input_val[1], usd_input_val[2], 1.0)
@@ -418,9 +433,11 @@ def process_mod_pbr_util(shader_prim_instance, bl_mat_instance, main_shader_node
             attr_layer_dir = os.path.dirname(attr_layer_path)
 
             is_n, is_nc = (grp_sock == "Normal"), grp_sock in ["Metallic", "Roughness", "Emission Strength", "Alpha"]
+            from .normal_import import effective_encoding
             node_created = process_mod_input_util(val, name_fnd, nodes, links, main_shader_node_instance, grp_sock,
                                       attr_layer_dir, attr_layer_path,
-                                      (-400, base_y + y_off), is_n, is_nc, report_fn)
+                                      (-400, base_y + y_off), is_n, is_nc, report_fn,
+                                      normal_encoding=effective_encoding(shader_prim_instance) if is_n else None)
             if node_created:
                 y_off -= spacing
 

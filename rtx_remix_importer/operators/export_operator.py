@@ -701,7 +701,7 @@ def export_material(blender_material, sublayer_stage, project_root, sublayer_pat
         return None
 
     from ..displacement import read_displacement
-    from ..export_utils import ShaderSetup
+    from ..export_utils import ShaderSetup, NodeAnalyzer
     displacement = read_displacement(blender_material)
     material_type = ShaderSetup.detect_material_type(blender_material)
     if displacement and material_type != 'AperturePBR_Opacity':
@@ -767,21 +767,7 @@ def export_material(blender_material, sublayer_stage, project_root, sublayer_pat
         shader_prim.CreateAttribute("info:mdl:sourceAsset", Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(f"{material_type}.mdl"))
         shader_prim.CreateAttribute("info:mdl:sourceAsset:subIdentifier", Sdf.ValueTypeNames.Token).Set(material_type)
 
-    principled_node = None
-    if blender_material.use_nodes and blender_material.node_tree:
-        for node in blender_material.node_tree.nodes:
-            if node.type == 'BSDF_PRINCIPLED':
-                principled_node = node
-                break
-            elif node.type == 'GROUP' and node.node_tree:
-                group_name = node.node_tree.name.lower()
-                if any(keyword in group_name for keyword in ['aperture', 'pbr', 'remix']):
-                    principled_node = node
-                    break
-                expected_inputs = ['Base Color', 'Albedo Color', 'Metallic', 'Roughness']
-                if any(input_name in [inp.name for inp in node.inputs] for input_name in expected_inputs):
-                    principled_node = node
-                    break
+    principled_node = NodeAnalyzer.find_surface_shader(blender_material)
 
     if not principled_node:
         return mat_path
@@ -841,7 +827,11 @@ def export_material(blender_material, sublayer_stage, project_root, sublayer_pat
             return None, None
             
         image_node = None
-        if socket and socket.is_linked:
+        scalar_channel = None
+        if socket.is_linked and socket_name in ('Metallic', 'Roughness', 'Alpha', 'Opacity', 'Specular', 'Specular IOR Level'):
+            from ..scalar_texture import read_scalar_source
+            image_node, scalar_channel = read_scalar_source(socket)
+        elif socket and socket.is_linked:
             link = socket.links[0]
             node = link.from_node
             while node and node.type != 'TEX_IMAGE':
@@ -872,7 +862,7 @@ def export_material(blender_material, sublayer_stage, project_root, sublayer_pat
             dds_file_name = texture_processor.texture_filename(bl_image)
             absolute_dds_path = os.path.normpath(os.path.join(textures_dir, dds_file_name))
             key = os.path.normcase(absolute_dds_path)
-            source = (bl_image.as_pointer(), texture_type)
+            source = (bl_image.as_pointer(), texture_type, scalar_channel)
             if key in texture_destinations and texture_destinations[key] != source:
                 raise ValueError(f"Multiple textures need different data at the same export path: {absolute_dds_path}")
             texture_destinations[key] = source
@@ -880,7 +870,12 @@ def export_material(blender_material, sublayer_stage, project_root, sublayer_pat
             if texture_type == 'normal':
                 if texture_processor.export_normal_map(bl_image, absolute_dds_path, normal_export.current_mode()):
                     return bl_image, get_relative_path(sublayer_path, absolute_dds_path)
-                return None, None
+                raise RuntimeError(f"Could not export normal map {bl_image.name} to DDS")
+
+            if scalar_channel is not None:
+                if not texture_processor.export_height_texture(bl_image, absolute_dds_path, scalar_channel):
+                    raise RuntimeError(f"Could not export scalar texture {bl_image.name} to DDS")
+                return bl_image, get_relative_path(sublayer_path, absolute_dds_path)
 
             if os.path.exists(absolute_dds_path):
                 return bl_image, get_relative_path(sublayer_path, absolute_dds_path)
@@ -952,8 +947,12 @@ def export_material(blender_material, sublayer_stage, project_root, sublayer_pat
         shader_prim.CreateAttribute('inputs:displace_out', Sdf.ValueTypeNames.Float).Set(displace_out)
 
     if texture_tasks and texture_processor:
-        background_processor = core_utils.get_background_processor()
-        background_processor.start_background_job(texture_tasks)
+        # Blender image access must stay on the main thread. Do not author
+        # queued texture paths until conversion has completed successfully.
+        results = texture_processor._convert_texture_batch_sync(texture_tasks)
+        if len(results) != len(texture_tasks) or not all(results):
+            failed = [task[0].name for task, ok in zip(texture_tasks, results) if not ok]
+            raise RuntimeError(f"Could not export textures to DDS: {', '.join(failed) or 'incomplete conversion'}")
 
     if material_type == "AperturePBR_Translucent":
         if diffuse_rel_path:
@@ -1076,7 +1075,7 @@ def export_light(operator, context, obj, sublayer_stage, project_root, target_su
 
     print(f"\n--- Exporting Light: {obj.name} ---")
     bl_light = obj.data
-    remix_export_scale = context.scene.remix_export_scale
+    remix_export_scale = context.scene.remix_export_scale or 1.0
 
     usd_light_type = None
     light_attrs = {}
@@ -1084,43 +1083,43 @@ def export_light(operator, context, obj, sublayer_stage, project_root, target_su
     extent = None
 
     light_attrs["inputs:color"] = Gf.Vec3f(bl_light.color[:])
-    light_attrs["inputs:intensity"] = float(bl_light.energy)
+    # Invert the existing import conversion; physical photometry depends on
+    # renderer-specific normalization and is not implied by this mapping.
+    energy_factor = 1.0 if bl_light.type == 'SUN' else 1000.0 * remix_export_scale ** 2
+    light_attrs["inputs:intensity"] = float(bl_light.energy / energy_factor)
+    light_attrs["inputs:exposure"] = 0.0
 
     if bl_light.type == 'POINT':
         usd_light_type = "SphereLight"
-        radius = bl_light.shadow_soft_size
-        if radius <= 0 or radius < 0.001 or radius > 10:
-            radius = 0.07
+        radius = bl_light.shadow_soft_size / remix_export_scale
         light_attrs["inputs:radius"] = float(radius)
-        shaping_attrs["shaping:cone:angle"] = 180.0
-        shaping_attrs["shaping:cone:softness"] = 0.0
-        shaping_attrs["shaping:focus"] = 0.0
+        shaping_attrs["inputs:shaping:cone:angle"] = 180.0
+        shaping_attrs["inputs:shaping:cone:softness"] = 0.0
+        shaping_attrs["inputs:shaping:focus"] = 0.0
         default_extent = 5.0
         extent = Vt.Vec3fArray([Gf.Vec3f(-default_extent), Gf.Vec3f(default_extent)])
 
     elif bl_light.type == 'SUN':
         usd_light_type = "DistantLight"
-        light_attrs["inputs:angle"] = float(bl_light.angle * 0.5 * 180.0 / 3.14159265)
+        light_attrs["inputs:angle"] = math.degrees(bl_light.angle)
     elif bl_light.type == 'SPOT':
         usd_light_type = "SphereLight"
-        radius = bl_light.shadow_soft_size
-        if radius <= 0 or radius < 0.001 or radius > 10:
-            radius = 0.07
+        radius = bl_light.shadow_soft_size / remix_export_scale
         light_attrs["inputs:radius"] = float(radius)
-        shaping_attrs["shaping:cone:angle"] = float(bl_light.spot_size * 0.5 * 180.0 / 3.14159265)
-        shaping_attrs["shaping:cone:softness"] = float(bl_light.spot_blend)
+        shaping_attrs["inputs:shaping:cone:angle"] = math.degrees(bl_light.spot_size) * 0.5
+        shaping_attrs["inputs:shaping:cone:softness"] = float(bl_light.spot_blend)
         default_extent = 5.0
         extent = Vt.Vec3fArray([Gf.Vec3f(-default_extent), Gf.Vec3f(default_extent)])
     elif bl_light.type == 'AREA':
         if bl_light.shape in ['SQUARE', 'RECTANGLE']:
             usd_light_type = "RectLight"
-            light_attrs["inputs:width"] = float(bl_light.size)
-            light_attrs["inputs:height"] = float(bl_light.size_y if bl_light.shape == 'RECTANGLE' else bl_light.size)
+            light_attrs["inputs:width"] = float(bl_light.size / remix_export_scale)
+            light_attrs["inputs:height"] = float((bl_light.size_y if bl_light.shape == 'RECTANGLE' else bl_light.size) / remix_export_scale)
             half_w, half_h = light_attrs["inputs:width"]/2.0, light_attrs["inputs:height"]/2.0
             extent = Vt.Vec3fArray([Gf.Vec3f(-half_w, -half_h, 0), Gf.Vec3f(half_w, half_h, 0)])
         elif bl_light.shape in ['DISK', 'ELLIPSE']:
             usd_light_type = "DiskLight"
-            light_attrs["inputs:radius"] = float(bl_light.size * 0.5)
+            light_attrs["inputs:radius"] = float(bl_light.size * 0.5 / remix_export_scale)
             r = light_attrs["inputs:radius"]
             extent = Vt.Vec3fArray([Gf.Vec3f(-r, -r, 0), Gf.Vec3f(r, r, 0)])
         else:
@@ -1213,6 +1212,14 @@ def export_light(operator, context, obj, sublayer_stage, project_root, target_su
             inv_anchor = get_safe_matrix_inverse(anchor_obj.matrix_world)
             relative_matrix = inv_anchor @ obj.matrix_world
             loc, rot, scale_vec = relative_matrix.decompose()
+            # Imported anchors include the capture unit scale in their world
+            # matrix, while imported light object matrices do not. Remove that
+            # factor before translating Blender units back into USD units.
+            if anchor_obj.get('usd_instance_path') or anchor_obj.get('usd_prim_path'):
+                import_scale = float(context.scene.get('remix_import_unit_scale', 1.0))
+                if import_scale > 0:
+                    loc *= import_scale
+                    scale_vec *= import_scale
         except Exception as e:
             print(f"  WARNING: Relative light transform fallback: {e}")
             loc = obj.location - anchor_obj.location
@@ -1221,10 +1228,21 @@ def export_light(operator, context, obj, sublayer_stage, project_root, target_su
     else:
         loc, rot, scale_vec = obj.matrix_world.decompose()
 
+        # World-space lights need the inverse of the import's Y-up basis.
+        game_stage = get_game_stage(context)
+        axis_stage = game_stage or sublayer_stage
+        from ..nvidia_core.capture import get_capture_layer
+        from ..nvidia_core.composition import _layer_metadata
+        capture_axis = _layer_metadata(get_capture_layer(axis_stage), 'upAxis')
+        if (capture_axis or UsdGeom.GetStageUpAxis(axis_stage)) == UsdGeom.Tokens.y:
+            basis_inverse = mathutils.Quaternion((1, 0, 0), -math.pi / 2)
+            loc = basis_inverse @ loc
+            rot = basis_inverse @ rot
+
     effective_translate = Gf.Vec3d(
-        loc[0] * remix_export_scale,
-        loc[1] * remix_export_scale,
-        loc[2] * remix_export_scale
+        loc[0] / remix_export_scale,
+        loc[1] / remix_export_scale,
+        loc[2] / remix_export_scale
     )
     effective_scale = Gf.Vec3f(scale_vec[0], scale_vec[1], scale_vec[2])
 
@@ -1345,6 +1363,9 @@ class ExportRemixAsset(Operator):
                 stage = Usd.Stage.Open(file_path)
                 if not stage:
                     self.report({'ERROR'}, f"Failed to open existing stage: {file_path}")
+                    return None
+                if stage.GetRootLayer().customLayerData.get('lightspeed_layer_type') == 'capture':
+                    self.report({'ERROR'}, f"Cannot export into a capture layer: {file_path}")
                     return None
                 return stage 
             else:

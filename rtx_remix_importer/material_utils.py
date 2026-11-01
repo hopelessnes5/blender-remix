@@ -268,7 +268,7 @@ def create_material(usd_material_path, usd_stage, usd_file_path_context):
 
 # Input Processor
 def process_input(usd_input_value, input_type, nodes, links, target_node, target_socket_name,
-                  usd_file_path_context, node_pos=(-400, 0), is_normal=False, is_non_color=False):
+                  usd_file_path_context, node_pos=(-400, 0), is_normal=False, is_non_color=False, normal_encoding=None):
     """
     Processes a USD input value and connects it to a Blender node socket with simple layout.
     Places textures to the left of the target node.
@@ -313,6 +313,9 @@ def process_input(usd_input_value, input_type, nodes, links, target_node, target
             # Use existing texture loading function
             image = load_texture(resolved_path, is_normal=is_normal, is_non_color=is_non_color)
             if image:
+                if is_normal:
+                    from .normal_import import decode_to_opengl
+                    image = decode_to_opengl(image, normal_encoding)
                 tex_node = nodes.new(type='ShaderNodeTexImage')
                 tex_node.image = image
                 tex_node.label = f"{input_type.replace('_', ' ').title()} Texture"
@@ -323,9 +326,6 @@ def process_input(usd_input_value, input_type, nodes, links, target_node, target
                 if is_non_color or is_normal:
                     # Ensure correct color space for non-color data
                     image.colorspace_settings.name = 'Non-Color'
-                    # Prefer Alpha output for single channel data if target socket expects VALUE
-                    if 'Alpha' in tex_node.outputs and target_socket.type == 'VALUE':
-                        output_socket_name = 'Alpha'
 
                 # Special handling for Normal Maps
                 if is_normal:
@@ -335,6 +335,10 @@ def process_input(usd_input_value, input_type, nodes, links, target_node, target
                     links.new(tex_node.outputs[output_socket_name], normal_map_node.inputs['Color'])
                     links.new(normal_map_node.outputs['Normal'], target_socket)
                     created_node = normal_map_node # Return the normal map node
+                elif is_non_color and target_socket.type == 'VALUE':
+                    from .scalar_texture import connect_scalar_red
+                    connect_scalar_red(nodes, links, tex_node, target_socket)
+                    created_node = tex_node
                 else:
                     # Direct connection for other textures
                     links.new(tex_node.outputs[output_socket_name], target_socket)
@@ -456,11 +460,13 @@ def process_pbr(shader, bl_material, shader_node, usd_file_path_context):
             # Calculate node position for textures relative to the main shader_node
             node_y_pos = base_y_pos + y_pos_offset
 
+            from .normal_import import effective_encoding
             created_node = process_input(
                 input_value, found_name, nodes, links, shader_node, principled_socket_name,
                 usd_file_path_context, node_pos=(-400, node_y_pos), # X is hardcoded, Y is dynamic
                 is_normal=is_normal, 
-                is_non_color=is_non_color
+                is_non_color=is_non_color,
+                normal_encoding=effective_encoding(shader) if is_normal else None,
             )
 
             # If a texture or normal map node was created, decrease y_pos_offset for the next one

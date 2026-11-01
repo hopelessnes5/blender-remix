@@ -70,19 +70,18 @@ class InterpolatedAttribute:
             return None
 
         if self.interpolation == UsdGeom.Tokens.faceVarying:
-            if self.indices is not None:
-                if corner_index >= len(self.indices):
-                    return None
-                value_index = self.indices[corner_index]
-            else:
-                value_index = corner_index
-        elif self.interpolation == UsdGeom.Tokens.vertex:
+            value_index = corner_index
+        elif self.interpolation in (UsdGeom.Tokens.vertex, UsdGeom.Tokens.varying):
             value_index = point_index
         elif self.interpolation == UsdGeom.Tokens.uniform:
             value_index = face_index
         else:  # constant
             value_index = 0
 
+        if self.indices is not None:
+            if not 0 <= value_index < len(self.indices):
+                return None
+            value_index = self.indices[value_index]
         if value_index is None or not 0 <= value_index < len(values):
             return None
         return values[value_index]
@@ -116,10 +115,8 @@ class MeshData:
     def polygons(self) -> list[tuple[int, ...]]:
         """Return faces as tuples, with USD left-handed winding corrected."""
         faces: list[tuple[int, ...]] = []
-        offset = 0
-        for count in self.face_vertex_counts:
+        for count, offset in zip(self.face_vertex_counts, self.face_corner_offsets):
             face = tuple(self.face_vertex_indices[offset : offset + count])
-            offset += count
             if self.is_left_handed:
                 face = tuple(reversed(face))
             faces.append(face)
@@ -176,7 +173,7 @@ def _get_primvar(prim: Usd.Prim, name: str, time_code: Usd.TimeCode) -> Interpol
     values = primvar.Get(time_code)
     if values is None:
         return None
-    indices = primvar.GetIndices(time_code)
+    indices = primvar.GetIndices(time_code) if primvar.IsIndexed() else None
     interpolation = primvar.GetInterpolation() or UsdGeom.Tokens.constant
     return InterpolatedAttribute(
         interpolation=interpolation,
@@ -268,6 +265,15 @@ def extract_mesh_data(
     orientation = str(mesh.GetOrientationAttr().Get(time_code) or "rightHanded")
     original_corner_count = int(sum(int(count) for count in counts))
 
+    normals = _get_primvar(prim, "normals", time_code)
+    if normals is None:
+        normal_values = mesh.GetNormalsAttr().Get(time_code)
+        if normal_values is not None:
+            normals = InterpolatedAttribute(
+                interpolation=mesh.GetNormalsInterpolation() or UsdGeom.Tokens.vertex,
+                values=_as_tuple(normal_values),
+            )
+
     return MeshData(
         prototype_path=prototype_path or str(prim.GetPath()),
         points=tuple((float(p[0]), float(p[1]), float(p[2])) for p in points),
@@ -277,7 +283,7 @@ def extract_mesh_data(
         face_ids=tuple(kept_face_ids),
         orientation=orientation,
         uvs=_get_primvar(prim, "st", time_code),
-        normals=_get_primvar(prim, "normals", time_code),
+        normals=normals,
         subsets=_read_subsets(prim, time_code),
         original_corner_count=original_corner_count,
     )

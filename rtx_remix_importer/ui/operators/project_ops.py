@@ -15,6 +15,91 @@ except ImportError:
     UsdLux = None
     Gf = None
 
+
+def _require_writable_layer(path):
+    """Open a layer for authoring, refusing capture and locked layers."""
+    layer = Sdf.Layer.FindOrOpen(path)
+    if not layer:
+        raise ValueError(f"Could not open layer: {path}")
+    if layer.customLayerData.get('lightspeed_layer_type') == 'capture':
+        raise ValueError(f"Cannot edit capture layer: {path}")
+    if not layer.permissionToEdit:
+        raise ValueError(f"Layer is locked: {path}")
+    return layer
+
+
+def _layer_identity(layer):
+    return os.path.normcase(os.path.realpath(layer.realPath or layer.identifier))
+
+
+def _sublayer_graph(root):
+    """Return descendant IDs and whether this tree contains a capture.
+
+    Fail closed on missing dependencies: an unresolved subtree cannot be
+    checked for cycles or capture ordering safely.
+    """
+    seen = set()
+    active = set()
+    contains_capture = False
+
+    def visit(layer):
+        nonlocal contains_capture
+        identity = _layer_identity(layer)
+        if identity in active:
+            raise ValueError(f'Cycle in sublayer graph: {layer.identifier}')
+        if identity in seen:
+            return
+        seen.add(identity)
+        active.add(identity)
+        if layer.customLayerData.get('lightspeed_layer_type') == 'capture':
+            contains_capture = True
+        for subpath in layer.subLayerPaths:
+            child = Sdf.Layer.FindRelativeToLayer(layer, subpath)
+            if child is None:
+                child = Sdf.Layer.FindOrOpen(layer.ComputeAbsolutePath(subpath))
+            if child is None:
+                raise ValueError(f'Cannot inspect sublayer {subpath} in {layer.identifier}')
+            visit(child)
+        active.remove(identity)
+
+    visit(root)
+    return seen, contains_capture
+
+
+def _insert_sublayer(target_layer, child_path):
+    """Add a sublayer without cycles, duplicate paths or stronger captures."""
+    target_layer = _require_writable_layer(target_layer.realPath or target_layer.identifier)
+    child = Sdf.Layer.FindOrOpen(child_path)
+    if not child:
+        raise ValueError(f'Cannot open sublayer: {child_path}')
+    target_id, child_id = _layer_identity(target_layer), _layer_identity(child)
+    child_ids, child_has_capture = _sublayer_graph(child)
+    if target_id in child_ids:
+        raise ValueError(f'Adding {child_path} would create a sublayer cycle')
+
+    existing = []
+    for path in target_layer.subLayerPaths:
+        layer = Sdf.Layer.FindRelativeToLayer(target_layer, path)
+        if layer is None:
+            layer = Sdf.Layer.FindOrOpen(target_layer.ComputeAbsolutePath(path))
+        if layer is None:
+            raise ValueError(f'Cannot inspect existing sublayer: {path}')
+        if _layer_identity(layer) == child_id:
+            return False
+        _, has_capture = _sublayer_graph(layer)
+        existing.append((path, has_capture))
+
+    relative = os.path.relpath(child.realPath, start=os.path.dirname(target_layer.realPath)).replace('\\', '/')
+    if not relative.startswith('..'):
+        relative = './' + relative
+    # An imported capture subtree belongs at the weak end. A replacement is
+    # inserted ahead of any existing subtree containing a capture.
+    insertion = len(existing) if child_has_capture else next(
+        (i for i, (_, has_capture) in enumerate(existing) if has_capture), len(existing)
+    )
+    target_layer.subLayerPaths.insert(insertion, relative)
+    return True
+
 class LoadRemixProject(bpy.types.Operator):
     """Loads the specified Remix mod file and populates the sublayer list"""
     bl_idname = "remix.load_project"
@@ -177,6 +262,11 @@ class SetTargetSublayer(bpy.types.Operator):
 
     def execute(self, context):
         if self.sublayer_path:
+            try:
+                _require_writable_layer(bpy.path.abspath(self.sublayer_path))
+            except Exception as exc:
+                self.report({'ERROR'}, str(exc))
+                return {'CANCELLED'}
             context.scene.remix_active_sublayer_path = self.sublayer_path
             print(f"Set active export target: {self.sublayer_path}")
             # Force UI redraw if necessary (might not be needed depending on context)
@@ -210,6 +300,12 @@ class CreateRemixSublayer(bpy.types.Operator):
 
         mod_file_path = bpy.path.abspath(context.scene.remix_mod_file_path)
         new_name = context.scene.remix_new_sublayer_name
+        target_path = context.scene.remix_active_sublayer_path or mod_file_path
+        try:
+            _require_writable_layer(bpy.path.abspath(target_path))
+        except Exception as exc:
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
         if not new_name:
             self.report({'ERROR'}, "New sublayer name cannot be empty.")
             return {'CANCELLED'}
@@ -306,7 +402,7 @@ class CreateRemixSublayer(bpy.types.Operator):
                 target_name = os.path.basename(mod_file_path)
             
             # Open the target layer
-            target_layer = Sdf.Layer.FindOrOpen(target_file)
+            target_layer = _require_writable_layer(target_file)
             if not target_layer:
                 raise RuntimeError(f"Failed to open target file {target_file} to add sublayer.")
             
@@ -317,12 +413,9 @@ class CreateRemixSublayer(bpy.types.Operator):
             if not relative_path.startswith(".."):
                 relative_path = f"./{relative_path}"
 
-            # Check if already present
-            current_sublayers = target_layer.subLayerPaths
-            if relative_path in current_sublayers:
+            if not _insert_sublayer(target_layer, new_sublayer_path):
                 self.report({'INFO'}, f"Sublayer '{relative_path}' already exists in {target_name}.")
             else:
-                target_layer.subLayerPaths.append(relative_path)
                 target_layer.Save()
                 print(f"Added '{relative_path}' to sublayers in {target_name}")
                 if active_sublayer:
@@ -332,7 +425,7 @@ class CreateRemixSublayer(bpy.types.Operator):
 
         except Exception as e:
              self.report({'ERROR'}, f"Failed to add sublayer reference to {mod_file_path}: {e}")
-             # Don't cancel here, the file was created, but adding reference failed.
+             return {'CANCELLED'}
 
         # Refresh the UI list by calling the load operator
         bpy.ops.remix.load_project()
@@ -389,7 +482,7 @@ class AddRemixSublayer(bpy.types.Operator, bpy_extras.io_utils.ImportHelper):
                 target_name = os.path.basename(mod_file_path)
             
             # Open the target layer
-            target_layer = Sdf.Layer.FindOrOpen(target_file)
+            target_layer = _require_writable_layer(target_file)
             if not target_layer:
                 raise RuntimeError(f"Failed to open target file {target_file} to add sublayer.")
             
@@ -400,12 +493,9 @@ class AddRemixSublayer(bpy.types.Operator, bpy_extras.io_utils.ImportHelper):
             if not relative_path.startswith(".."):
                 relative_path = f"./{relative_path}"
 
-            # Check if already present
-            current_sublayers = target_layer.subLayerPaths
-            if relative_path in current_sublayers:
+            if not _insert_sublayer(target_layer, existing_sublayer_path):
                 self.report({'INFO'}, f"Sublayer '{relative_path}' already exists in {target_name}. No changes made.")
             else:
-                target_layer.subLayerPaths.append(relative_path)
                 target_layer.Save()
                 print(f"Added '{relative_path}' to sublayers in {target_name}")
                 if active_sublayer:

@@ -313,7 +313,8 @@ class DeleteExportedAsset(bpy.types.Operator):
         
         try:
             # Open the layer directly (not as a composed stage)
-            layer = Sdf.Layer.FindOrOpen(target_file)
+            from .project_ops import _require_writable_layer
+            layer = _require_writable_layer(target_file)
             if not layer:
                 self.report({'ERROR'}, f"Could not open layer: {target_file}")
                 return {'CANCELLED'}
