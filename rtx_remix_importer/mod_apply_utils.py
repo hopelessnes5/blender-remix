@@ -54,7 +54,7 @@ def get_mesh_data_from_mod(usd_mesh_prim_param, current_time_code, is_mod_y_up, 
             else: # Triangulate N-gons
                 for i in range(1, count_val - 1): faces.append((face_indices[0], face_indices[i], face_indices[i+1]))
             current_idx += count_val
-        
+
         uvs_data_tuple, normals_data_tuple = None, None
         primvars_api = UsdGeom.PrimvarsAPI(mesh_api.GetPrim())
         st_primvar = primvars_api.GetPrimvar("st")
@@ -63,7 +63,7 @@ def get_mesh_data_from_mod(usd_mesh_prim_param, current_time_code, is_mod_y_up, 
             uv_indices_list = st_primvar.GetIndices(current_time_code)
             uv_interp = st_primvar.GetInterpolation()
             if uv_values is not None: uvs_data_tuple = (uv_values, uv_indices_list, uv_interp)
-        
+
         normals_primvar = primvars_api.GetPrimvar("normals")
         if normals_primvar:
             norm_values = normals_primvar.Get(current_time_code)
@@ -85,7 +85,7 @@ def create_new_blender_light_from_mod(usd_light_prim, time_code_param, scene_sca
     bl_light_data_name = bl_light_name + "_data"
 
     bl_type = 'POINT' # Default
-    
+
     # Check light types safely (different USD versions have different schemas)
     def safe_is_light_type(prim, type_name):
         """Safely check if prim is a specific light type."""
@@ -96,18 +96,18 @@ def create_new_blender_light_from_mod(usd_light_prim, time_code_param, scene_sca
             except:
                 return False
         return False
-    
-    if safe_is_light_type(usd_light_prim, 'SphereLight'): 
+
+    if safe_is_light_type(usd_light_prim, 'SphereLight'):
         bl_type = 'POINT'
-    elif safe_is_light_type(usd_light_prim, 'RectLight'): 
+    elif safe_is_light_type(usd_light_prim, 'RectLight'):
         bl_type = 'AREA'
-    elif safe_is_light_type(usd_light_prim, 'DistantLight'): 
+    elif safe_is_light_type(usd_light_prim, 'DistantLight'):
         bl_type = 'SUN'
-    elif safe_is_light_type(usd_light_prim, 'SpotLight'): 
+    elif safe_is_light_type(usd_light_prim, 'SpotLight'):
         bl_type = 'SPOT'
-    elif safe_is_light_type(usd_light_prim, 'DiskLight'): 
+    elif safe_is_light_type(usd_light_prim, 'DiskLight'):
         bl_type = 'POINT'
-    elif safe_is_light_type(usd_light_prim, 'DomeLight'): 
+    elif safe_is_light_type(usd_light_prim, 'DomeLight'):
         report_fn({'INFO'}, f"USD DomeLight <{usd_light_prim.GetPath()}> mapped to Blender SUN light. For IBL, consider environment textures.")
         bl_type = 'SUN'
     elif safe_is_light_type(usd_light_prim, 'CylinderLight'):
@@ -119,7 +119,7 @@ def create_new_blender_light_from_mod(usd_light_prim, time_code_param, scene_sca
     elif safe_is_light_type(usd_light_prim, 'DiskLight'):
         report_fn({'INFO'}, f"USD DiskLight <{usd_light_prim.GetPath()}> mapped to Blender POINT light with sphere shape.")
         bl_type = 'POINT'
-    
+
     bl_light_data = bpy.data.lights.new(name=bl_light_data_name, type=bl_type)
     light_api = UsdLux.LightAPI(usd_light_prim)
 
@@ -131,7 +131,7 @@ def create_new_blender_light_from_mod(usd_light_prim, time_code_param, scene_sca
     if light_api.GetEnableColorTemperatureAttr().Get(time_code_param) and light_api.GetColorTemperatureAttr().IsDefined():
         bl_light_data.use_custom_color_temp = True
         bl_light_data.color_temperature = light_api.GetColorTemperatureAttr().Get(time_code_param)
-    
+
     if safe_is_light_type(usd_light_prim, 'SphereLight'):
         sphere_light_api = getattr(UsdLux, 'SphereLight')(usd_light_prim)
         # Set shape only if the attribute exists (newer Blender versions)
@@ -169,12 +169,8 @@ def create_new_blender_light_from_mod(usd_light_prim, time_code_param, scene_sca
     return new_bl_light_obj
 
 # --- Material-related helpers ---
-# Caches and constants that will be module-level here
+# Caches that will be module-level here
 _TEXTURE_CACHE_MOD_APPLY = {} # Specific cache for this module's texture loading
-_APERTURE_OPAQUE_NODE_GROUP_LOADED_MOD_APPLY = False # Specific flag
-_APERTURE_TRANSLUCENT_NODE_GROUP_LOADED_MOD_APPLY = False # Specific flag
-APERTURE_OPAQUE_NODE_GROUP_NAME_CONST = "Aperture Opaque" # Shared constant name
-APERTURE_TRANSLUCENT_NODE_GROUP_NAME_CONST = "Aperture Translucent" # Shared constant name
 
 def resolve_mod_material_asset_path_util(asset_path, texture_resolution_context_path_param, mod_file_path_param, report_fn):
     # texture_resolution_context_path_param is the primary base (e.g. project root for textures)
@@ -190,7 +186,7 @@ def resolve_mod_material_asset_path_util(asset_path, texture_resolution_context_
         search_paths.append(os.path.join(texture_resolution_context_path_param, "assets"))
         search_paths.append(os.path.join(texture_resolution_context_path_param, "textures"))
         search_paths.append(os.path.join(texture_resolution_context_path_param, "assets", "textures"))
-    
+
     mod_file_dir = os.path.dirname(mod_file_path_param)
     if mod_file_dir not in search_paths:
         search_paths.insert(0, mod_file_dir) # Prioritize mod file's own directory and its assets/textures
@@ -200,7 +196,7 @@ def resolve_mod_material_asset_path_util(asset_path, texture_resolution_context_
 
     for root_dir in search_paths:
         if not root_dir or not os.path.isdir(root_dir): continue
-        
+
         current_test_path = os.path.normpath(os.path.join(root_dir, asset_path))
         if os.path.exists(current_test_path): return current_test_path
 
@@ -235,85 +231,51 @@ def load_mod_texture_util(image_path, is_normal=False, is_non_color=False, repor
         report_fn({'WARNING'}, f"Error loading texture '{abs_image_path}': {e}. Stub image will be used.")
         return None
 
-def append_mod_aperture_opaque_node_group_util(report_fn):
-    global _APERTURE_OPAQUE_NODE_GROUP_LOADED_MOD_APPLY
-    if APERTURE_OPAQUE_NODE_GROUP_NAME_CONST in bpy.data.node_groups:
-        return bpy.data.node_groups[APERTURE_OPAQUE_NODE_GROUP_NAME_CONST]
-    if _APERTURE_OPAQUE_NODE_GROUP_LOADED_MOD_APPLY: return None
-    
-    _APERTURE_OPAQUE_NODE_GROUP_LOADED_MOD_APPLY = True
-    addon_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    blend_file_path = os.path.join(addon_root, "nodes", "ApertureOpaque.blend")
-    if not os.path.exists(blend_file_path):
-        report_fn({'ERROR'}, f"ApertureOpaque.blend not found at {blend_file_path}")
-        return None
-    try:
-        with bpy.data.libraries.load(blend_file_path, link=False) as (data_from, data_to):
-            if APERTURE_OPAQUE_NODE_GROUP_NAME_CONST in data_from.node_groups:
-                data_to.node_groups = [APERTURE_OPAQUE_NODE_GROUP_NAME_CONST]
-            else: return None
-    except Exception as e:
-        report_fn({'ERROR'}, f"Failed to load Aperture Opaque node group: {e}")
-        return None
-    return bpy.data.node_groups.get(APERTURE_OPAQUE_NODE_GROUP_NAME_CONST)
-
-def append_mod_aperture_translucent_node_group_util(report_fn):
-    global _APERTURE_TRANSLUCENT_NODE_GROUP_LOADED_MOD_APPLY
-    if APERTURE_TRANSLUCENT_NODE_GROUP_NAME_CONST in bpy.data.node_groups:
-        return bpy.data.node_groups[APERTURE_TRANSLUCENT_NODE_GROUP_NAME_CONST]
-    if _APERTURE_TRANSLUCENT_NODE_GROUP_LOADED_MOD_APPLY: return None
-    
-    _APERTURE_TRANSLUCENT_NODE_GROUP_LOADED_MOD_APPLY = True
-    # Try to import from material_utils
-    try:
-        from . import material_utils
-        return material_utils.append_aperture_translucent_node_group()
-    except Exception as e:
-        report_fn({'ERROR'}, f"Failed to load Aperture Translucent node group: {e}")
-        return None
+def _get_mod_socket(node, *names):
+    """Return the first existing input socket among *names* (version-tolerant lookup)."""
+    for name in names:
+        socket = node.inputs.get(name)
+        if socket is not None:
+            return socket
+    return None
 
 def create_mod_default_blender_material_util(name, report_fn, is_translucent=False):
+    """Create a standard Principled BSDF material for mod overrides.
+
+    Translucent mods are represented by Principled's transmission layer
+    (Transmission Weight = 1.0) instead of a custom node group.
+    """
     mat = bpy.data.materials.new(name=name)
     mat.use_nodes = True
     nodes, links = mat.node_tree.nodes, mat.node_tree.links
     nodes.clear()
     output_node = nodes.new(type='ShaderNodeOutputMaterial')
     output_node.location = (300, 0)
-    
+
+    bsdf = nodes.new(type='ShaderNodeBsdfPrincipled')
+    bsdf.location = (0, 0)
     if is_translucent:
-        aperture_group = append_mod_aperture_translucent_node_group_util(report_fn)
-        group_name = APERTURE_TRANSLUCENT_NODE_GROUP_NAME_CONST
-    else:
-        aperture_group = append_mod_aperture_opaque_node_group_util(report_fn)
-        group_name = APERTURE_OPAQUE_NODE_GROUP_NAME_CONST
-    
-    if not aperture_group:
-        bsdf = nodes.new(type='ShaderNodeBsdfPrincipled')
-        bsdf.location = (0,0)
-        if is_translucent:
-            # Set up for transmission
-            if 'Transmission Weight' in bsdf.inputs:
-                bsdf.inputs['Transmission Weight'].default_value = 1.0
-            elif 'Transmission' in bsdf.inputs:
-                bsdf.inputs['Transmission'].default_value = 1.0
-        links.new(bsdf.outputs['BSDF'], output_node.inputs['Surface'])
-        return mat, bsdf
-    
-    group_node = nodes.new(type='ShaderNodeGroup')
-    group_node.node_tree = aperture_group
-    group_node.name = group_name
-    group_node.location = (0, 0)
-    if 'BSDF' in group_node.outputs: links.new(group_node.outputs['BSDF'], output_node.inputs['Surface'])
-    if 'Displacement' in group_node.outputs: links.new(group_node.outputs['Displacement'], output_node.inputs['Displacement'])
-    return mat, group_node
+        # Set up for transmission
+        if 'Transmission Weight' in bsdf.inputs:
+            bsdf.inputs['Transmission Weight'].default_value = 1.0
+        elif 'Transmission' in bsdf.inputs:
+            bsdf.inputs['Transmission'].default_value = 1.0
+        ior_socket = _get_mod_socket(bsdf, 'IOR')
+        if ior_socket is not None:
+            ior_socket.default_value = 1.3
+    links.new(bsdf.outputs['BSDF'], output_node.inputs['Surface'])
+    return mat, bsdf
 
 def get_mod_input_value_util(shader_prim_instance, input_name_str):
     # Handle both UsdShade.Shader and raw Usd.Prim
     # Returns tuple: (value, attribute) where attribute can be used to find authoring layer
     if hasattr(shader_prim_instance, 'GetInput'):
         # It's a UsdShade.Shader, use GetInput
-        shader_input = shader_prim_instance.GetInput(input_name_str)
-        if not shader_input: return None, None
+        base_name = input_name_str.removeprefix('inputs:')
+        shader_input = shader_prim_instance.GetInput(base_name)
+        if not shader_input:
+            attr = shader_prim_instance.GetPrim().GetAttribute(base_name)
+            return (attr.Get(), attr) if attr and attr.HasValue() else (None, None)
         # Get the underlying attribute to check if it's defined and has value
         attr = shader_input.GetAttr()
         if not attr or not attr.IsDefined() or not attr.HasValue(): return None, None
@@ -324,7 +286,7 @@ def get_mod_input_value_util(shader_prim_instance, input_name_str):
         if not attr or not attr.IsDefined() or not attr.HasValue(): return None, None
         return attr.Get(), attr
 
-def process_mod_input_util(usd_input_val, input_type_name, nodes, links, target_node, target_socket_name, 
+def process_mod_input_util(usd_input_val, input_type_name, nodes, links, target_node, target_socket_name,
                            texture_res_context_path, mod_file_path_for_tex, # For resolve_mod_material_asset_path_util
                            node_pos=(-400,0), is_normal=False, is_non_color=False, report_fn=print):
     target_socket = target_node.inputs.get(target_socket_name)
@@ -377,42 +339,52 @@ def process_mod_input_util(usd_input_val, input_type_name, nodes, links, target_
     elif isinstance(usd_input_val, bool) and target_socket.type == 'VALUE': target_socket.default_value = 1.0 if usd_input_val else 0.0
     return created_node
 
-def process_mod_pbr_util(shader_prim_instance, bl_mat_instance, main_shader_node_instance, 
+def _shader_prim_is_translucent(shader_prim_instance):
+    """Detect a translucent mod shader from its own authored inputs (the
+    AperturePBR_Translucent-specific set), independent of the Blender node."""
+    for name in ("inputs:transmittance_color", "transmittance_color",
+                 "inputs:transmittance_texture", "transmittance_texture",
+                 "inputs:thin_walled", "thin_walled"):
+        val, _attr = get_mod_input_value_util(shader_prim_instance, name)
+        if val is not None:
+            return True
+    return False
+
+
+# Principled-only attributes that have no direct socket counterpart on the
+# node; they are preserved as custom material properties.
+_TRANSLUCENT_EXTRA_PROPERTIES = ("Thin Wall Thickness", "Transmittance Measurement Distance", "Thin Walled")
+
+
+def process_mod_pbr_util(shader_prim_instance, bl_mat_instance, main_shader_node_instance,
                                     texture_res_context_path_p, mod_file_path_for_tex_p, report_fn):
     nodes, links = bl_mat_instance.node_tree.nodes, bl_mat_instance.node_tree.links
-    
-    # Detect if this is a translucent material by checking node group type
-    is_translucent = (main_shader_node_instance.type == 'GROUP' and 
-                     main_shader_node_instance.node_tree and 
-                     APERTURE_TRANSLUCENT_NODE_GROUP_NAME_CONST in main_shader_node_instance.node_tree.name)
-    
+
+    # Detect if this is a translucent material from the mod shader's inputs
+    is_translucent = _shader_prim_is_translucent(shader_prim_instance)
+
     if is_translucent:
-        # Translucent material input mapping
+        # Translucent material input mapping (AperturePBR_Translucent -> Principled)
         input_map = {
-            "Transmittance/Diffuse Albedo": ["inputs:transmittance_texture", "transmittance_texture", "inputs:transmittance_color", "transmittance_color"],
+            "Base Color": ["inputs:transmittance_texture", "transmittance_texture", "inputs:transmittance_color", "transmittance_color"],
             "IOR": ["inputs:ior_constant", "ior_constant"],
-            "Thin Walled": ["inputs:thin_walled", "thin_walled"],
-            "Thin Wall Thickness": ["inputs:thin_wall_thickness", "thin_wall_thickness"],
-            "Use Diffuse Layer": ["inputs:use_diffuse_layer", "use_diffuse_layer"],
-            "Transmittance Measurement Distance": ["inputs:transmittance_measurement_distance", "transmittance_measurement_distance"],
-            "Enable Emission": ["inputs:enable_emission"],
-            "Emissive Color": ["inputs:emissive_mask_texture", "emissive_mask_texture", "inputs:emissive_color", "emissive_color"],
-            "Emissive Intensity": ["inputs:emissive_intensity", "emissive_intensity"],
-            "Normal Map": ["inputs:normalmap_texture", "normalmap_texture"],
+            "Normal": ["inputs:normalmap_texture", "normalmap_texture"],
+            "Emission Color": ["inputs:emissive_mask_texture", "emissive_mask_texture", "inputs:emissive_color", "emissive_color"],
+            "Emission Strength": ["inputs:emissive_intensity", "emissive_intensity"],
         }
     else:
-        # Standard opaque PBR input mapping
+        # Standard opaque PBR input mapping (Principled sockets)
         input_map = {
-            "Albedo Color": ["inputs:diffuse_texture", "diffuse_texture", "diffuse_color_constant"],
-            "Opacity": ["inputs:opacity_texture", "opacity_texture", "opacity_constant", "inputs:opacity", "opacity"],
+            "Base Color": ["inputs:diffuse_texture", "diffuse_texture", "diffuse_color_constant"],
             "Roughness": ["inputs:reflectionroughness_texture", "reflectionroughness_texture", "reflection_roughness_constant"],
             "Metallic": ["inputs:metallic_texture", "metallic_texture", "metallic_constant"],
-            "Normal Map": ["inputs:normalmap_texture", "normalmap_texture"],
-            "Height Map": ["inputs:height_texture", "height_texture", "height_constant"],
-            "Enable Emission": ["inputs:enable_emission"],
-            "Emissive Color": ["inputs:emissive_mask_texture", "emissive_mask_texture", "emissive_color_constant"],
-            "Emissive Intensity": ["inputs:emissive_intensity", "emissive_intensity"],
+            "Normal": ["inputs:normalmap_texture", "normalmap_texture"],
+            "Emission Color": ["inputs:emissive_mask_texture", "emissive_mask_texture", "emissive_color_constant"],
+            "Emission Strength": ["inputs:emissive_intensity", "emissive_intensity"],
         }
+    opacity_enabled, _ = get_mod_input_value_util(shader_prim_instance, "inputs:enable_opacity")
+    if opacity_enabled is True:
+        input_map["Alpha"] = ["inputs:opacity_texture", "opacity_texture", "inputs:opacity_constant", "opacity_constant", "inputs:opacity", "opacity"]
     base_y, y_off, spacing = main_shader_node_instance.location.y, 200, 250
     # Get the stage from the shader prim (works for both wrapped and raw)
     shader_prim_obj = shader_prim_instance.GetPrim() if hasattr(shader_prim_instance, 'GetPrim') else shader_prim_instance
@@ -420,9 +392,9 @@ def process_mod_pbr_util(shader_prim_instance, bl_mat_instance, main_shader_node
     for grp_sock, usd_names in input_map.items():
         if not main_shader_node_instance.inputs.get(grp_sock): continue
         val, attr, name_fnd = None, None, None
-        for name in usd_names: 
+        for name in usd_names:
             result = get_mod_input_value_util(shader_prim_instance, name)
-            if result[0] is not None: 
+            if result[0] is not None:
                 val, attr = result
                 name_fnd = name
                 break
@@ -439,26 +411,37 @@ def process_mod_pbr_util(shader_prim_instance, bl_mat_instance, main_shader_node
                             if prim_spec and attr.GetName() in [spec.name for spec in prim_spec.attributes]:
                                 attr_layer_path = layer.realPath
                                 break
-                except:
+                except Exception:
                     pass  # Use default if we can't find the layer
-            
+
             # Use the layer where the attribute was authored
             attr_layer_dir = os.path.dirname(attr_layer_path)
-            
-            is_n, is_nc = (grp_sock == "Normal Map"), grp_sock in ["Metallic", "Roughness", "Opacity", "Height Map", "Emissive Intensity", "Transmittance Measurement Distance"]
-            node_created = process_mod_input_util(val, name_fnd, nodes, links, main_shader_node_instance, grp_sock, 
-                                      attr_layer_dir, attr_layer_path, 
+
+            is_n, is_nc = (grp_sock == "Normal"), grp_sock in ["Metallic", "Roughness", "Emission Strength", "Alpha"]
+            node_created = process_mod_input_util(val, name_fnd, nodes, links, main_shader_node_instance, grp_sock,
+                                      attr_layer_dir, attr_layer_path,
                                       (-400, base_y + y_off), is_n, is_nc, report_fn)
             if node_created:
                 y_off -= spacing
-            # Store translucent properties as custom material properties if socket doesn't exist
-            elif grp_sock in ["IOR", "Thin Walled", "Thin Wall Thickness", "Transmittance Measurement Distance"]:
-                prop_name = f"rtx_{grp_sock.lower().replace(' ', '_')}"
-                if isinstance(val, (float, int)):
-                    bl_mat_instance[prop_name] = float(val)
-                elif isinstance(val, bool):
+
+    # Translucent attributes without a Principled socket counterpart are kept
+    # as custom material properties so the values survive reloads.
+    for prop_label in _TRANSLUCENT_EXTRA_PROPERTIES:
+        prop_usd_names = {
+            "Thin Walled": ["inputs:thin_walled", "thin_walled"],
+            "Thin Wall Thickness": ["inputs:thin_wall_thickness", "thin_wall_thickness"],
+            "Transmittance Measurement Distance": ["inputs:transmittance_measurement_distance", "transmittance_measurement_distance"],
+        }
+        for name in prop_usd_names[prop_label]:
+            val, _attr = get_mod_input_value_util(shader_prim_instance, name)
+            if val is not None:
+                prop_name = f"rtx_{prop_label.lower().replace(' ', '_')}"
+                if isinstance(val, bool):
                     bl_mat_instance[prop_name] = val
-                report_fn({'INFO'}, f"  Stored {grp_sock} = {val} as custom property '{prop_name}'")
+                elif isinstance(val, (float, int)):
+                    bl_mat_instance[prop_name] = float(val)
+                report_fn({'INFO'}, f"  Stored {prop_label} = {val} as custom property '{prop_name}'")
+                break
     # FIX: same class of bug fixed earlier in material_utils.py (capture import) -
     # this was connecting Albedo's alpha to Opacity based purely on pixel-variance
     # (has_meaningful_alpha), ignoring the material's actual enable_opacity flag
@@ -476,48 +459,52 @@ def process_mod_pbr_util(shader_prim_instance, bl_mat_instance, main_shader_node
 
     usd_enable_opacity = _get_bare_or_prefixed("enable_opacity")
     from .texture_utils import has_meaningful_alpha
-    op_s, alb_s = main_shader_node_instance.inputs.get("Opacity"), main_shader_node_instance.inputs.get("Albedo Color")
+    op_s, alb_s = main_shader_node_instance.inputs.get("Alpha"), main_shader_node_instance.inputs.get("Base Color")
     if usd_enable_opacity is True:
         if op_s and not op_s.is_linked and alb_s and alb_s.is_linked:
             alb_n = alb_s.links[0].from_node
             if alb_n.type == 'TEX_IMAGE' and 'Alpha' in alb_n.outputs and alb_n.image and has_meaningful_alpha(alb_n.image):
                 links.new(alb_n.outputs['Alpha'], op_s)
-                print(f"  Connected alpha from '{alb_n.image.name}' to opacity - enable_opacity=True")
+                print(f"  Connected alpha from '{alb_n.image.name}' to alpha - enable_opacity=True")
     elif usd_enable_opacity is False:
         if op_s and op_s.is_linked:
             links.remove(op_s.links[0])
-            print("  Disconnected alpha from opacity - mod material explicitly sets enable_opacity=False")
+            print("  Disconnected alpha from alpha socket - mod material explicitly sets enable_opacity=False")
+        if op_s:
+            op_s.default_value = 1.0
     # usd_enable_opacity is None (this mod override doesn't mention opacity at all) -
-    # leave the Opacity socket exactly as inherited from the copied base material.
-    em_c, em_i = main_shader_node_instance.inputs.get("Emissive Color"), main_shader_node_instance.inputs.get("Emissive Intensity")
+    # leave the Alpha socket exactly as inherited from the copied base material.
+    em_c, em_i = _get_mod_socket(main_shader_node_instance, "Emission Color", "Emissive Color"), \
+                 _get_mod_socket(main_shader_node_instance, "Emission Strength", "Emissive Intensity")
     en_em = main_shader_node_instance.inputs.get("Enable Emission")
     # FIX: was only trying "inputs:enable_emission" - same bare-vs-prefixed issue as
     # enable_opacity above, so this likely never matched real captured/mod data either.
     usd_en_em = _get_bare_or_prefixed("enable_emission")
     expl_dis = isinstance(usd_en_em, bool) and not usd_en_em
     if em_c and em_i and em_c.is_linked and not em_i.is_linked and not expl_dis:
-        if not (en_em and isinstance(en_em.default_value, (float, int, bool)) and not en_em.default_value) and em_i.default_value == 0.0: 
+        if not (en_em and isinstance(en_em.default_value, (float, int, bool)) and not en_em.default_value) and em_i.default_value == 0.0:
             em_i.default_value = 1.0
 
-def create_mod_material_nodes_util(material_usd_path_str, current_mod_stage, 
+def create_mod_material_nodes_util(material_usd_path_str, current_mod_stage,
                                    texture_res_context_path_p, mod_file_path_for_tex_p, report_fn,
                                    existing_bl_material_param=None):
     mat_prim = current_mod_stage.GetPrimAtPath(material_usd_path_str)
     if not mat_prim or not mat_prim.IsValid():
         return None, None
-    
+
     # For override-only files, IsA(Material) may fail, but we can still process it
     # if it has the expected structure (Shader child)
     is_material = mat_prim.IsA(UsdShade.Material)
     has_shader_child = mat_prim.GetChild("Shader") is not None
-    
+
     if not is_material and not has_shader_child:
         return None, None
-    
+
     mat_name = bpy.path.clean_name(mat_prim.GetName() or os.path.basename(material_usd_path_str))
-    
+
     # Detect if this is a translucent material by checking for translucent-specific inputs
     is_translucent = False
+    has_explicit_type = False
     if mat_prim or has_shader_child:
         test_shader = None
         if has_shader_child:
@@ -526,33 +513,70 @@ def create_mod_material_nodes_util(material_usd_path_str, current_mod_stage,
             surf_out = UsdShade.Material(mat_prim).GetSurfaceOutput()
             if surf_out and surf_out.HasConnectedSource():
                 test_shader = surf_out.GetConnectedSource()[0].GetPrim()
-        
+
         if test_shader and test_shader.IsValid():
+            mdl = test_shader.GetAttribute('info:mdl:sourceAsset')
+            mdl_value = mdl.Get() if mdl and mdl.HasValue() else None
+            if mdl_value:
+                has_explicit_type = True
+                is_translucent = 'AperturePBR_Translucent' in str(mdl_value)
             # Check for translucent-specific attributes
             for attr in test_shader.GetAuthoredAttributes():
                 attr_name = attr.GetName()
                 if 'transmittance' in attr_name.lower() or 'thin_walled' in attr_name.lower():
                     is_translucent = True
+                    has_explicit_type = True
                     report_fn({'INFO'}, f"  Detected translucent material: {mat_name}")
                     break
-    
-    target_mat_name = f"{mat_name}_mod_override"
-    expected_group_name = APERTURE_TRANSLUCENT_NODE_GROUP_NAME_CONST if is_translucent else APERTURE_OPAQUE_NODE_GROUP_NAME_CONST
 
-    # FIX: reuse the existing material + shader group from a previous load instead of
+    # An override containing only roughness or a normal map must retain the
+    # type and existing node graph of the material it patches.
+    if not has_explicit_type and existing_bl_material_param and existing_bl_material_param.node_tree:
+        for node in existing_bl_material_param.node_tree.nodes:
+            if node.type == 'BSDF_PRINCIPLED':
+                trans = node.inputs.get('Transmission Weight') or node.inputs.get('Transmission')
+                is_translucent = bool(trans is not None and not trans.is_linked and trans.default_value >= 0.5)
+                break
+
+    target_mat_name = f"{mat_name}_mod_override"
+
+    def _principled_state_matches(node):
+        """Whether an existing Principled BSDF node matches the translucent state."""
+        if node.type != 'BSDF_PRINCIPLED':
+            return False
+        trans = node.inputs.get('Transmission Weight') or node.inputs.get('Transmission')
+        is_node_translucent = bool(trans is not None and not trans.is_linked and trans.default_value >= 0.5)
+        # Legacy pre-Principled node groups are always treated as opaque;
+        # rebuilding into a standard Principled setup is the point of the port.
+        return is_node_translucent == bool(is_translucent)
+
+    def _find_main_shader_node(material):
+        """Find the main shading node of a material: a Principled BSDF first,
+        falling back to a legacy Aperture group for old .blend materials."""
+        principled, group = None, None
+        for node in material.node_tree.nodes:
+            if node.type == 'BSDF_PRINCIPLED':
+                principled = node
+                break
+            elif node.type == 'GROUP' and node.node_tree and group is None:
+                if "Aperture" in node.node_tree.name:
+                    group = node
+        node = principled if principled is not None else group
+        return node if node is not None and _principled_state_matches(node) else None
+
+    # FIX: reuse the existing material + Principled shader from a previous load instead of
     # always calling bpy.data.materials.new() (which silently created "_mod_override.001",
     # ".002", ... on every reload, leaving the mesh's actual material behind untouched and
     # orphaning the old datablocks). If a material with this name already exists and still
-    # has the expected shader group node, update it in place.
+    # has a matching shader node, update it in place.
     bl_mat, main_node = None, None
     existing_mat = bpy.data.materials.get(target_mat_name)
     if existing_mat and existing_mat.node_tree:
-        for node in existing_mat.node_tree.nodes:
-            if node.type == 'GROUP' and node.node_tree and node.node_tree.name == expected_group_name:
-                bl_mat, main_node = existing_mat, node
-                report_fn({'INFO'}, f"  Reusing existing material '{existing_mat.name}' - updating shader parameters in place")
-                break
-        if not main_node:
+        main_node = _find_main_shader_node(existing_mat)
+        if main_node:
+            bl_mat = existing_mat
+            report_fn({'INFO'}, f"  Reusing existing material '{existing_mat.name}' - updating shader parameters in place")
+        else:
             report_fn({'INFO'}, f"  Existing material '{existing_mat.name}' has a different shader structure (opaque/translucent changed) - rebuilding")
 
     if not bl_mat:
@@ -565,23 +589,28 @@ def create_mod_material_nodes_util(material_usd_path_str, current_mod_stage,
         # its diffuse/albedo already wired - instead of a blank default, whatever
         # isn't mentioned in this mod material (like diffuse here) stays intact.
         if existing_bl_material_param and existing_bl_material_param.node_tree:
-            for node in existing_bl_material_param.node_tree.nodes:
-                if node.type == 'GROUP' and node.node_tree and node.node_tree.name == expected_group_name:
-                    bl_mat = existing_bl_material_param.copy()
-                    bl_mat.name = target_mat_name
-                    main_node = None
+            base_node = _find_main_shader_node(existing_bl_material_param)
+            if base_node is not None:
+                bl_mat = existing_bl_material_param.copy()
+                bl_mat.name = target_mat_name
+                main_node = None
+                for copied_node in bl_mat.node_tree.nodes:
+                    if copied_node.type == 'BSDF_PRINCIPLED':
+                        main_node = copied_node
+                        break
+                if main_node is None and base_node.type == 'GROUP':
+                    # Legacy base material: find the copied group node by name.
                     for copied_node in bl_mat.node_tree.nodes:
-                        if copied_node.type == 'GROUP' and copied_node.node_tree and copied_node.node_tree.name == expected_group_name:
+                        if copied_node.type == 'GROUP' and copied_node.node_tree and copied_node.node_tree.name == base_node.node_tree.name:
                             main_node = copied_node
                             break
-                    report_fn({'INFO'}, f"  Basing '{target_mat_name}' on the object's existing material '{existing_bl_material_param.name}' (patching only what mod.usda specifies)")
-                    break
+                report_fn({'INFO'}, f"  Basing '{target_mat_name}' on the object's existing material '{existing_bl_material_param.name}' (patching only what mod.usda specifies)")
             if not bl_mat:
                 report_fn({'INFO'}, f"  Existing object material '{existing_bl_material_param.name}' has a different shader structure (opaque/translucent changed) - starting fresh")
 
     if not bl_mat:
         bl_mat, main_node = create_mod_default_blender_material_util(target_mat_name, report_fn, is_translucent)
-    
+
     # Try to get shader prim - either via surface output or direct child
     shader_prim = None
     if is_material:
@@ -589,7 +618,7 @@ def create_mod_material_nodes_util(material_usd_path_str, current_mod_stage,
         if surf_out and surf_out.HasConnectedSource():
             src_path = surf_out.GetConnectedSource()[0].GetPrim().GetPath()
             shader_prim = UsdShade.Shader(current_mod_stage.GetPrimAtPath(src_path))
-    
+
     # Fallback: Look for Shader child directly (common in override files)
     if not shader_prim:
         shader_child = mat_prim.GetChild("Shader")
@@ -603,7 +632,7 @@ def create_mod_material_nodes_util(material_usd_path_str, current_mod_stage,
             else:
                 # Use raw prim - process_mod_pbr_util will handle it
                 shader_prim = shader_child
-    
+
     if shader_prim:
         report_fn({'INFO'}, f"  Processing shader for material {mat_name}")
         # Check if shader has inputs (debug)
@@ -611,16 +640,16 @@ def create_mod_material_nodes_util(material_usd_path_str, current_mod_stage,
         if shader_prim_obj:
             authored_attrs = [attr.GetName() for attr in shader_prim_obj.GetAuthoredAttributes()]
             report_fn({'INFO'}, f"  Shader has {len(authored_attrs)} authored attributes")
-        
-        process_mod_pbr_util(shader_prim, bl_mat, main_node, 
+
+        process_mod_pbr_util(shader_prim, bl_mat, main_node,
                                         texture_res_context_path_p, mod_file_path_for_tex_p, report_fn)
     else:
         report_fn({'WARNING'}, f"  No shader found for material {mat_name}")
-    
+
     return bl_mat, main_node
 
-def get_or_create_mod_instance_material_util(base_material_usd_path, instance_prim_for_metadata, current_mod_stage, 
-                                             texture_res_context_path_p, mod_file_path_for_tex_p, 
+def get_or_create_mod_instance_material_util(base_material_usd_path, instance_prim_for_metadata, current_mod_stage,
+                                             texture_res_context_path_p, mod_file_path_for_tex_p,
                                              mod_base_material_node_cache_param, # Specific cache for (mat, node) tuples
                                              local_material_cache_param, # Cache for final Blender materials
                                              report_fn,
@@ -629,7 +658,7 @@ def get_or_create_mod_instance_material_util(base_material_usd_path, instance_pr
     if instance_prim_for_metadata:
         over_mesh_in_mod = instance_prim_for_metadata.GetChild("mesh")
         if over_mesh_in_mod:
-            for prop in over_mesh_in_mod.GetAuthoredPropertiesInNamespace("primvars:_remix_metadata"): 
+            for prop in over_mesh_in_mod.GetAuthoredPropertiesInNamespace("primvars:_remix_metadata"):
                 instance_metadata[prop.GetBaseName()] = prop.Get()
     meta_hash = hashlib.md5(json.dumps(instance_metadata, sort_keys=True).encode('utf-8')).hexdigest()[:8] if instance_metadata else ""
     unique_key = f"{base_material_usd_path}_{meta_hash}" if meta_hash else base_material_usd_path
@@ -637,81 +666,54 @@ def get_or_create_mod_instance_material_util(base_material_usd_path, instance_pr
 
     bl_mat_base_tuple = mod_base_material_node_cache_param.get(base_material_usd_path)
     if not bl_mat_base_tuple:
-        bl_mat_base_tuple = create_mod_material_nodes_util(base_material_usd_path, current_mod_stage, 
+        bl_mat_base_tuple = create_mod_material_nodes_util(base_material_usd_path, current_mod_stage,
                                                              texture_res_context_path_p, mod_file_path_for_tex_p, report_fn,
                                                              existing_bl_material_param=existing_bl_material_param)
         if not bl_mat_base_tuple or not bl_mat_base_tuple[0]:
              report_fn({'ERROR'}, f"Failed to create base material structure for mod override: {base_material_usd_path}")
              return None
         mod_base_material_node_cache_param[base_material_usd_path] = bl_mat_base_tuple
-    
+
     base_bl_mat, _ = bl_mat_base_tuple # Don't need main_shader_node here
     final_bl_material = base_bl_mat
     if instance_metadata:
         final_name = f"{base_bl_mat.name}_{meta_hash[:4]}"
         existing_copy = bpy.data.materials.get(final_name)
         if existing_copy: final_bl_material = existing_copy
-        else: 
+        else:
             final_bl_material = base_bl_mat.copy(); final_bl_material.name = final_name
-        
-        # Apply actual metadata overrides to the shader group inputs
+
+        # Apply actual metadata overrides to the Principled BSDF inputs
         shader_group_node = None
         if final_bl_material.node_tree:
             for node in final_bl_material.node_tree.nodes:
-                if node.type == 'GROUP' and node.node_tree and node.node_tree.name == APERTURE_OPAQUE_NODE_GROUP_NAME_CONST:
+                if node.type == 'BSDF_PRINCIPLED':
                     shader_group_node = node
                     break
-        
+            if shader_group_node is None:
+                # Legacy pre-Principled materials: fall back to the Aperture group
+                for node in final_bl_material.node_tree.nodes:
+                    if node.type == 'GROUP' and node.node_tree and "Aperture" in node.node_tree.name:
+                        shader_group_node = node
+                        break
+
         if shader_group_node:
             metadata_to_socket_map = {
-                # Standard PBR
-                "albedo_color_constant": "Albedo Color",
-                "diffuse_color_constant": "Albedo Color", 
-                "opacity_constant": "Opacity",
+                # Standard PPR (Principled sockets)
+                "albedo_color_constant": "Base Color",
+                "diffuse_color_constant": "Base Color",
+                "opacity_constant": "Alpha",
                 "roughness_constant": "Roughness",
                 "metallic_constant": "Metallic",
-                # Normal Map (texture handled by process_mod_input_util, this would be for a constant vector if ever used)
-                # "normal_map_constant": "Normal Map", 
-
-                # Iridescence
-                "enable_iridescence": "Enable Iridescence",
-                # "iridescence_thickness_constant": "Iridescence Thickness", # If you have these inputs
-                # "iridescence_ior_constant": "Iridescence IOR",
-                
-                # Opacity/Thickness Link
-                "use_opacity_as_thickness": "Use Opacity As Thickness",
-                "thickness_constant": "Thickness", 
-
-                # Emission
-                "enable_emission": "Enable Emission",
-                "emissive_color_constant": "Emissive Color",
-                "emissive_intensity": "Emissive Intensity",
-
-                # Animation - Sprite Sheets
-                "sprite_sheet_fps": "Sprite Sheet FPS",
-                "sprite_sheet_cols": "Sprite Sheet Columns",
-                "sprite_sheet_rows": "Sprite Sheet Rows",
-
-                # Remix Flags
-                "preload_textures": "Preload Textures",
-                "ignore_material": "Ignore Material",
-
-                # Alpha Blending
-                "use_legacy_alpha_blend": "Use Legacy Alpha Blend",
-                "blend_enabled": "Blend Enabled", # Or maps to specific alpha mode enable
-                # "blend_type": "Blend Type", # If an enum, needs careful handling
-                "alpha_test_threshold": "Alpha Test Threshold",
-
-                # Displacement
-                "height_map_scale": "Height Map Scale", # Assuming "Height M" is a scale for a map
-                "height_constant": "Height Map Scale", # Or if "Height M" is a direct constant height value
-                "inwards_displacement": "Inwards Displacement",
-                "outwards_displacement": "Outwards Displacement",
-                
-                # Translucent material properties
-                "transmittance_color": "Transmittance Color",
-                "transmittance_measurement_distance": "Transmittance Measurement Distance",
                 "ior_constant": "IOR",
+                "specular_constant": "Specular IOR Level",
+                # Emission
+                "enable_emission": "Emission Strength",
+                "emissive_color_constant": "Emission Color",
+                "emissive_intensity": "Emission Strength",
+                # Translucent material properties
+                "transmittance_color": "Base Color",
+                "transmittance_measurement_distance": "Transmittance Measurement Distance",
                 "thin_walled": "Thin Walled",
                 "thin_wall_thickness": "Thin Wall Thickness",
             }
@@ -722,46 +724,62 @@ def get_or_create_mod_instance_material_util(base_material_usd_path, instance_pr
                     # report_fn({'DEBUG'}, f"Metadata key '{meta_key}' not mapped for material '{final_bl_material.name}'")
                     continue
 
-                if socket_name in shader_group_node.inputs:
-                    socket = shader_group_node.inputs[socket_name]
-                    try:
-                        current_val = socket.default_value
-                        val_changed = False
-                        if socket.type == 'RGBA' and isinstance(meta_value, (Gf.Vec3f, Gf.Vec4f, tuple, list)) and len(meta_value) >= 3:
-                            new_val = (meta_value[0], meta_value[1], meta_value[2], meta_value[3] if len(meta_value) == 4 else 1.0)
-                            # Compare component-wise for colors due to potential float precision issues with direct tuple comparison
-                            if not all(abs(a-b) < 1e-5 for a,b in zip(list(current_val), list(new_val))):
-                                socket.default_value = new_val
-                                val_changed = True
-                        elif socket.type == 'VALUE' and isinstance(meta_value, (float, int, bool)):
-                            new_float_val = float(meta_value)
-                            if isinstance(current_val, float) and abs(current_val - new_float_val) > 1e-5 or current_val != new_float_val:
-                                socket.default_value = new_float_val
-                                val_changed = True
-                        elif socket.type == 'VECTOR' and isinstance(meta_value, (Gf.Vec3f, tuple, list)) and len(meta_value) == 3:
-                            new_vec_val = tuple(meta_value)
-                            if not all(abs(a-b) < 1e-5 for a,b in zip(list(current_val), new_vec_val)):
-                                socket.default_value = new_vec_val
-                                val_changed = True
-                        # Add more type checks (e.g., for BOOLEAN if socket.type == 'BOOLEAN')
-                        # elif socket.type == 'BOOLEAN' and isinstance(meta_value, bool):
-                        #    if socket.default_value != meta_value: socket.default_value = meta_value; val_changed = True
+                socket = shader_group_node.inputs.get(socket_name)
+                if socket is None:
+                    # Attributes without a Principled socket counterpart (thin
+                    # wall/transmittance extras) are kept as custom properties.
+                    if isinstance(meta_value, (float, int, bool)):
+                        prop_name = f"rtx_{socket_name.lower().replace(' ', '_')}"
+                        if isinstance(meta_value, bool):
+                            final_bl_material[prop_name] = meta_value
                         else:
-                            report_fn({'WARNING'}, f"Metadata key '{meta_key}' type '{type(meta_value).__name__}' unhandled or mismatch for socket '{socket_name}' (type: {socket.type}) in mat '{final_bl_material.name}'.")
-                        
-                        if val_changed:
-                            report_fn({'INFO'}, f"  Applied metadata: Mat '{final_bl_material.name}', Socket '{socket_name}' = {socket.default_value} (from {meta_key})")
-                            applied_any_metadata = True
+                            final_bl_material[prop_name] = float(meta_value)
+                        report_fn({'INFO'}, f"  Applied metadata: Mat '{final_bl_material.name}', Property '{prop_name}' = {final_bl_material[prop_name]} (from {meta_key})")
+                        applied_any_metadata = True
+                    else:
+                        report_fn({'WARNING'}, f"Metadata key '{meta_key}' has no Principled socket '{socket_name}' in mat '{final_bl_material.name}' and value is not scalar; skipped.")
+                    continue
 
-                    except Exception as e_meta:
-                        report_fn({'ERROR'}, f"Error applying metadata '{meta_key}' to '{socket_name}' for mat '{final_bl_material.name}': {e_meta}")
-                # else:
-                    # report_fn({'DEBUG'}, f"Socket '{socket_name}' (for meta '{meta_key}') not found in group '{shader_group_node.name}' in mat '{final_bl_material.name}'.")
-            
+                try:
+                    current_val = socket.default_value
+                    val_changed = False
+                    if socket.type == 'RGBA' and isinstance(meta_value, (Gf.Vec3f, Gf.Vec4f, tuple, list)) and len(meta_value) >= 3:
+                        new_val = (meta_value[0], meta_value[1], meta_value[2], meta_value[3] if len(meta_value) == 4 else 1.0)
+                        # Compare component-wise for colors due to potential float precision issues with direct tuple comparison
+                        if not all(abs(a-b) < 1e-5 for a,b in zip(list(current_val), list(new_val))):
+                            socket.default_value = new_val
+                            val_changed = True
+                    elif socket.type == 'VALUE' and isinstance(meta_value, (float, int, bool)):
+                        new_float_val = float(meta_value)
+                        if socket_name == "Emission Strength" and isinstance(meta_value, bool):
+                            # enable_emission=False switches emission off; True only
+                            # lights the layer up if the strength is still zero.
+                            if not meta_value:
+                                new_float_val = 0.0
+                            elif current_val == 0.0 or new_float_val > 0.0:
+                                new_float_val = max(1.0, new_float_val) if new_float_val > 0.0 else 1.0
+                        if isinstance(current_val, float) and abs(current_val - new_float_val) > 1e-5 or current_val != new_float_val:
+                            socket.default_value = new_float_val
+                            val_changed = True
+                    elif socket.type == 'VECTOR' and isinstance(meta_value, (Gf.Vec3f, tuple, list)) and len(meta_value) == 3:
+                        new_vec_val = tuple(meta_value)
+                        if not all(abs(a-b) < 1e-5 for a,b in zip(list(current_val), new_vec_val)):
+                            socket.default_value = new_vec_val
+                            val_changed = True
+                    else:
+                        report_fn({'WARNING'}, f"Metadata key '{meta_key}' type '{type(meta_value).__name__}' unhandled or mismatch for socket '{socket_name}' (type: {socket.type}) in mat '{final_bl_material.name}'.")
+
+                    if val_changed:
+                        report_fn({'INFO'}, f"  Applied metadata: Mat '{final_bl_material.name}', Socket '{socket_name}' = {socket.default_value} (from {meta_key})")
+                        applied_any_metadata = True
+
+                except Exception as e_meta:
+                    report_fn({'ERROR'}, f"Error applying metadata '{meta_key}' to '{socket_name}' for mat '{final_bl_material.name}': {e_meta}")
+
             if applied_any_metadata:
                  pass # Already reported per-socket change
         else:
-            report_fn({'WARNING'}, f"Could not find '{APERTURE_OPAQUE_NODE_GROUP_NAME_CONST}' in mat '{final_bl_material.name}' to apply metadata.")
+            report_fn({'WARNING'}, f"Could not find a Principled BSDF shader node in mat '{final_bl_material.name}' to apply metadata.")
         # report_fn({'DEBUG'}, f"Material '{final_bl_material.name}' for instance with metadata.") # This was the old line, replaced by per-socket logs
 
     local_material_cache_param[unique_key] = final_bl_material
@@ -769,9 +787,7 @@ def get_or_create_mod_instance_material_util(base_material_usd_path, instance_pr
 
 # --- Utility to clear module-level caches if needed (e.g., before a new operator run) ---
 def clear_mod_apply_caches():
-    global _TEXTURE_CACHE_MOD_APPLY, _APERTURE_OPAQUE_NODE_GROUP_LOADED_MOD_APPLY, _APERTURE_TRANSLUCENT_NODE_GROUP_LOADED_MOD_APPLY
+    global _TEXTURE_CACHE_MOD_APPLY
     _TEXTURE_CACHE_MOD_APPLY.clear()
-    _APERTURE_OPAQUE_NODE_GROUP_LOADED_MOD_APPLY = False
-    _APERTURE_TRANSLUCENT_NODE_GROUP_LOADED_MOD_APPLY = False
     # _mod_base_material_node_cache is managed per-operator run by passing it as arg, so not cleared here.
     print("Cleared mod apply utility caches (texture, node group loaded state).")

@@ -1,6 +1,6 @@
 # Feature parity and backend details
 
-Status snapshot: 31 October 2026. [Back to README](../README.md) · [Русский](PARITY.ru.md).
+Status snapshot: 1 November 2026. [Back to README](../README.md) · [Русский](PARITY.ru.md).
 
 The README badges and progress map are generated from these tables by `python tools/generate_progress.py`.
 
@@ -28,8 +28,8 @@ The official Toolkit is a Kit-based application (`lightspeed.trex.*` extensions)
 | Feature | Official Toolkit component | Status | Notes in this add-on |
 |---|---|:--:|---|
 | Import a capture file | `lightspeed.trex.capture.core.shared` | ✅ | `Import RTX Remix Capture`; `.usd`, `.usda`, `.usdc` |
-| Mass import + capture browser with previews | `lightspeed.trex.home.widget`, project wizard | ✅ | list with checkboxes, `Batch Import All / Selected`, DDS→PNG thumbnails |
-| Captured materials → viewport materials | `lightspeed.tool.material.core`, `omni.flux.asset_importer.core` | ✅ | AperturePBR Opaque / Translucent / Model / Normal / SpriteSheet (bundled `.mdl`), Principled BSDF fallback |
+| Mass import + capture browser with previews | `lightspeed.trex.home.widget`, project wizard | ✅ | list with checkboxes, `Batch Import All / Selected`, DDS thumbnails read directly into memory; no converted-file cache |
+| Captured materials → viewport materials | `lightspeed.tool.material.core`, `omni.flux.asset_importer.core` | ✅ | imported materials build as standard Principled BSDF (transmission layer for AperturePBR_Translucent values); export still authors the bundled `AperturePBR*.mdl` shaders into USD |
 | Instance / selection tree editing | `lightspeed.trex.selection_tree.widget` | 🟡 | one Blender object per `inst_<hash>_N`, mesh data shared per prototype; no prototype tree UI |
 | Per-instance render state / material metadata | mesh and material panes | 🟡 | reads `metadata:*` and legacy `primvars:_remix_metadata`; binding resolution uses the direct relationship, composed bindings and prototype/child fallbacks |
 | Lights → Blender lights (Sphere / Disk / Cylinder / Rect / Distant) | light replacement | ✅ | intensity, color, radius, shaping cone |
@@ -47,7 +47,7 @@ The official Toolkit is a Kit-based application (`lightspeed.trex.*` extensions)
 | Add a brand-new instanced mesh | ingest + add reference | ✅ | creates `mesh_<HASH>` + `inst_<HASH>_0` when no target mesh is selected |
 | Add an *extra* reference to a mesh prim (combine assets) | mesh pane "add reference" | ⛔ | only single replace |
 | Restore / unhide the original captured mesh | remove reference | ✅ | `Restore Hidden Meshes`; removes the `references = None` mask from the mod layer, no geometry is exported |
-| Duplicate a replacement (copy USD overrides) | `copy_replacement_overrides_to_path` | ⛔ | |
+| Duplicate a replacement (copy USD overrides) | `Setup.copy_replacement_overrides_to_path` | 🟡 | ported to `nvidia_core/copier.py`: attribute overrides via `Sdf.CopySpec`, relationship overrides with internal-target remapping, sublayer recursion; no Blender duplicate operator wired yet |
 | Skeleton / skinned mesh replacement + automatic joint remap (`skel:remix_joints`) | `lightspeed.trex.skeleton_replacements.widget`, `.../skeleton.py` | ⛔ | |
 | Ingest non-USD sources (FBX, OBJ, glTF, …) via `omni.kit.asset_converter` | `omni.flux.asset_importer.core` | ⛔ | USD in / USD out only |
 
@@ -55,10 +55,10 @@ The official Toolkit is a Kit-based application (`lightspeed.trex.*` extensions)
 
 | Feature | Official Toolkit component | Status | Notes in this add-on |
 |---|---|:--:|---|
-| Author `AperturePBR_Opacity` / `AperturePBR_Translucent` materials (texture slots + constants) | `lightspeed.tool.material.core` | ✅ | diffuse, metallic, roughness, normal, emissive, opacity, specular; transmittance, IOR, thin-walled |
+| Author `AperturePBR_Opacity` / `AperturePBR_Translucent` materials (texture slots + constants) | `lightspeed.tool.material.core` | ✅ | diffuse, metallic, roughness, normal, emissive, opacity, specular; transmittance, IOR, thin-walled. All parameters are read from the standard Principled BSDF sockets of the Blender material |
 | Replace the material of a captured mesh | `lightspeed.tool.material.core` | 🟡 | exports a new `mat_<uuid>` and binds it with `strongerThanDescendants`; it does not `over` the captured `mat_<HASH>` |
 | Correct material binding strength (`bindMaterialAs` as relationship metadata) | USD material binding | ✅ | authored through `MaterialBindingAPI`, not as an attribute |
-| Aperture node group inside Blender + Principled ⇄ Aperture conversion | — (Blender-side authoring) | ✅ | `Create Aperture Opaque / Translucent` |
+| Blender-side Aperture node groups (`Aperture Opaque` / `Aperture Translucent`) + Principled ⇄ Aperture conversion operators | — (Blender-side authoring) | ⛔ | deliberately removed: materials are authored natively as standard Principled BSDF; node groups written by old releases remain readable for re-export |
 | Copy / transfer material overrides between prims | `transfer_property_spec_to_layer`, `transfer_reference_spec_to_layer` | ⛔ | |
 | MDL parameter browser / material presets | material tool | ⛔ | |
 
@@ -71,7 +71,7 @@ The official Toolkit is a Kit-based application (`lightspeed.trex.*` extensions)
 | Replace a captured texture asset | `lightspeed.trex.texture_replacements.core.shared` | 🟡 | new textures are authored on the exported material; texture paths on captured `mat_<HASH>` prims are not swapped |
 | Octahedral normal encoding | ingest `ConvertToOctahedral` | ⛔ | |
 | RTXIO texture compression | `lightspeed.trex.rtxio.core` | ⛔ | |
-| DDS → PNG previews, broken DDS repair | — (Blender-side) | ✅ | `Convert DDS to PNG`, `Fix Broken Textures`, texture cache cleanup |
+| DDS → PNG texture conversion, broken DDS repair | — (Blender-side) | ✅ | `Convert DDS to PNG`, `Fix Broken Textures`, texture cache cleanup |
 
 ### Assets, utilities, integration
 
@@ -92,7 +92,6 @@ The official Toolkit is a Kit-based application (`lightspeed.trex.*` extensions)
 | Feature | Where |
 |---|---|
 | Capture browser with thumbnails directly in Blender | `Captures` panel |
-| Aperture node group authoring and Principled BSDF fallback | `RTX Remix Materials` panel, Shader Editor sidebar |
 | Background / parallel texture processing with job status UI | `Texture Management` panel |
 | Export scale, auto-apply transforms, "inherit parent material" | `Export Settings` |
 | Texture cache and duplicate texture cleanup | `Texture Management` panel |
@@ -128,15 +127,19 @@ Source paths refer to RTX Remix Toolkit 1.6.1 (`source/extensions/...`, Apache-2
 | `lightspeed.common.lightspeed.common.constants` | `nvidia_core/constants.py` | Values and regexes copied; the `omni.ui` import that made the module unusable outside Kit was removed. |
 | `lightspeed.trex.utils.common.prim_utils` | `nvidia_core/prim_utils.py` | Algorithms ported (classification, prototype lookup, reference discovery, transferable specs, ghost detection). The implicit `omni.usd` context and selection were replaced by explicit `stage` / `selection` arguments. |
 | `lightspeed.trex.capture.core.shared.setup` | `nvidia_core/capture.py` | Capture detection, layer metadata, hash discovery, stage-metadata copy and `remix_config` publishing ported. Kit layer manager, thumbnails, `omni.client` listing and undo are not ported. |
+| `lightspeed.trex.asset_replacements.core.shared.Setup.copy_replacement_overrides_to_path` | `nvidia_core/copier.py` | Descendant override copying ported: prim specs under the source path across the replacement layer and its sublayers, attribute specs through `Sdf.CopySpec`, relationships (e.g. `material:binding`) with internal-target remapping. `SetRelationshipTargetsCommand` became `Usd.Relationship.SetTargets`; capture-typed source layers or edit targets are rejected. No Blender duplicate UI yet. |
 | `lightspeed.layer_manager.core` layer ordering | `nvidia_core/composition.py` | Reimplemented with `pxr`: capture is always the weakest sublayer, the mod/replacement layer is the edit target, capture is locked read-only, and the workfile's `omni_layer.muteness` / `omni_layer.locked` metadata is applied on open. The full layer model, mute/lock/reorder UI and events are not ported. |
 | `omni.usd.get_composed_references_from_prim`, `omni.usd.get_introducing_layer` | `compatibility/kit_adapters.py` | Reimplemented with `Sdf` / `Usd.PrimCompositionQuery`, including authoring-layer resolution and relative asset paths. |
 | `omni.flux.utils.common.lights.get_light_type` | `compatibility/kit_adapters.py` | Light type enum and the historical `DomeLight_1` alias ported. |
 | Toolkit mesh/prim conventions | `nvidia_core/geometry.py` | Blender extraction written against the same `mesh_<HASH>` / `inst_<HASH>_<N>` layout. N-gons are preserved, left-handed winding is reversed, and per-corner UV/normal arrays stay aligned with `faceVertexIndices`. |
 
-**Not ported (P1+):** asset replacement transfer, ingest/packaging pipelines,
+**Not ported (P1+):** the other asset-replacement transfer commands
+(`transfer_property_spec_to_layer` / `transfer_prim_definition_spec_to_layer` /
+`transfer_reference_spec_to_layer`), ingest/packaging pipelines,
 skeleton replacement, material/texture override transfer, ComfyUI integration,
 StageCraft, Kit undo, and the properties panes. Material *conversion* remains the
-add-on's existing `material_utils.py` code, not an NVIDIA port.
+add-on's existing `material_utils.py` code, not an NVIDIA port; it now builds
+standard Principled BSDF node graphs instead of the custom Aperture node groups.
 
 ### Backend switch and rollback
 
@@ -198,12 +201,23 @@ selection/fallback and real Blender imports of both `capture.usda` and
 `full_project.usda`; composition tests also verify that `omni_layer` muteness hides muted sublayers, that metadata-locked sublayers become read-only, that saving a project writes only the mod layer, and that authoring into the locked capture raises. `tests/blender/test_ui_operators.py` drives the actual UI
 operators (`remix.import_capture`, `remix.scan_capture_folder`) end to end,
 including the scene-property backend switch and the `direct-only` error path.
-`tests/unit/test_hide.py` and `TestHideMeshOperators` cover hiding/restoring
-captured meshes: the mask is authored on the reference-owning instance prim, the
-capture file hash is unchanged, no `assets/` output appears, and the composed
-geometry disappears/returns.
+`tests/unit/test_copier.py` reproduces the Toolkit's own unit tests for
+`copy_replacement_overrides_to_path`: it copies attribute and relationship
+overrides from a source prim to its duplicate across the replacement layer and
+its sublayers, remaps targets that live inside the source hierarchy, skips the
+root prim's own override spec and invalid destinations, honours the "no
+replacement layer" early return, and rejects capture-typed layers both as
+override source and as edit target. `tests/unit/test_hide.py` and
+`TestHideMeshOperators` cover hiding/restoring captured meshes: the mask is
+authored on the reference-owning instance prim, the capture file hash is
+unchanged, no `assets/` output appears, and the composed geometry
+disappears/returns. `tests/blender/test_principled_materials.py` checks
+Principled constants, opacity gating, transmission type detection and selected
+USD export values on real Blender nodes. `tests/blender/test_capture_thumbnails.py`
+checks direct DDS thumbnail lookup, decoding, refresh and missing files without
+a converted-file cache.
 
-**Executed result:** 89 tests pass on both Blender 4.5.5 LTS (bundled OpenUSD
+**Executed result:** 114 tests pass on both Blender 4.5.5 LTS (bundled OpenUSD
 25.02) and Blender 5.1.2 (bundled OpenUSD 25.08) on Windows, exit code `0`;
 `register()` / `unregister()` was smoke-tested on both as well. A freshly built
 `rtx_remix_importer.zip` was installed through `preferences.addon_install` into a
@@ -213,10 +227,16 @@ pass.
 
 **Not verified:**
 
+- Capture thumbnails support RGBA16F, RGBA8/BGRA8 and BC1–BC3 DDS;
+  other DDS formats (including BC7) are not decoded. A real game capture thumbnail
+  was decoded in background Blender; interactive thumbnail display was not tested.
+
 - No real game capture with textures was available; only the Toolkit fixture
   (two DDS files) was exercised. Blender 4.0–4.4 and Linux/Wine were not run.
-- In this environment the `Aperture Opaque` node group could not be appended, so
-  material conversion exercised the existing Principled BSDF fallback.
+- Imported materials are authored as standard Principled BSDF node graphs (the
+  custom Aperture node groups were removed). Only the opaque AperturePBR path
+  is exercised by the fixture; the transmission mapping for
+  `AperturePBR_Translucent` is verified on unit level only.
 - `omni_layer` muteness/locking is exercised on the Toolkit fixture. Projects that
   mute the capture or the mod authoring layer are not covered: those layers are
   protected and deliberately never muted, while the reference Toolkit may expose

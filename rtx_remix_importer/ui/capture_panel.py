@@ -3,11 +3,13 @@ import os
 import json
 from bpy.utils import previews
 from .. import core_utils
+from ..thumbnail_dds import icon_pixels
 from .operators.capture_ops import *
 from .operators.utility_ops import *
 
 # Global preview collection
 preview_collections = {}
+_preview_sources = {}
 
 class PT_RemixCapturePanel(bpy.types.Panel):
     """Panel for managing RTX Remix capture imports"""
@@ -194,9 +196,9 @@ class PT_RemixCapturePanel(bpy.types.Panel):
                     preview_box.label(text="Preview:")
                     preview_box.template_icon(icon_value=preview_image.icon_id, scale=5)
                 else:
-                    # If preview not loaded yet, show a placeholder
+                    # No corresponding readable thumbnail was found.
                     preview_box = captures_box.box()
-                    preview_box.label(text="Preview: (Generating...)")
+                    preview_box.label(text="Preview unavailable", icon='INFO')
 
 
 def register_previews():
@@ -210,15 +212,37 @@ def unregister_previews():
     for pcoll in preview_collections.values():
         previews.remove(pcoll)
     preview_collections.clear()
+    _preview_sources.clear()
 
 def load_thumbnail(capture_path):
-    """Load a single thumbnail into the preview collection."""
-    pcoll = preview_collections["main"]
-
-    if capture_path and capture_path not in pcoll:
-        thumb_path = core_utils.get_thumbnail_preview(capture_path)
-        if thumb_path:
-            pcoll.load(capture_path, thumb_path, 'IMAGE')
+    """Read the capture's DDS directly; keep only the Blender icon in memory."""
+    pcoll = preview_collections.get("main")
+    if pcoll is None or not capture_path:
+        return
+    thumb_path = core_utils.get_thumbnail_preview(capture_path)
+    try:
+        stat = os.stat(thumb_path) if thumb_path else None
+        signature = (thumb_path, stat.st_mtime_ns, stat.st_size) if stat else None
+    except OSError:
+        signature = None
+    if capture_path in _preview_sources and _preview_sources[capture_path] == signature:
+        return
+    if capture_path in pcoll:
+        del pcoll[capture_path]
+    _preview_sources[capture_path] = signature
+    if signature is None:
+        return
+    try:
+        pixels = icon_pixels(thumb_path)
+        preview = pcoll.new(capture_path)
+        preview.icon_size = (256, 256)
+        preview.icon_pixels_float = pixels
+        preview.image_size = (256, 256)
+        preview.image_pixels_float = pixels
+    except (OSError, ValueError, RuntimeError, TypeError) as error:
+        if capture_path in pcoll:
+            del pcoll[capture_path]
+        print(f"Cannot load capture thumbnail '{thumb_path}': {error}")
 
 @bpy.app.handlers.persistent
 def on_depsgraph_update(scene):

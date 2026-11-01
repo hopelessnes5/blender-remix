@@ -92,6 +92,10 @@ class ScanCaptureFolder(bpy.types.Operator):
                 item.name = f['name']
                 item.full_path = f['full_path']
                 item.size_mb = f['size_mb']
+            index = context.scene.remix_captures_index
+            if 0 <= index < len(context.scene.remix_captures):
+                from ..capture_panel import load_thumbnail
+                load_thumbnail(context.scene.remix_captures[index].full_path)
             
             self.report({'INFO'}, f"Found {len(usd_files)} RTX Remix capture files in capture folder")
             print(f"Found capture files: {[f['name'] for f in usd_files[:5]]}{'...' if len(usd_files) > 5 else ''}")

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -84,6 +85,15 @@ def parse_tests() -> dict:
     match = re.search(r"\*\*Executed result:\*\*\s+(\d+)\s+tests pass", text)
     passed = int(match.group(1)) if match else 0
     return {"passed": passed, "total": passed}
+
+
+def parse_snapshot() -> str:
+    """Read the snapshot date from the parity document's status line."""
+    text = PARITY.read_text(encoding="utf-8")
+    match = re.search(r"Status snapshot: (\d{1,2} \w+ \d{4})\.", text)
+    if not match:
+        raise SystemExit(f"No 'Status snapshot:' date found in {PARITY}")
+    return datetime.strptime(match.group(1), "%d %B %Y").date().isoformat()
 
 
 def badge_svg(label: str, value: str, colour: str, label_width: int, value_width: int) -> str:
@@ -183,7 +193,7 @@ def main() -> None:
     totals["percent"] = round(totals["full"] * 100 / totals["total"], 1)
 
     data = {
-        "snapshot": "2026-10-31",
+        "snapshot": parse_snapshot(),
         "areas": areas,
         "totals": totals,
         "tests": tests,

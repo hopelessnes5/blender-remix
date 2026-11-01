@@ -781,6 +781,14 @@ def export_material(blender_material, sublayer_stage, project_root, sublayer_pat
     textures_dir = os.path.join(project_root, custom_texture_dir)
     os.makedirs(textures_dir, exist_ok=True)
 
+    def node_socket(node, *names):
+        """First existing input socket among *names* (Principled + legacy Aperture)."""
+        for name in names:
+            socket = node.inputs.get(name)
+            if socket is not None:
+                return socket
+        return None
+
     def find_texture_for_socket(socket_name, dds_format='BC7_UNORM_SRGB'):
         is_group = principled_node.type == 'GROUP'
         socket = None
@@ -788,6 +796,7 @@ def export_material(blender_material, sublayer_stage, project_root, sublayer_pat
         if is_group:
             socket_name_mapping = {
                 'Base Color': 'Albedo Color',
+                'Alpha': 'Opacity',
                 'Metallic': 'Metallic',
                 'Roughness': 'Roughness',
                 'Normal': 'Normal Map',
@@ -802,7 +811,16 @@ def export_material(blender_material, sublayer_stage, project_root, sublayer_pat
                         socket = input_socket
                         break
         else:
-            socket = principled_node.inputs.get(socket_name)
+            # Translating legacy Aperture-group socket names onto standard
+            # Principled BSDF input names for the fallback module.
+            principled_name_mapping = {
+                'Transmittance/Diffuse Albedo': 'Base Color',
+                'Albedo Color': 'Base Color',
+                'Normal Map': 'Normal',
+                'Emissive Color': 'Emission Color',
+                'Emissive Intensity': 'Emission Strength',
+            }
+            socket = principled_node.inputs.get(principled_name_mapping.get(socket_name, socket_name))
             
         if not socket:
             return None, None
@@ -889,7 +907,7 @@ def export_material(blender_material, sublayer_stage, project_root, sublayer_pat
             enable_emission = True
 
     opacity_image, opacity_rel_path = None, None
-    opacity_socket = principled_node.inputs.get('Alpha')
+    opacity_socket = node_socket(principled_node, 'Alpha', 'Opacity')
     if opacity_socket and opacity_socket.is_linked:
         alpha_uses_same_image = False
         if diffuse_image and opacity_socket.links:
@@ -900,9 +918,9 @@ def export_material(blender_material, sublayer_stage, project_root, sublayer_pat
             opacity_image, opacity_rel_path = find_texture_for_socket('Alpha', 'BC4_UNORM')
 
     specular_image, specular_rel_path = None, None
-    specular_socket = principled_node.inputs.get('Specular')
+    specular_socket = node_socket(principled_node, 'Specular IOR Level', 'Specular')
     if specular_socket and specular_socket.is_linked:
-        specular_image, specular_rel_path = find_texture_for_socket('Specular', 'BC4_UNORM')
+        specular_image, specular_rel_path = find_texture_for_socket(specular_socket.name, 'BC4_UNORM')
 
     if texture_tasks and texture_processor:
         background_processor = core_utils.get_background_processor()
@@ -913,7 +931,7 @@ def export_material(blender_material, sublayer_stage, project_root, sublayer_pat
             shader_prim.CreateAttribute("inputs:transmittance_texture", Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(diffuse_rel_path))
             shader_prim.CreateAttribute("inputs:transmittance_color", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(1.0, 1.0, 1.0))
         else:
-            transmittance_socket = principled_node.inputs.get('Transmittance/Diffuse Albedo')
+            transmittance_socket = node_socket(principled_node, 'Base Color', 'Transmittance/Diffuse Albedo')
             if transmittance_socket and hasattr(transmittance_socket.default_value, '__len__'):
                 tc = transmittance_socket.default_value
                 shader_prim.CreateAttribute("inputs:transmittance_color", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(tc[0], tc[1], tc[2]))
@@ -928,12 +946,26 @@ def export_material(blender_material, sublayer_stage, project_root, sublayer_pat
             ('Emissive Intensity', 'inputs:emissive_intensity', 'Float'),
         ]
         for socket_name, usd_attr, value_type in translucent_params:
-            socket = principled_node.inputs.get(socket_name)
+            socket = node_socket(principled_node, socket_name, 'Emission Strength') if socket_name == 'Emissive Intensity' else principled_node.inputs.get(socket_name)
             if socket:
                 if value_type == 'Bool':
                     shader_prim.CreateAttribute(usd_attr, Sdf.ValueTypeNames.Bool).Set(bool(socket.default_value))
                 else:
                     shader_prim.CreateAttribute(usd_attr, Sdf.ValueTypeNames.Float).Set(float(socket.default_value))
+            elif socket_name in ('Thin Walled', 'Thin Wall Thickness', 'Transmittance Measurement Distance'):
+                prop = 'rtx_' + socket_name.lower().replace(' ', '_')
+                if prop in blender_material:
+                    value = blender_material[prop]
+                    value_type_usd = Sdf.ValueTypeNames.Bool if value_type == 'Bool' else Sdf.ValueTypeNames.Float
+                    shader_prim.CreateAttribute(usd_attr, value_type_usd).Set(bool(value) if value_type == 'Bool' else float(value))
+
+        if enable_emission:
+            shader_prim.CreateAttribute("inputs:enable_emission", Sdf.ValueTypeNames.Bool).Set(True)
+            if emissive_rel_path:
+                shader_prim.CreateAttribute("inputs:emissive_mask_texture", Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(emissive_rel_path))
+            elif emissive_socket:
+                ec = emissive_socket.default_value
+                shader_prim.CreateAttribute("inputs:emissive_color", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(ec[0], ec[1], ec[2]))
         
         if normal_rel_path:
             shader_prim.CreateAttribute("inputs:normalmap_texture", Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(normal_rel_path))
@@ -981,7 +1013,7 @@ def export_material(blender_material, sublayer_stage, project_root, sublayer_pat
             
             shader_prim.CreateAttribute("inputs:emissive_intensity", Sdf.ValueTypeNames.Float).Set(float(emissive_intensity))
 
-        alpha_socket = principled_node.inputs.get('Alpha')
+        alpha_socket = node_socket(principled_node, 'Alpha', 'Opacity')
         has_alpha = False
         if opacity_rel_path:
             shader_prim.CreateAttribute("inputs:opacity_texture", Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(opacity_rel_path))
@@ -993,6 +1025,7 @@ def export_material(blender_material, sublayer_stage, project_root, sublayer_pat
             has_alpha = True
         
         if has_alpha:
+            shader_prim.CreateAttribute("inputs:enable_opacity", Sdf.ValueTypeNames.Bool).Set(True)
             shader_prim.CreateAttribute("inputs:blend_enabled", Sdf.ValueTypeNames.Bool).Set(True)
             shader_prim.CreateAttribute("inputs:blend_type", Sdf.ValueTypeNames.Int).Set(0)
             shader_prim.CreateAttribute("inputs:use_legacy_alpha_state", Sdf.ValueTypeNames.Bool).Set(False)
@@ -1000,7 +1033,6 @@ def export_material(blender_material, sublayer_stage, project_root, sublayer_pat
         if specular_rel_path:
             shader_prim.CreateAttribute("inputs:specular_texture", Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(specular_rel_path))
         else:
-            specular_socket = principled_node.inputs.get('Specular')
             if specular_socket and specular_socket.default_value != 0.5:
                 shader_prim.CreateAttribute("inputs:specular_constant", Sdf.ValueTypeNames.Float).Set(float(specular_socket.default_value))
 

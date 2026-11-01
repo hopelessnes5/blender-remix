@@ -1,5 +1,5 @@
 {
-  "snapshot": "2026-10-31",
+  "snapshot": "2026-11-01",
   "areas": [
     {
       "name": "Project and layers",
@@ -20,18 +20,18 @@
     {
       "name": "Mesh replacement",
       "full": 5,
-      "partial": 1,
-      "none": 4,
+      "partial": 2,
+      "none": 3,
       "total": 10,
       "percent": 50.0
     },
     {
       "name": "Materials",
-      "full": 3,
+      "full": 2,
       "partial": 1,
-      "none": 2,
+      "none": 3,
       "total": 6,
-      "percent": 50.0
+      "percent": 33.3
     },
     {
       "name": "Textures",
@@ -51,14 +51,14 @@
     }
   ],
   "totals": {
-    "full": 20,
-    "partial": 9,
+    "full": 19,
+    "partial": 10,
     "none": 16,
     "total": 45,
-    "percent": 44.4
+    "percent": 42.2
   },
   "tests": {
-    "passed": 89,
-    "total": 89
+    "passed": 114,
+    "total": 114
   }
 }

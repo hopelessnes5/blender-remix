@@ -12,11 +12,11 @@ Not affiliated with NVIDIA. RTX Remix, the RTX Remix Toolkit and AperturePBR mat
 
 ## Status
 
-[![Toolkit parity: 44%](docs/badge-parity.svg)](docs/PARITY.md) [![Tests: 89/89](docs/badge-tests.svg)](docs/PARITY.md#tests)
+[![Toolkit parity: 42%](docs/badge-parity.svg)](docs/PARITY.md) [![Tests: 114/114](docs/badge-tests.svg)](docs/PARITY.md#tests)
 
 [![Feature parity progress map](docs/progress.svg)](docs/PARITY.md)
 
-20 of 45 tracked Toolkit features are fully implemented, 9 are partial. Snapshot: 31 October 2026. Tested on Blender 4.5.5 LTS and 5.1.2, 89/89 tests. Full tables and unverified items: [docs/PARITY.md](docs/PARITY.md).
+19 of 45 tracked Toolkit features are fully implemented, 10 are partial. Snapshot: 1 November 2026. Tested on Blender 4.5.5 LTS and 5.1.2, 114/114 tests. Full tables and unverified items: [docs/PARITY.md](docs/PARITY.md).
 
 ## How it works
 
@@ -49,7 +49,7 @@ For a source install, put `texconv.exe` into `rtx_remix_importer/texconv/` and i
 - `Apply Mod File Changes` is experimental.
 - Lights exported without a target mesh go to `/RootNode/remix_assets`, not `/RootNode/lights/light_<HASH>`.
 - Albedo textures with alpha may not round-trip; some DDS files appear purple — use `Captures > Fix Broken Textures`.
-- The Aperture node group is incomplete (animation, iridescence, flags, …).
+- Materials missing from a capture are handled; legacy Aperture node groups written by old releases render as-is, new materials always build on a standard Principled BSDF.
 - Only one reference per mesh prim is supported; assets cannot be combined into one mesh.
 
 ## Troubleshooting
@@ -63,7 +63,6 @@ For a source install, put `texconv.exe` into `rtx_remix_importer/texconv/` and i
 
 ## Credits
 
-- Uncle Burrito (RTX Remix Showcase Discord) — Aperture Opaque node group.
 - Based on the original *Remix Toolkit for Blender* by sambow23; this fork is maintained by [hopelessnes5](https://github.com/hopelessnes5/).
 - Ported NVIDIA code retains its Apache-2.0 attribution headers.
 

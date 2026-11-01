@@ -1,8 +1,8 @@
 """Material resolution and assignment for the direct RTX Remix backend.
 
-Material *conversion* stays in :mod:`rtx_remix_importer.material_utils` (the
-existing AperturePBR -> Blender node graph); this module only resolves which
-USD material a capture instance uses and applies it at object level so a
+Material *conversion* stays in :mod:`rtx_remix_importer.material_utils`
+(AperturePBR -> standard Principled BSDF node graph); this module only resolves
+which USD material a capture instance uses and applies it at object level so a
 shared prototype mesh can carry per-instance overrides.
 """
 

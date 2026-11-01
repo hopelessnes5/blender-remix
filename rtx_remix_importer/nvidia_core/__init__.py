@@ -7,4 +7,4 @@ Nothing in this package imports ``omni``, ``carb`` or ``bpy``: it only needs
 ``pxr`` (the OpenUSD shipped with Blender) and the standard library.
 """
 
-from . import constants, prim_utils, capture, composition, geometry, hide  # noqa: F401
+from . import constants, prim_utils, capture, composition, geometry, hide, copier  # noqa: F401

@@ -61,8 +61,6 @@ from .capture_list import (
 )
 from .material_panel import (
     PT_RemixMaterialPanel,
-    PT_RemixNodeGroupPanel,
-    PT_RemixMaterialOperatorPanel,
 )
 
 # List of all operator classes for registration
@@ -98,8 +96,6 @@ panel_classes = [
     PT_RemixAssetProcessingPanel,
     PT_RemixCapturePanel,
     PT_RemixMaterialPanel,
-    PT_RemixNodeGroupPanel,
-    PT_RemixMaterialOperatorPanel,
 ]
 
 # List of all Menu classes

@@ -44,7 +44,13 @@ def load_texture_smart(
     # Check cache first
     if not force_reload and cache_key in _loaded_textures:
         cached_image = _loaded_textures[cache_key]
-        if cached_image and cached_image.name in bpy.data.images:
+        try:
+            cache_valid = bool(cached_image) and cached_image.name in bpy.data.images
+        except ReferenceError:
+            # Blender purged the datablock (e.g. factory-settings reset between
+            # imports); the cache entry points at a dead StructRNA reference.
+            cache_valid = False
+        if cache_valid:
             print(f"Using cached texture: {os.path.basename(texture_path)}")
             return cached_image
         else:
