@@ -122,9 +122,7 @@ class REMIX_OT_ParallelTextureProcessor(Operator):
                 # Prepare tasks
                 tasks = []
                 for bl_image, texture_type in textures_to_process:
-                    base_name = os.path.splitext(bl_image.name)[0]
-                    suffix = texture_processor.get_texture_suffix(texture_type)
-                    output_path = os.path.join(temp_dir, f"{base_name}{suffix}.dds")
+                    output_path = os.path.join(temp_dir, texture_processor.texture_filename(bl_image))
                     
                     tasks.append((bl_image, output_path, texture_type, None))
                 
@@ -305,4 +303,4 @@ def register():
 
 def unregister():
     for cls in reversed(classes):
-        bpy.utils.unregister_class(cls) 
+        bpy.utils.unregister_class(cls)

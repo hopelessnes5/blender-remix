@@ -16,12 +16,11 @@ the official Toolkit authors:
     {
     }
 
-Which prim needs the mask depends on the capture: the geometry of a
-``mesh_<HASH>`` prototype is defined inline, so a mask on the prototype does
-nothing.  The prototype is instantiated by ``inst_<HASH>_<N>`` prims that own the
-``prepend references = </RootNode/meshes/mesh_<HASH>>`` opinion; those instances
-are the reference owners and are what has to be masked.  Both kinds of path are
-accepted here so callers can pass whichever prim their Blender object maps to.
+The Blender hide-mesh operator passes the captured ``mesh_<HASH>`` prototype,
+not an individual ``inst_<HASH>_<N>`` reference. Both path kinds remain accepted
+by this low-level function for compatibility. For inline capture geometry,
+ordinary USD composition may still show the child mesh after a prototype mask;
+the runtime's interpretation of the authored replacement opinion is separate.
 
 The empty *explicit* reference list is what masks the capture layer; clearing a
 layer's reference edits (``ClearReferences()``) would not hide anything, because

@@ -82,6 +82,19 @@ class TestPrincipledMaterials(unittest.TestCase):
         self.assertTrue(self.shader.GetInput('enable_opacity').Get())
         self.assertAlmostEqual(self.shader.GetInput('opacity_constant').Get(), .35)
 
+    def test_export_omits_mdl_defaults_but_keeps_changed_blender_values(self):
+        self.node.inputs['Base Color'].default_value = (.2, .2, .2, 1)
+        self.node.inputs['Metallic'].default_value = 0.0
+        self.node.inputs['Roughness'].default_value = .5
+        exporter = MaterialExporter('', '')
+        asyncio.run(exporter._export_material_textures(self.node, self.shader.GetPrim(), ProgressTracker(6)))
+        self.assertFalse(self.shader.GetInput('diffuse_color_constant'))
+        self.assertFalse(self.shader.GetInput('metallic_constant'))
+        self.assertFalse(self.shader.GetInput('reflection_roughness_constant'))
+        self.node.inputs['Base Color'].default_value = (.8, .8, .8, 1)
+        asyncio.run(exporter._export_material_textures(self.node, self.shader.GetPrim(), ProgressTracker(6)))
+        self.assertAlmostEqual(self.shader.GetInput('diffuse_color_constant').Get()[0], .8)
+
     def test_export_translucent_custom_properties(self):
         self.material['rtx_thin_walled'] = True
         self.material['rtx_thin_wall_thickness'] = .25

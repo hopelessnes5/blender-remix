@@ -684,7 +684,7 @@ def get_mesh_name_from_object(obj):
 
 def export_material(blender_material, sublayer_stage, project_root, sublayer_path, parent_mesh_path=None, obj=None,
                     material_scope_path=None, bind_prim_path=None,
-                    bind_strength="weakerThanDescendants", material_name=None):
+                    bind_strength="weakerThanDescendants", material_name=None, override_material_path=None):
     """Export a Blender material into `sublayer_stage`.
 
     Two destinations are supported, both matching what the RTX Remix Toolkit
@@ -699,9 +699,13 @@ def export_material(blender_material, sublayer_stage, project_root, sublayer_pat
     if not blender_material:
         return None
 
-    ensure_mdl_files(project_root)
+    if override_material_path is None:
+        ensure_mdl_files(project_root)
 
-    if material_scope_path is not None:
+    if override_material_path is not None:
+        scope_path = None
+        mat_path = Sdf.Path(override_material_path)
+    elif material_scope_path is not None:
         scope_path = Sdf.Path(material_scope_path)
         if not sublayer_stage.GetPrimAtPath(scope_path):
             sublayer_stage.DefinePrim(scope_path, "Scope")
@@ -713,17 +717,22 @@ def export_material(blender_material, sublayer_stage, project_root, sublayer_pat
         mat_name_sanitized = generate_uuid_name(sanitize_prim_name(blender_material.name), prefix="mat_")
         print(f"Exporting Material to {scope_path}: {blender_material.name}")
 
-    mat_path = scope_path.AppendPath(mat_name_sanitized)
+    if override_material_path is None:
+        mat_path = scope_path.AppendPath(mat_name_sanitized)
     # Inside an asset every prim has to be *defined*, an `over` alone would not
     # compose once the asset is referenced.
-    if material_scope_path is not None:
+    if override_material_path is not None:
+        material_prim = sublayer_stage.OverridePrim(mat_path)
+    elif material_scope_path is not None:
         material_prim = sublayer_stage.DefinePrim(mat_path, "Material")
     else:
         material_prim = sublayer_stage.OverridePrim(mat_path)
         material_prim.SetTypeName("Material")
 
     shader_path = mat_path.AppendPath("Shader")
-    if material_scope_path is not None:
+    if override_material_path is not None:
+        shader_prim = sublayer_stage.OverridePrim(shader_path)
+    elif material_scope_path is not None:
         shader_prim = sublayer_stage.DefinePrim(shader_path, "Shader")
     else:
         shader_prim = sublayer_stage.OverridePrim(shader_path)
@@ -737,21 +746,21 @@ def export_material(blender_material, sublayer_stage, project_root, sublayer_pat
         else:
             print(f"  WARNING: cannot bind material, prim {bind_prim_path} was not found")
 
-    material_api = UsdShade.Material(material_prim)
-    shader_output = UsdShade.Shader(shader_prim).CreateOutput("out", Sdf.ValueTypeNames.Token)
-    shader_output.SetRenderType("material")
-
-    # `Create*Output` takes a render context: "mdl" produces `outputs:mdl:surface`.
-    material_api.CreateSurfaceOutput("mdl").ConnectToSource(shader_output)
-    material_api.CreateDisplacementOutput("mdl").ConnectToSource(shader_output)
-    material_api.CreateVolumeOutput("mdl").ConnectToSource(shader_output)
+    if override_material_path is None:
+        material_api = UsdShade.Material(material_prim)
+        shader_output = UsdShade.Shader(shader_prim).CreateOutput("out", Sdf.ValueTypeNames.Token)
+        shader_output.SetRenderType("material")
+        material_api.CreateSurfaceOutput("mdl").ConnectToSource(shader_output)
+        material_api.CreateDisplacementOutput("mdl").ConnectToSource(shader_output)
+        material_api.CreateVolumeOutput("mdl").ConnectToSource(shader_output)
 
     from ..export_utils import ShaderSetup
     material_type = ShaderSetup.detect_material_type(blender_material)
     
-    shader_prim.CreateAttribute("info:implementationSource", Sdf.ValueTypeNames.Token).Set("sourceAsset")
-    shader_prim.CreateAttribute("info:mdl:sourceAsset", Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(f"{material_type}.mdl"))
-    shader_prim.CreateAttribute("info:mdl:sourceAsset:subIdentifier", Sdf.ValueTypeNames.Token).Set(material_type)
+    if override_material_path is None:
+        shader_prim.CreateAttribute("info:implementationSource", Sdf.ValueTypeNames.Token).Set("sourceAsset")
+        shader_prim.CreateAttribute("info:mdl:sourceAsset", Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(f"{material_type}.mdl"))
+        shader_prim.CreateAttribute("info:mdl:sourceAsset:subIdentifier", Sdf.ValueTypeNames.Token).Set(material_type)
 
     principled_node = None
     if blender_material.use_nodes and blender_material.node_tree:
@@ -773,6 +782,7 @@ def export_material(blender_material, sublayer_stage, project_root, sublayer_pat
         return mat_path
 
     texture_tasks = []
+    texture_destinations = {}
     from .. import core_utils
     texture_processor = core_utils.get_texture_processor()
     
@@ -848,25 +858,27 @@ def export_material(blender_material, sublayer_stage, project_root, sublayer_pat
                 texture_type = 'emission'
             elif texture_type in ['base color', 'albedo color']:
                 texture_type = 'base color'
+            elif texture_type in ['normal', 'normal map']:
+                texture_type = 'normal'
             
-            type_suffix = texture_processor.get_texture_suffix(texture_type)
             if dds_format == 'BC7_UNORM_SRGB':
                 dds_format = texture_processor.get_recommended_format(texture_type)
             
-            base_name, _ = os.path.splitext(bl_image.name)
-            dds_file_name = f"{base_name}{type_suffix}.dds"
+            dds_file_name = texture_processor.texture_filename(bl_image)
             absolute_dds_path = os.path.normpath(os.path.join(textures_dir, dds_file_name))
-            
+            key = os.path.normcase(absolute_dds_path)
+            source = (bl_image.as_pointer(), texture_type)
+            if key in texture_destinations and texture_destinations[key] != source:
+                raise ValueError(f"Multiple textures need different data at the same export path: {absolute_dds_path}")
+            texture_destinations[key] = source
+
+            if texture_type == 'normal':
+                if texture_processor.export_octahedral_normal(bl_image, absolute_dds_path):
+                    return bl_image, get_relative_path(sublayer_path, absolute_dds_path)
+                return None, None
+
             if os.path.exists(absolute_dds_path):
                 return bl_image, get_relative_path(sublayer_path, absolute_dds_path)
-            
-            if bpy_context.scene.remix_reuse_existing_textures:
-                base_material_name = extract_base_material_name(blender_material.name)
-                existing_texture_path = find_existing_texture_for_base_material(
-                    base_material_name, texture_type, textures_dir, texture_processor
-                )
-                if existing_texture_path:
-                    return bl_image, get_relative_path(sublayer_path, existing_texture_path)
             
             texture_tasks.append((bl_image, absolute_dds_path, texture_type, dds_format))
             return bl_image, get_relative_path(sublayer_path, absolute_dds_path)
@@ -969,11 +981,10 @@ def export_material(blender_material, sublayer_stage, project_root, sublayer_pat
         
         if normal_rel_path:
             shader_prim.CreateAttribute("inputs:normalmap_texture", Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(normal_rel_path))
-            shader_prim.CreateAttribute("inputs:encoding", Sdf.ValueTypeNames.Int).Set(2)
+            shader_prim.CreateAttribute("inputs:encoding", Sdf.ValueTypeNames.Int).Set(0)
     else:
         if diffuse_rel_path:
             shader_prim.CreateAttribute("inputs:diffuse_texture", Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(diffuse_rel_path))
-            shader_prim.CreateAttribute("inputs:diffuse_color_constant", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(1.0, 1.0, 1.0))
         else:
             base_color_socket = principled_node.inputs.get('Albedo Color') or principled_node.inputs.get('Base Color')
             base_color = base_color_socket.default_value if base_color_socket else (0.8, 0.8, 0.8, 1.0)
@@ -993,7 +1004,7 @@ def export_material(blender_material, sublayer_stage, project_root, sublayer_pat
 
         if normal_rel_path:
             shader_prim.CreateAttribute("inputs:normalmap_texture", Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(normal_rel_path))
-            shader_prim.CreateAttribute("inputs:encoding", Sdf.ValueTypeNames.Int).Set(2)
+            shader_prim.CreateAttribute("inputs:encoding", Sdf.ValueTypeNames.Int).Set(0)
 
         if enable_emission:
             shader_prim.CreateAttribute("inputs:enable_emission", Sdf.ValueTypeNames.Bool).Set(True)
@@ -1036,6 +1047,8 @@ def export_material(blender_material, sublayer_stage, project_root, sublayer_pat
             if specular_socket and specular_socket.default_value != 0.5:
                 shader_prim.CreateAttribute("inputs:specular_constant", Sdf.ValueTypeNames.Float).Set(float(specular_socket.default_value))
 
+    from ..material_defaults import remove_default_inputs
+    remove_default_inputs(shader_prim, material_type)
     return mat_path
 
 # --- Light Export Helper ---
@@ -1681,6 +1694,23 @@ class TestApplyAllTransforms(Operator):
 
 # --- Material Replacement Export Helper ---
 
+def captured_material_path(obj, material, context):
+    """Find the original capture hash, without inventing a new material ID."""
+    candidates = [obj.get('usd_material_path', ''), material.get('usd_material_path', ''), material.name]
+    stage = get_game_stage(context)
+    if stage:
+        from ..blender_bridge.materials import resolve_bound_material_path
+        anchor = resolve_anchor_prim_path(obj)
+        prim = stage.GetPrimAtPath(anchor) if anchor else None
+        if prim:
+            candidates.append(resolve_bound_material_path(prim) or '')
+    for candidate in candidates:
+        match = re.search(r'(?:^|/)mat_([0-9a-fA-F]{16})(?=$|[/_.])', str(candidate))
+        if match:
+            return f'/RootNode/Looks/mat_{match.group(1).upper()}'
+    return None
+
+
 def export_material_replacement(operator, context, obj, sublayer_stage, project_root, target_sublayer_path):
     """Exports material replacement for an existing mesh object."""
     if not obj or obj.type != 'MESH':
@@ -1704,19 +1734,14 @@ def export_material_replacement(operator, context, obj, sublayer_stage, project_
         return False
 
     try:
-        prim_path = Sdf.Path(usd_prim_path)
-        material_path = export_material(bl_mat, sublayer_stage, project_root, target_sublayer_path, parent_mesh_path=None, obj=obj)
+        material_target = captured_material_path(obj, bl_mat, context)
+        if not material_target:
+            operator.report({'ERROR'}, f"Cannot find the original captured material hash for '{obj.name}'.")
+            return False
+        material_path = export_material(bl_mat, sublayer_stage, project_root, target_sublayer_path, obj=obj,
+                                        override_material_path=material_target)
         if material_path:
-            target_prim = sublayer_stage.OverridePrim(prim_path)
-            # `bindMaterialAs` is metadata on the binding relationship, so it has
-            # to be authored through MaterialBindingAPI - a
-            # `material:binding:bindMaterialAs` attribute is inert.
-            bind_material_on_prim(
-                target_prim,
-                sublayer_stage.GetPrimAtPath(material_path),
-                "strongerThanDescendants",
-            )
-            print(f"  Successfully replaced material for {obj.name} at {prim_path}")
+            print(f"  Successfully updated captured material {material_path} for {obj.name}")
             obj["remix_material_path"] = str(material_path)
             return True
         else:

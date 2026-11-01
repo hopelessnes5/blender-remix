@@ -19,11 +19,11 @@
     },
     {
       "name": "Mesh replacement",
-      "full": 5,
-      "partial": 2,
+      "full": 4,
+      "partial": 3,
       "none": 3,
       "total": 10,
-      "percent": 50.0
+      "percent": 40.0
     },
     {
       "name": "Materials",
@@ -35,11 +35,11 @@
     },
     {
       "name": "Textures",
-      "full": 3,
-      "partial": 1,
-      "none": 2,
+      "full": 2,
+      "partial": 3,
+      "none": 1,
       "total": 6,
-      "percent": 50.0
+      "percent": 33.3
     },
     {
       "name": "Assets and utilities",
@@ -51,14 +51,14 @@
     }
   ],
   "totals": {
-    "full": 19,
-    "partial": 10,
-    "none": 16,
+    "full": 17,
+    "partial": 13,
+    "none": 15,
     "total": 45,
-    "percent": 42.2
+    "percent": 37.8
   },
   "tests": {
-    "passed": 114,
-    "total": 114
+    "passed": 137,
+    "total": 137
   }
 }

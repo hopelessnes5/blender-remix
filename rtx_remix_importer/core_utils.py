@@ -520,6 +520,56 @@ class TextureProcessingQueue:
 
 class TextureProcessor:
     """Handles texture processing operations asynchronously."""
+
+    def texture_filename(self, bl_image):
+        """Keep the image's name, replacing its extension with .dds."""
+        name = os.path.basename(bl_image.name)
+        stem, ext = os.path.splitext(name)
+        if ext.lower() not in {'.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp', '.tga', '.exr', '.hdr', '.dds', '.webp'}:
+            stem = name
+        return f"{stem}.dds"
+
+    def export_octahedral_normal(self, bl_image, output_path):
+        """Convert an OpenGL Blender normal map on the main thread to BC5 DDS."""
+        import numpy as np
+        from .nvidia_core.octahedral import convert_float_to_octahedral_in_place
+
+        if not self.is_available():
+            return False
+        width, height = bl_image.size
+        if width <= 0 or height <= 0:
+            return False
+        pixels = np.empty(width * height * 4, dtype=np.float32)
+        bl_image.pixels.foreach_get(pixels)
+        pixels = pixels.reshape(height, width, 4)
+        inward = convert_float_to_octahedral_in_place(pixels, opengl=True)
+        if inward:
+            print(f"Warning: mirrored {inward} inward normals in {bl_image.name}")
+        directory = os.path.dirname(output_path)
+        os.makedirs(directory, exist_ok=True)
+        temporary_image = None
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as temp_file:
+                temp_path = temp_file.name
+            temporary_image = bpy.data.images.new('Remix Octahedral Temporary', width=width, height=height, alpha=True, float_buffer=True)
+            temporary_image.colorspace_settings.name = 'Non-Color'
+            temporary_image.pixels.foreach_set(pixels.ravel())
+            temporary_image.filepath_raw = temp_path
+            temporary_image.file_format = 'PNG'
+            temporary_image.save()
+            result = subprocess.run([self.texconv_path, temp_path, '-o', directory, '-ft', 'dds', '-f', 'BC5_UNORM', '-m', '0', '-y', '-nologo'], capture_output=True, text=True, check=False, shell=False, timeout=120)
+            converted = os.path.join(directory, os.path.splitext(os.path.basename(temp_path))[0] + '.dds')
+            if result.returncode != 0 or not os.path.isfile(converted):
+                print(f"Normal DDS conversion failed: {result.stderr}")
+                return False
+            os.replace(converted, output_path)
+            return True
+        finally:
+            if temporary_image is not None:
+                bpy.data.images.remove(temporary_image)
+            if temp_path and os.path.exists(temp_path):
+                os.remove(temp_path)
     
     def __init__(self, texconv_path: Optional[str] = None):
         self.texconv_path = texconv_path or self._find_texconv()

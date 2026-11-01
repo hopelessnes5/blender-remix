@@ -1,15 +1,15 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="296" viewBox="0 0 1000 296" role="img" aria-label="Toolkit parity: 42.2% (19 of 45 features fully implemented)">
-  <title>Toolkit parity: 42.2% (19/45)</title>
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="296" viewBox="0 0 1000 296" role="img" aria-label="Toolkit parity: 37.8% (17 of 45 features fully implemented)">
+  <title>Toolkit parity: 37.8% (17/45)</title>
   <rect width="1000" height="296" fill="#0d1117"/>
-  <text x="12" y="21" font-family="Verdana, DejaVu Sans, sans-serif" font-size="16" fill="#ffffff">Toolkit parity: 42.2% (19/45)</text>
-  <text x="988" y="21" text-anchor="end" font-family="Verdana, DejaVu Sans, sans-serif" font-size="12" fill="#8b949e">64% implemented or partial</text>
+  <text x="12" y="21" font-family="Verdana, DejaVu Sans, sans-serif" font-size="16" fill="#ffffff">Toolkit parity: 37.8% (17/45)</text>
+  <text x="988" y="21" text-anchor="end" font-family="Verdana, DejaVu Sans, sans-serif" font-size="12" fill="#8b949e">67% implemented or partial</text>
   <g font-family="Verdana, DejaVu Sans, sans-serif" font-size="12" fill="#c9d1d9">
     <rect x="12" y="33" width="9" height="9" fill="#3fb950"/>
-    <text x="26" y="42">19 implemented</text>
+    <text x="26" y="42">17 implemented</text>
     <rect x="178" y="33" width="9" height="9" fill="#d29922"/>
-    <text x="192" y="42">10 partial</text>
+    <text x="192" y="42">13 partial</text>
     <rect x="344" y="33" width="9" height="9" fill="#6e7681"/>
-    <text x="358" y="42">16 not implemented</text>
+    <text x="358" y="42">15 not implemented</text>
   </g>
   <g><title>Project and layers: 2 implemented, 2 partial, 2 not implemented</title>
     <text x="12" y="77" font-family="Verdana, DejaVu Sans, sans-serif" font-size="13" font-weight="600" fill="#c9d1d9">Project and layers</text>
@@ -33,14 +33,14 @@
     <rect x="718" y="87" width="30" height="30" fill="#d29922" stroke="#0d1117" stroke-width="1"/>
     <rect x="753" y="87" width="30" height="30" fill="#d29922" stroke="#0d1117" stroke-width="1"/>
   </g>
-  <g><title>Mesh replacement: 5 implemented, 2 partial, 3 not implemented</title>
+  <g><title>Mesh replacement: 4 implemented, 3 partial, 3 not implemented</title>
     <text x="12" y="155" font-family="Verdana, DejaVu Sans, sans-serif" font-size="13" font-weight="600" fill="#c9d1d9">Mesh replacement</text>
-    <text x="488" y="155" text-anchor="end" font-family="Verdana, DejaVu Sans, sans-serif" font-size="12" fill="#8b949e">5 / 10 &#183; 50%</text>
+    <text x="488" y="155" text-anchor="end" font-family="Verdana, DejaVu Sans, sans-serif" font-size="12" fill="#8b949e">4 / 10 &#183; 40%</text>
     <rect x="12" y="165" width="30" height="30" fill="#3fb950" stroke="#0d1117" stroke-width="1"/>
     <rect x="47" y="165" width="30" height="30" fill="#3fb950" stroke="#0d1117" stroke-width="1"/>
     <rect x="82" y="165" width="30" height="30" fill="#3fb950" stroke="#0d1117" stroke-width="1"/>
     <rect x="117" y="165" width="30" height="30" fill="#3fb950" stroke="#0d1117" stroke-width="1"/>
-    <rect x="152" y="165" width="30" height="30" fill="#3fb950" stroke="#0d1117" stroke-width="1"/>
+    <rect x="152" y="165" width="30" height="30" fill="#d29922" stroke="#0d1117" stroke-width="1"/>
     <rect x="187" y="165" width="30" height="30" fill="#d29922" stroke="#0d1117" stroke-width="1"/>
     <rect x="222" y="165" width="30" height="30" fill="#d29922" stroke="#0d1117" stroke-width="1"/>
     <rect x="257" y="165" width="30" height="30" fill="#6e7681" stroke="#0d1117" stroke-width="1"/>
@@ -57,14 +57,14 @@
     <rect x="648" y="165" width="30" height="30" fill="#6e7681" stroke="#0d1117" stroke-width="1"/>
     <rect x="683" y="165" width="30" height="30" fill="#6e7681" stroke="#0d1117" stroke-width="1"/>
   </g>
-  <g><title>Textures: 3 implemented, 1 partial, 2 not implemented</title>
+  <g><title>Textures: 2 implemented, 3 partial, 1 not implemented</title>
     <text x="12" y="233" font-family="Verdana, DejaVu Sans, sans-serif" font-size="13" font-weight="600" fill="#c9d1d9">Textures</text>
-    <text x="488" y="233" text-anchor="end" font-family="Verdana, DejaVu Sans, sans-serif" font-size="12" fill="#8b949e">3 / 6 &#183; 50%</text>
+    <text x="488" y="233" text-anchor="end" font-family="Verdana, DejaVu Sans, sans-serif" font-size="12" fill="#8b949e">2 / 6 &#183; 33%</text>
     <rect x="12" y="243" width="30" height="30" fill="#3fb950" stroke="#0d1117" stroke-width="1"/>
     <rect x="47" y="243" width="30" height="30" fill="#3fb950" stroke="#0d1117" stroke-width="1"/>
-    <rect x="82" y="243" width="30" height="30" fill="#3fb950" stroke="#0d1117" stroke-width="1"/>
+    <rect x="82" y="243" width="30" height="30" fill="#d29922" stroke="#0d1117" stroke-width="1"/>
     <rect x="117" y="243" width="30" height="30" fill="#d29922" stroke="#0d1117" stroke-width="1"/>
-    <rect x="152" y="243" width="30" height="30" fill="#6e7681" stroke="#0d1117" stroke-width="1"/>
+    <rect x="152" y="243" width="30" height="30" fill="#d29922" stroke="#0d1117" stroke-width="1"/>
     <rect x="187" y="243" width="30" height="30" fill="#6e7681" stroke="#0d1117" stroke-width="1"/>
   </g>
   <g><title>Assets and utilities: 2 implemented, 1 partial, 6 not implemented</title>

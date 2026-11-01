@@ -113,6 +113,51 @@ class HideTestCase(unittest.TestCase):
         self.assertTrue(hide.is_mesh_hidden(self.layer, MESH_PATH))
         self.assertTrue(hide.unhide_mesh(self.layer, MESH_PATH))
 
+    def test_prototype_mask_leaves_multiple_instances_and_replacement_untouched(self):
+        stage = self.composed()
+        stage.SetEditTarget(self.layer)
+        second_path = '/RootNode/instances/inst_6CA2F12444DEBE09_1'
+        second = stage.DefinePrim(second_path, 'Xform')
+        second.GetReferences().AddInternalReference(MESH_PATH)
+        holder = stage.DefinePrim(MESH_PATH + '/ref_123456789abcdef0', 'Xform')
+        holder.CreateAttribute('IsRemixRef', Sdf.ValueTypeNames.Bool).Set(True)
+        self.assertTrue(hide.hide_mesh(self.layer, MESH_PATH))
+        self.assertTrue(hide.is_mesh_hidden(self.layer, MESH_PATH))
+        self.assertIsNone(self.layer.GetPrimAtPath(INSTANCE_PATH))
+        self.assertTrue(stage.GetPrimAtPath(INSTANCE_PATH).HasAuthoredReferences())
+        self.assertTrue(stage.GetPrimAtPath(second_path).HasAuthoredReferences())
+        self.assertTrue(stage.GetPrimAtPath(MESH_PATH + '/ref_123456789abcdef0'))
+        self.assertTrue(hide.unhide_mesh(self.layer, MESH_PATH))
+        self.assertTrue(stage.GetPrimAtPath(MESH_PATH + '/ref_123456789abcdef0'))
+        self.assertEqual(_sha256(self.capture_path), self.capture_hash)
+
+    def test_prototype_reference_mask_hides_geometry_for_all_instances(self):
+        geometry = Sdf.Layer.CreateAnonymous('geometry.usda')
+        geometry_stage = Usd.Stage.Open(geometry)
+        geometry_stage.DefinePrim('/Asset', 'Xform')
+        geometry_stage.DefinePrim('/Asset/mesh', 'Mesh')
+        capture = Sdf.Layer.CreateAnonymous('capture.usda')
+        capture.customLayerData = {'lightspeed_layer_type': 'capture'}
+        mod = Sdf.Layer.CreateAnonymous('mod.usda')
+        mod.subLayerPaths.append(capture.identifier)
+        stage = Usd.Stage.Open(mod)
+        stage.SetEditTarget(capture)
+        prototype = stage.DefinePrim(MESH_PATH, 'Xform')
+        prototype.GetReferences().AddReference(geometry.identifier, '/Asset')
+        paths = [INSTANCE_PATH, '/RootNode/instances/inst_6CA2F12444DEBE09_1']
+        for path in paths:
+            stage.DefinePrim(path, 'Xform').GetReferences().AddInternalReference(MESH_PATH)
+        before = capture.ExportToString()
+        stage.SetEditTarget(mod)
+        self.assertTrue(all(stage.GetPrimAtPath(path + '/mesh') for path in paths))
+        self.assertTrue(hide.hide_mesh(mod, MESH_PATH))
+        self.assertTrue(all(stage.GetPrimAtPath(path).HasAuthoredReferences() for path in paths))
+        self.assertTrue(all(not stage.GetPrimAtPath(path + '/mesh') for path in paths))
+        self.assertEqual(capture.ExportToString(), before)
+        self.assertTrue(hide.unhide_mesh(mod, MESH_PATH))
+        self.assertTrue(all(stage.GetPrimAtPath(path + '/mesh') for path in paths))
+        self.assertEqual(capture.ExportToString(), before)
+
     def test_capture_layer_is_never_written(self):
         capture_layer = Sdf.Layer.FindOrOpen(str(self.capture_path))
         self.assertEqual(

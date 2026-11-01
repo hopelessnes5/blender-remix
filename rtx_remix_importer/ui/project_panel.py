@@ -213,9 +213,6 @@ class PT_RemixProjectPanel(bpy.types.Panel):
             # Add Auto Apply Transforms option
             row_transform = box_export_settings.row()
             row_transform.prop(scene, "remix_auto_apply_transforms")
-            # Add Texture Reuse option
-            row_texture_reuse = box_export_settings.row()
-            row_texture_reuse.prop(scene, "remix_reuse_existing_textures")
             # Add Hide Original Mesh option
             row_hide_original = box_export_settings.row()
             row_hide_original.prop(scene, "remix_hide_original_mesh")

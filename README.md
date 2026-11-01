@@ -12,11 +12,11 @@ Not affiliated with NVIDIA. RTX Remix, the RTX Remix Toolkit and AperturePBR mat
 
 ## Status
 
-[![Toolkit parity: 42%](docs/badge-parity.svg)](docs/PARITY.md) [![Tests: 114/114](docs/badge-tests.svg)](docs/PARITY.md#tests)
+[![Toolkit parity: 38%](docs/badge-parity.svg)](docs/PARITY.md) [![Tests: 137/137](docs/badge-tests.svg)](docs/PARITY.md#tests)
 
 [![Feature parity progress map](docs/progress.svg)](docs/PARITY.md)
 
-19 of 45 tracked Toolkit features are fully implemented, 10 are partial. Snapshot: 1 November 2026. Tested on Blender 4.5.5 LTS and 5.1.2, 114/114 tests. Full tables and unverified items: [docs/PARITY.md](docs/PARITY.md).
+17 of 45 tracked Toolkit features are fully implemented, 13 are partial. Snapshot: 1 November 2026. Tested on Blender 4.5.5 LTS and 5.1.2, 137/137 tests. Full tables and unverified items: [docs/PARITY.md](docs/PARITY.md).
 
 ## How it works
 
@@ -41,7 +41,7 @@ For a source install, put `texconv.exe` into `rtx_remix_importer/texconv/` and i
 3. Place replacements and press `Export Selected Meshes/Lights` or `Export Selected Materials`.
 4. Use `Hide Selected Meshes` / `Restore Hidden Meshes` to mask captured geometry without exporting it.
 
-`Export Settings` controls the target mesh, scale, transforms, texture reuse and output folders. Every write goes to the active target layer.
+`Export Settings` controls the target mesh, scale, transforms and output folders. Every write goes to the active target layer.
 
 ## Known issues
 
@@ -51,6 +51,8 @@ For a source install, put `texconv.exe` into `rtx_remix_importer/texconv/` and i
 - Albedo textures with alpha may not round-trip; some DDS files appear purple — use `Captures > Fix Broken Textures`.
 - Materials missing from a capture are handled; legacy Aperture node groups written by old releases render as-is, new materials always build on a standard Principled BSDF.
 - Only one reference per mesh prim is supported; assets cannot be combined into one mesh.
+
+For existing mods, the [texture suffix cleanup utility](docs/MOD_CLEANUP.ru.md) offers a dry run and backup before changes.
 
 ## Troubleshooting
 

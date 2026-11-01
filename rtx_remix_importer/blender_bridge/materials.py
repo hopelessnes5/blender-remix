@@ -144,4 +144,6 @@ def assign_material(
     slot = bl_object.material_slots[0]
     slot.link = "OBJECT"
     slot.material = bl_material
+    bl_object['usd_material_path'] = material_path
+    bl_material['usd_material_path'] = material_path
     return bl_material

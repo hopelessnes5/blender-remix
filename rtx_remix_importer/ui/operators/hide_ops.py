@@ -5,10 +5,8 @@ The buttons never export geometry: they author the same
 writes when a captured asset is removed, so the game stops drawing the captured
 mesh while the capture file itself stays untouched.
 
-Captured geometry is defined inline on the ``mesh_<HASH>`` prototype; the
-``inst_<HASH>_<N>`` prims own the reference that instantiates it.  Imported
-instance objects therefore mask their instance path, which is the prim that
-actually carries the capture reference.
+The operation targets the captured ``mesh_<HASH>`` prototype, so all of its
+instances are addressed without changing their references or transforms.
 """
 
 from __future__ import annotations
@@ -36,20 +34,17 @@ __all__ = ["HideCapturedMesh", "ShowCapturedMesh"]
 
 
 def _resolve_mask_path(obj):
-    """Return the captured prim that carries *obj*'s reference.
-
-    Imported instance objects store their own ``usd_instance_path``; objects that
-    only know a prototype path fall back to the ``mesh_<HASH>`` prim.
-    """
-    instance_path = obj.get(constants.PROP_USD_INSTANCE_PATH)
-    if isinstance(instance_path, str) and re.match(constants.REGEX_INSTANCE_PATH, instance_path):
-        return instance_path
-    anchor = resolve_anchor_prim_path(obj)
-    if not anchor:
-        return None
-    if re.match(constants.REGEX_INSTANCE_PATH, anchor):
-        return anchor
-    return remix_mesh_prim_path(anchor)
+    """Find the mesh prototype, preferring the captured prototype metadata."""
+    candidates = [obj.get(constants.PROP_USD_PROTOTYPE_PATH),
+                  obj.get(constants.PROP_USD_PRIM_PATH)]
+    if obj.data:
+        candidates.append(obj.data.get(constants.PROP_USD_PRIM_PATH))
+    candidates.extend((resolve_anchor_prim_path(obj), obj.get(constants.PROP_USD_INSTANCE_PATH)))
+    for path in candidates:
+        mesh_path = remix_mesh_prim_path(path) if isinstance(path, str) and path else None
+        if mesh_path:
+            return mesh_path
+    return None
 
 
 class _MeshMaskOperator(bpy.types.Operator):
@@ -66,7 +61,7 @@ class _MeshMaskOperator(bpy.types.Operator):
     # -- helpers ----------------------------------------------------------
     @staticmethod
     def _selected_meshes(context):
-        """Map selected Blender objects to the prims that own their references."""
+        """Map selected Blender objects to distinct mesh prototypes."""
         targets = []
         skipped = []
         seen = set()
@@ -99,7 +94,7 @@ class _MeshMaskOperator(bpy.types.Operator):
             layer = stage.GetRootLayer()
         return stage, layer, mod_path
 
-    def _run(self, context, apply):
+    def _run(self, context, apply, restore_legacy_instances=False):
         """Apply *apply* to every selected mesh and report a single summary."""
         targets, skipped = self._selected_meshes(context)
         if not targets:
@@ -108,6 +103,16 @@ class _MeshMaskOperator(bpy.types.Operator):
                 "Select at least one imported RTX Remix mesh (mesh_<HASH> or inst_<HASH> path required).",
             )
             return {"CANCELLED"}
+
+        if restore_legacy_instances:
+            seen = {path for _, path in targets}
+            for obj in context.selected_objects:
+                if obj.type != 'MESH' or not _resolve_mask_path(obj):
+                    continue
+                path = obj.get(constants.PROP_USD_INSTANCE_PATH)
+                if isinstance(path, str) and re.match(constants.REGEX_INSTANCE_PATH, path) and path not in seen:
+                    targets.append((obj.name, path))
+                    seen.add(path)
 
         try:
             _stage, layer, mod_path = self._open_mod_layer(context)
@@ -157,8 +162,8 @@ class HideCapturedMesh(_MeshMaskOperator):
     bl_idname = "object.rtx_remix_hide_mesh"
     bl_label = "Hide Captured Meshes"
     bl_description = (
-        "Write 'references = None' for the selected captured mesh(es) into the "
-        "mod layer. No geometry is exported and the capture file is not modified"
+        "Mask the selected mesh prototypes in the mod layer; all instances of "
+        "each mesh are affected. The capture file is not modified"
     )
 
     def execute(self, context):
@@ -176,4 +181,4 @@ class ShowCapturedMesh(_MeshMaskOperator):
     )
 
     def execute(self, context):
-        return self._run(context, hide.unhide_mesh)
+        return self._run(context, hide.unhide_mesh, restore_legacy_instances=True)

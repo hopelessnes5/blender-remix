@@ -15,7 +15,7 @@ import unittest
 from pathlib import Path
 
 import bpy
-from pxr import Usd
+from pxr import Sdf, Usd
 
 import rtx_remix_importer
 from rtx_remix_importer import material_utils
@@ -155,20 +155,27 @@ class TestHideMeshOperators(OperatorTestCase):
 
         self.assertEqual(result, {"FINISHED"})
         text = self.mod_path.read_text(encoding="utf-8")
-        self.assertIn('over "inst_6CA2F12444DEBE09_0"', text)
+        self.assertIn('over "mesh_6CA2F12444DEBE09"', text)
+        self.assertNotIn('over "inst_6CA2F12444DEBE09_0"', text)
         self.assertIn("references = None", text)
         self.assertNotEqual(_sha256(self.mod_path), mod_before)
         self.assertEqual(_sha256(self.project / "capture.usda"), self.capture_hash)
         # No new asset/mesh file was written by hiding.
         self.assertFalse((self.project / "assets").exists())
-        self.assertIsNone(_valid_mesh_child(self.composed()))
+        # Inline prototype geometry remains visible in standard USD composition;
+        # the mask itself is an RTX Remix replacement opinion on the prototype.
+        self.assertIsNotNone(_valid_mesh_child(self.composed()))
+        stage = self.composed()
+        instance = stage.GetPrimAtPath(INSTANCE_PATH)
+        self.assertTrue(instance.HasAuthoredReferences())
 
         # Hiding only authors USD: the Blender mesh itself is untouched.
         self.assertEqual(len(self.mesh_object.data.vertices), 763)
 
     def test_show_restores_the_capture_mesh(self):
         self.assertEqual(bpy.ops.object.rtx_remix_hide_mesh(), {"FINISHED"})
-        self.assertIsNone(_valid_mesh_child(self.composed()))
+        layer = Sdf.Layer.FindOrOpen(str(self.mod_path))
+        self.assertIsNotNone(layer.GetPrimAtPath('/RootNode/meshes/mesh_6CA2F12444DEBE09'))
 
         self.assertEqual(bpy.ops.object.rtx_remix_show_mesh(), {"FINISHED"})
         self.assertIsNotNone(_valid_mesh_child(self.composed()))
@@ -183,6 +190,20 @@ class TestHideMeshOperators(OperatorTestCase):
 
         with self.assertRaises(RuntimeError):
             bpy.ops.object.rtx_remix_hide_mesh()
+
+    def test_mesh_target_prefers_prototype_over_instance_hash(self):
+        from rtx_remix_importer.ui.operators.hide_ops import _resolve_mask_path
+        self.mesh_object['usd_prototype_path'] = '/RootNode/meshes/mesh_1234567890ABCDEF'
+        self.assertEqual(_resolve_mask_path(self.mesh_object), '/RootNode/meshes/mesh_1234567890ABCDEF')
+
+    def test_restore_removes_selected_legacy_instance_mask(self):
+        from rtx_remix_importer.nvidia_core import hide
+        layer = Sdf.Layer.FindOrOpen(str(self.mod_path))
+        self.assertTrue(hide.hide_mesh(layer, INSTANCE_PATH))
+        layer.Save()
+        self.assertEqual(bpy.ops.object.rtx_remix_show_mesh(), {'FINISHED'})
+        self.assertFalse(hide.is_mesh_hidden(layer, INSTANCE_PATH))
+        self.assertEqual(_sha256(self.project / 'capture.usda'), self.capture_hash)
 
 
 if __name__ == "__main__":

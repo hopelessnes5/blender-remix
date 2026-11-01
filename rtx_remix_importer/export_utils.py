@@ -203,9 +203,7 @@ class TextureExporter:
 
         for bl_image, texture_type in texture_list:
             # Generate output filename
-            base_name, _ = os.path.splitext(bl_image.name)
-            type_suffix = self.texture_processor.get_texture_suffix(texture_type)
-            dds_file_name = f"{base_name}{type_suffix}.dds"
+            dds_file_name = self.texture_processor.texture_filename(bl_image)
             absolute_dds_path = os.path.normpath(os.path.join(self.textures_dir, dds_file_name))
 
             # Get DDS format
@@ -261,6 +259,13 @@ class TextureExporter:
         progress_callback: Optional[Callable[[str], None]] = None
     ) -> Optional[str]:
         """Export a single texture asynchronously."""
+        if texture_type == 'normal':
+            os.makedirs(self.textures_dir, exist_ok=True)
+            name = self.texture_processor.texture_filename(bl_image)
+            path = os.path.join(self.textures_dir, name)
+            if self.texture_processor.export_octahedral_normal(bl_image, path):
+                return get_relative_path(self.sublayer_path, path)
+            return None
         results = await self.export_textures_parallel(
             [(bl_image, texture_type)],
             progress_callback
@@ -283,9 +288,7 @@ class TextureExporter:
             raise RuntimeError(f"Could not create textures directory: {e}")
 
         # Generate output filename
-        base_name, _ = os.path.splitext(bl_image.name)
-        type_suffix = self.texture_processor.get_texture_suffix(texture_type)
-        dds_file_name = f"{base_name}{type_suffix}.dds"
+        dds_file_name = self.texture_processor.texture_filename(bl_image)
         absolute_dds_path = os.path.normpath(os.path.join(self.textures_dir, dds_file_name))
 
         # Get DDS format
@@ -521,7 +524,7 @@ class MaterialExporter:
                 if texture_path:
                     shader_prim.CreateAttribute(texture_attr, Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(texture_path))
                     if socket_name in ['Normal', 'Normal Map']:
-                        shader_prim.CreateAttribute("inputs:encoding", Sdf.ValueTypeNames.Int).Set(2)
+                        shader_prim.CreateAttribute("inputs:encoding", Sdf.ValueTypeNames.Int).Set(0)
 
             elif constant_attr and socket:
                 # Set constant value
@@ -565,6 +568,9 @@ class MaterialExporter:
                     # Float values
                     shader_prim.CreateAttribute(usd_attr, Sdf.ValueTypeNames.Float).Set(float(value))
 
+
+        from .material_defaults import remove_default_inputs
+        remove_default_inputs(shader_prim, material_type)
 
     def export_material_sync(
         self,

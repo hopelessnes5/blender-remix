@@ -41,7 +41,7 @@ The official Toolkit is a Kit-based application (`lightspeed.trex.*` extensions)
 | Feature | Official Toolkit component | Status | Notes in this add-on |
 |---|---|:--:|---|
 | Replace a captured mesh: `over "mesh_<HASH>" ( references = None )` + child `def Xform "ref_<uuid>"` with `prepend references` and `custom bool IsRemixRef = 1` | `lightspeed.trex.asset_replacements.core.shared`, `lightspeed.trex.properties_pane.mesh.widget` | ✅ | `Export Selected Meshes/Lights`; holder prim is reused on repeated exports, duplicates and stale overrides are cleaned up |
-| Hide a captured mesh without exporting geometry | `Setup.remove_reference` (cross-layer branch) | ✅ | `Hide Selected Meshes` writes `references = None` into the mod layer on the reference-owning prim (`inst_<HASH>_<N>` for inline captures); capture layers are never touched |
+| Hide a captured mesh without exporting geometry | `Setup.remove_reference` (cross-layer branch) | 🟡 | `Hide Selected Meshes` writes `references = None` on `mesh_<HASH>` in the mod layer; instances and capture layers are not modified. Game runtime behavior remains unverified |
 | Ingested mesh asset layout: `/ReferenceTarget` → `/XForms` → `Mesh`, `MaterialBindingAPI`, `subdivisionScheme`, `extent`, face-varying UVs and normals | `lightspeed.trex.asset_pipeline.core` (`meta` step), IngestCraft | ✅ | same structure the official ingest pipeline writes, including `defaultPrim` |
 | Unit normalisation of the asset | ingest `ApplyUnitScale` | 🟡 | geometry is converted with `Export Scale` instead of `metersPerUnit` |
 | Add a brand-new instanced mesh | ingest + add reference | ✅ | creates `mesh_<HASH>` + `inst_<HASH>_0` when no target mesh is selected |
@@ -56,7 +56,7 @@ The official Toolkit is a Kit-based application (`lightspeed.trex.*` extensions)
 | Feature | Official Toolkit component | Status | Notes in this add-on |
 |---|---|:--:|---|
 | Author `AperturePBR_Opacity` / `AperturePBR_Translucent` materials (texture slots + constants) | `lightspeed.tool.material.core` | ✅ | diffuse, metallic, roughness, normal, emissive, opacity, specular; transmittance, IOR, thin-walled. All parameters are read from the standard Principled BSDF sockets of the Blender material |
-| Replace the material of a captured mesh | `lightspeed.tool.material.core` | 🟡 | exports a new `mat_<uuid>` and binds it with `strongerThanDescendants`; it does not `over` the captured `mat_<HASH>` |
+| Replace the material of a captured mesh | `lightspeed.tool.material.core` | 🟡 | authors an `over` on the original `mat_<HASH>` and its shader; all instances using that material are affected |
 | Correct material binding strength (`bindMaterialAs` as relationship metadata) | USD material binding | ✅ | authored through `MaterialBindingAPI`, not as an attribute |
 | Blender-side Aperture node groups (`Aperture Opaque` / `Aperture Translucent`) + Principled ⇄ Aperture conversion operators | — (Blender-side authoring) | ⛔ | deliberately removed: materials are authored natively as standard Principled BSDF; node groups written by old releases remain readable for re-export |
 | Copy / transfer material overrides between prims | `transfer_property_spec_to_layer`, `transfer_reference_spec_to_layer` | ⛔ | |
@@ -67,9 +67,9 @@ The official Toolkit is a Kit-based application (`lightspeed.trex.*` extensions)
 | Feature | Official Toolkit component | Status | Notes in this add-on |
 |---|---|:--:|---|
 | Convert textures to DDS (BC7 / BC5 / BC4) on export | ingest `ConvertToDDS` | ✅ | `texconv` wrapper, per-channel formats, background jobs |
-| Reuse existing textures by base material name | — | ✅ | `Reuse Existing Textures` |
+| Reuse existing textures | — | 🟡 | Existing non-normal DDS files with the exact image name are reused; normals are reconverted |
 | Replace a captured texture asset | `lightspeed.trex.texture_replacements.core.shared` | 🟡 | new textures are authored on the exported material; texture paths on captured `mat_<HASH>` prims are not swapped |
-| Octahedral normal encoding | ingest `ConvertToOctahedral` | ⛔ | |
+| Octahedral normal encoding | ingest `ConvertToOctahedral` | 🟡 | NVIDIA hemispherical conversion for Blender OpenGL normals on material export; BC5 DDS and `inputs:encoding = 0` |
 | RTXIO texture compression | `lightspeed.trex.rtxio.core` | ⛔ | |
 | DDS → PNG texture conversion, broken DDS repair | — (Blender-side) | ✅ | `Convert DDS to PNG`, `Fix Broken Textures`, texture cache cleanup |
 
@@ -209,15 +209,15 @@ root prim's own override spec and invalid destinations, honours the "no
 replacement layer" early return, and rejects capture-typed layers both as
 override source and as edit target. `tests/unit/test_hide.py` and
 `TestHideMeshOperators` cover hiding/restoring captured meshes: the mask is
-authored on the reference-owning instance prim, the capture file hash is
-unchanged, no `assets/` output appears, and the composed geometry
-disappears/returns. `tests/blender/test_principled_materials.py` checks
+authored on the mesh prototype, the capture file hash is unchanged and no
+`assets/` output appears. Tests exercise multiple instances and restoration;
+standard USD can still compose instance geometry from capture-layer references. `tests/blender/test_principled_materials.py` checks
 Principled constants, opacity gating, transmission type detection and selected
-USD export values on real Blender nodes. `tests/blender/test_capture_thumbnails.py`
+USD export values on real Blender nodes. `tests/unit/test_material_defaults.py` checks omission of MDL defaults and preservation of stronger opinions over weaker layers. `tests/blender/test_capture_thumbnails.py`
 checks direct DDS thumbnail lookup, decoding, refresh and missing files without
 a converted-file cache.
 
-**Executed result:** 114 tests pass on both Blender 4.5.5 LTS (bundled OpenUSD
+**Executed result:** 137 tests pass on both Blender 4.5.5 LTS (bundled OpenUSD
 25.02) and Blender 5.1.2 (bundled OpenUSD 25.08) on Windows, exit code `0`;
 `register()` / `unregister()` was smoke-tested on both as well. A freshly built
 `rtx_remix_importer.zip` was installed through `preferences.addon_install` into a
@@ -226,6 +226,13 @@ material, `direct` backend). `git diff --check` and `python -m compileall` also
 pass.
 
 **Not verified:**
+
+- Mesh-prototype masking was checked against a real capture using an anonymous
+  mod layer, but the result has not been tested in the RTX Remix game runtime.
+  Its instances may still show geometry in standard USD composition.
+
+- Octahedral normal export was tested with synthetic Blender images and texconv;
+  appearance in a real Remix game and non-OpenGL input conventions were not tested.
 
 - Capture thumbnails support RGBA16F, RGBA8/BGRA8 and BC1–BC3 DDS;
   other DDS formats (including BC7) are not decoded. A real game capture thumbnail
