@@ -219,9 +219,12 @@ a converted-file cache. `tests/blender/test_write_guard.py` checks the shared
 write guard behind every layer-save entry point: capture and locked layers and
 capture edit targets are refused immediately before each write, a globally
 unlocked capture blocks saving the composition, and the export stage path
-reports rejection without touching bytes.
+reports rejection without touching bytes. `tests/blender/test_texture_source_guard.py`
+checks the texture source guard: height and normal exports refuse hard-link
+and symlink aliases and the recorded pre-decode source path before texconv
+availability is even checked, and a distinct target still exports.
 
-**Executed result:** 200 tests pass on both Blender 4.5.5 LTS (bundled OpenUSD
+**Executed result:** 224 tests pass on both Blender 4.5.5 LTS (bundled OpenUSD
 25.02) and Blender 5.1.2 (bundled OpenUSD 25.08) on Windows, exit code `0`.
 `register()` / `unregister()` are exercised by the suite through the
 UI-operator tests. The package-install smoke check — a freshly built

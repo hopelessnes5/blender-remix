@@ -226,31 +226,47 @@ class ModFileLoader:
         return list(texture_paths)
     
     def _preload_textures_parallel(self, texture_paths: list):
-        """Pre-load texture data in parallel."""
+        """Warm the file cache in parallel, then load images.
+
+        Blender may only load images from its main thread (audit A03), so the
+        parallel phase only reads file bytes to warm the OS cache;
+        ``bpy.data.images.load`` runs sequentially on the calling thread.
+        """
         from concurrent.futures import ThreadPoolExecutor
         import time
-        
+        from ...core_utils import _require_blender_main_thread
+
+        _require_blender_main_thread()
+
         start_time = time.time()
+
+        def read_single_texture(tex_path):
+            """Read texture bytes to warm the OS file cache."""
+            try:
+                with open(tex_path, 'rb') as file:
+                    while file.read(1024 * 1024):
+                        pass
+            except (OSError, ValueError):
+                # Silently fail for problematic textures (e.g., BC7);
+                # they fail again in bpy.data.images.load below.
+                return
+
+        # Pre-read textures in parallel (I/O bound operation)
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            executor.map(read_single_texture, texture_paths)
+
         loaded_images = {}
-        
-        def load_single_texture(tex_path):
-            """Load a single texture file into memory."""
+        for tex_path in texture_paths:
             try:
                 # Load image into Blender (Blender handles caching internally)
                 # Use check_existing to avoid duplicates
                 img = bpy.data.images.load(tex_path, check_existing=True)
-                return (tex_path, img)
-            except Exception as e:
+            except Exception:
                 # Silently fail for problematic textures (e.g., BC7)
-                return (tex_path, None)
-        
-        # Pre-load textures in parallel (I/O bound operation)
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            results = executor.map(load_single_texture, texture_paths)
-            for tex_path, img in results:
-                if img:
-                    loaded_images[tex_path] = img
-        
+                img = None
+            if img:
+                loaded_images[tex_path] = img
+
         elapsed = time.time() - start_time
         self.report({'INFO'}, f"Pre-loaded {len(loaded_images)}/{len(texture_paths)} textures in {elapsed:.2f}s")
     

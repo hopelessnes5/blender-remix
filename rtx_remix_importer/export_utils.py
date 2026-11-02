@@ -38,6 +38,10 @@ class MDLManager:
                     source_file = os.path.join(mdl_source_dir, mdl_file)
                     target_file = os.path.join(mdl_target_dir, mdl_file)
 
+                    if os.path.exists(target_file) and os.path.samefile(source_file, target_file):
+                        # A hard link or symlink alias: copying would fail
+                        # with SameFileError and newer mtime is meaningless.
+                        continue
                     if not os.path.exists(target_file) or os.path.getmtime(source_file) > os.path.getmtime(target_file):
                         shutil.copy2(source_file, target_file)
                         copied_files.append(mdl_file)
@@ -572,6 +576,10 @@ class MaterialExporter:
                     texture_path = await self.texture_exporter.export_texture_async(
                         image_node.image, texture_type, progress_cb
                     )
+                    # A failed export must never read as success (audit A04);
+                    # the attribute used to be skipped silently instead.
+                    if texture_path is None:
+                        raise RuntimeError(f'Could not export {texture_type} texture {image_node.image.name} to DDS')
 
                 if texture_path:
                     shader_prim.CreateAttribute(texture_attr, Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(texture_path))

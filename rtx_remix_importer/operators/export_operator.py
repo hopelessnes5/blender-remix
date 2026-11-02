@@ -537,6 +537,39 @@ def create_asset_default_material(stage, mesh_prim_path, mesh_name):
 def write_ingested_mesh_asset(stage, obj, context, mesh_name_sanitized, points_matrix, bl_mat,
                               inherit_material, project_root, mesh_file_path, up_axis,
                               report_fn=print):
+    """Restore mesh-stage edits and staged textures if ingest fails."""
+    layer = stage.GetRootLayer()
+    write_guard.ensure_writable_layer(layer)
+    write_guard.ensure_editable_edit_target(stage)
+    if stage.GetEditTarget().GetLayer() != layer:
+        raise ValueError('Ingested mesh export requires the root layer as edit target')
+    before = layer.ExportToString()
+    textures = _MaterialTextureTransaction()
+    try:
+        result = _write_ingested_mesh_asset_impl(
+            stage, obj, context, mesh_name_sanitized, points_matrix, bl_mat,
+            inherit_material, project_root, mesh_file_path, up_axis,
+            report_fn, textures,
+        )
+        if result is None:
+            if layer.ExportToString() != before and not layer.ImportFromString(before):
+                raise RuntimeError('Failed to restore the USD mesh layer after export failed')
+            textures.rollback()
+        return result
+    except Exception:
+        try:
+            if layer.ExportToString() != before and not layer.ImportFromString(before):
+                raise RuntimeError('Failed to restore the USD mesh layer after export failed')
+        finally:
+            textures.rollback()
+        raise
+    finally:
+        textures.close()
+
+
+def _write_ingested_mesh_asset_impl(stage, obj, context, mesh_name_sanitized, points_matrix, bl_mat,
+                              inherit_material, project_root, mesh_file_path, up_axis,
+                              report_fn, texture_transaction):
     """Write an ingested mesh asset the way the Remix ingest pipeline does.
 
     Structure (asset_pipeline meta step + model_ingestion.json):
@@ -646,13 +679,16 @@ def write_ingested_mesh_asset(stage, obj, context, mesh_name_sanitized, points_m
                     bind_prim_path=mesh_prim_path,
                     bind_strength="weakerThanDescendants",
                     material_name="%s__" % mesh_name_sanitized,
+                    _texture_transaction=texture_transaction,
                 )
             if not material_path:
                 material_path = create_asset_default_material(stage, mesh_prim_path, mesh_name_sanitized)
 
         stage.SetDefaultPrim(ref_target_prim)
         write_guard.ensure_writable_layer(stage.GetRootLayer())
-        stage.GetRootLayer().Save()
+        texture_transaction.publish()
+        if not stage.GetRootLayer().Save():
+            raise RuntimeError(f'Could not save mesh layer: {mesh_file_path}')
         print("  Saved mesh data to: %s" % mesh_file_path)
         return mesh_prim_path, material_path
     except Exception as e:
@@ -685,9 +721,98 @@ def get_mesh_name_from_object(obj):
             mesh_name_to_use = mesh_data_name
     return mesh_name_to_use
 
+class _MaterialTextureTransaction:
+    """Stage DDS files next to their destinations and restore partial publication."""
+
+    def __init__(self):
+        self.directory = None
+        self.files = {}
+        self.published = []
+        self.rollback_failed = False
+
+    def stage_path(self, processor, image, destination):
+        destination = os.path.abspath(destination)
+        if processor.is_source_target(image, destination):
+            raise ValueError(f'Texture export would overwrite its source image: {destination}')
+        directory = os.path.dirname(destination)
+        if self.directory is None:
+            os.makedirs(directory, exist_ok=True)
+            self.directory = tempfile.TemporaryDirectory(prefix='.remix_material_', dir=directory)
+        key = os.path.normcase(destination)
+        if key not in self.files:
+            staged = os.path.join(self.directory.name, f'texture_{len(self.files)}.dds')
+            self.files[key] = (destination, staged)
+        return self.files[key][1]
+
+    def publish(self):
+        for index, (destination, staged) in enumerate(self.files.values()):
+            if not os.path.isfile(staged):
+                raise RuntimeError(f'Staged texture was not created: {destination}')
+            backup = None
+            if os.path.exists(destination):
+                backup = os.path.join(self.directory.name, f'backup_{index}.dds')
+                shutil.copy2(destination, backup)
+            os.replace(staged, destination)
+            self.published.append((destination, backup))
+
+    def rollback(self):
+        try:
+            for destination, backup in reversed(self.published):
+                if backup is None:
+                    os.remove(destination)
+                else:
+                    os.replace(backup, destination)
+            self.published.clear()
+        except Exception as exc:
+            self.rollback_failed = True
+            raise RuntimeError(f'Texture rollback failed; backups remain in {self.directory.name}: {exc}') from exc
+
+    def close(self):
+        if self.directory is not None and not self.rollback_failed:
+            self.directory.cleanup()
+        elif self.directory is not None:
+            # TemporaryDirectory otherwise removes the backups during GC.
+            self.directory._finalizer.detach()
+
+
 def export_material(blender_material, sublayer_stage, project_root, sublayer_path, parent_mesh_path=None, obj=None,
                     material_scope_path=None, bind_prim_path=None,
-                    bind_strength="weakerThanDescendants", material_name=None, override_material_path=None):
+                    bind_strength="weakerThanDescendants", material_name=None, override_material_path=None,
+                    _texture_transaction=None):
+    """Restore the edit layer if material authoring fails partway through."""
+    edit_layer = sublayer_stage.GetEditTarget().GetLayer()
+    write_guard.ensure_writable_layer(edit_layer)
+    before = edit_layer.ExportToString()
+    owns_textures = _texture_transaction is None
+    textures = _texture_transaction or _MaterialTextureTransaction()
+    try:
+        result = _export_material_impl(
+            blender_material, sublayer_stage, project_root, sublayer_path,
+            parent_mesh_path, obj, material_scope_path, bind_prim_path,
+            bind_strength, material_name, override_material_path, textures,
+        )
+        if owns_textures:
+            textures.publish()
+        return result
+    except Exception:
+        # Replacing the contents in the same Sdf layer also preserves edits
+        # that were dirty before this individual export began.
+        try:
+            if edit_layer.ExportToString() != before:
+                if not edit_layer.ImportFromString(before):
+                    raise RuntimeError('Failed to restore the USD edit layer after material export failed')
+        finally:
+            textures.rollback()
+        raise
+    finally:
+        if owns_textures:
+            textures.close()
+
+
+def _export_material_impl(blender_material, sublayer_stage, project_root, sublayer_path, parent_mesh_path=None, obj=None,
+                    material_scope_path=None, bind_prim_path=None,
+                    bind_strength="weakerThanDescendants", material_name=None, override_material_path=None,
+                    texture_transaction=None):
     """Export a Blender material into `sublayer_stage`.
 
     Two destinations are supported, both matching what the RTX Remix Toolkit
@@ -712,77 +837,40 @@ def export_material(blender_material, sublayer_stage, project_root, sublayer_pat
     if override_material_path is None:
         ensure_mdl_files(project_root)
 
+    # --- Phase 1: read-only planning. Only names and paths are computed
+    # here; prims are authored in phase 4, after every texture conversion
+    # succeeded (audit A05) ---
     if override_material_path is not None:
         scope_path = None
         mat_path = Sdf.Path(override_material_path)
     elif material_scope_path is not None:
         scope_path = Sdf.Path(material_scope_path)
-        if not sublayer_stage.GetPrimAtPath(scope_path):
-            sublayer_stage.DefinePrim(scope_path, "Scope")
         mat_name_sanitized = sanitize_prim_name(material_name or blender_material.name) or "Material"
         print(f"Exporting Material to {scope_path}: {blender_material.name}")
     else:
         scope_path = Sdf.Path(REMIX_LOOKS_PATH)
-        sublayer_stage.OverridePrim(scope_path)
         mat_name_sanitized = generate_uuid_name(sanitize_prim_name(blender_material.name), prefix="mat_")
         print(f"Exporting Material to {scope_path}: {blender_material.name}")
 
     if override_material_path is None:
         mat_path = scope_path.AppendPath(mat_name_sanitized)
-    # Inside an asset every prim has to be *defined*, an `over` alone would not
-    # compose once the asset is referenced.
-    if override_material_path is not None:
-        material_prim = sublayer_stage.OverridePrim(mat_path)
-    elif material_scope_path is not None:
-        material_prim = sublayer_stage.DefinePrim(mat_path, "Material")
-    else:
-        material_prim = sublayer_stage.OverridePrim(mat_path)
-        material_prim.SetTypeName("Material")
-
-    shader_path = mat_path.AppendPath("Shader")
-    if override_material_path is not None:
-        shader_prim = sublayer_stage.OverridePrim(shader_path)
-    elif material_scope_path is not None:
-        shader_prim = sublayer_stage.DefinePrim(shader_path, "Shader")
-    else:
-        shader_prim = sublayer_stage.OverridePrim(shader_path)
-        shader_prim.SetTypeName("Shader")
-
-    if bind_prim_path is not None:
-        target_prim = sublayer_stage.GetPrimAtPath(bind_prim_path)
-        if target_prim:
-            bind_material_on_prim(target_prim, material_prim, bind_strength)
-            print(f"  Bound {mat_path} to {bind_prim_path} ({bind_strength})")
-        else:
-            print(f"  WARNING: cannot bind material, prim {bind_prim_path} was not found")
-
-    if override_material_path is None:
-        material_api = UsdShade.Material(material_prim)
-        shader_output = UsdShade.Shader(shader_prim).CreateOutput("out", Sdf.ValueTypeNames.Token)
-        shader_output.SetRenderType("material")
-        material_api.CreateSurfaceOutput("mdl").ConnectToSource(shader_output)
-        material_api.CreateDisplacementOutput("mdl").ConnectToSource(shader_output)
-        material_api.CreateVolumeOutput("mdl").ConnectToSource(shader_output)
-
-    if override_material_path is None:
-        shader_prim.CreateAttribute("info:implementationSource", Sdf.ValueTypeNames.Token).Set("sourceAsset")
-        shader_prim.CreateAttribute("info:mdl:sourceAsset", Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(f"{material_type}.mdl"))
-        shader_prim.CreateAttribute("info:mdl:sourceAsset:subIdentifier", Sdf.ValueTypeNames.Token).Set(material_type)
 
     principled_node = NodeAnalyzer.find_surface_shader(blender_material)
 
-    if not principled_node:
-        return mat_path
+    # --- Phase 2: discovery. Sockets are only read here and conversions are
+    # recorded; they run in phase 3, still before the first stage write ---
+    normal_conversions = []
+    scalar_conversions = []
+    displacement_record = None
 
     texture_tasks = []
     texture_destinations = {}
     from .. import core_utils
     texture_processor = core_utils.get_texture_processor()
-    
+
     from bpy import context as bpy_context
     custom_texture_dir = bpy_context.scene.remix_custom_texture_dir or "rtx-remix/textures"
     textures_dir = os.path.join(project_root, custom_texture_dir)
-    os.makedirs(textures_dir, exist_ok=True)
 
     def node_socket(node, *names):
         """First existing input socket among *names* (Principled + legacy Aperture)."""
@@ -870,13 +958,13 @@ def export_material(blender_material, sublayer_stage, project_root, sublayer_pat
             texture_destinations[key] = source
 
             if texture_type == 'normal':
-                if texture_processor.export_normal_map(bl_image, absolute_dds_path, normal_export.current_mode()):
-                    return bl_image, get_relative_path(sublayer_path, absolute_dds_path)
-                raise RuntimeError(f"Could not export normal map {bl_image.name} to DDS")
+                # Recorded for the conversion phase below; exporting here
+                # would leave authored prims behind on failure (audit A05).
+                normal_conversions.append((bl_image, absolute_dds_path))
+                return bl_image, get_relative_path(sublayer_path, absolute_dds_path)
 
             if scalar_channel is not None:
-                if not texture_processor.export_height_texture(bl_image, absolute_dds_path, scalar_channel):
-                    raise RuntimeError(f"Could not export scalar texture {bl_image.name} to DDS")
+                scalar_conversions.append((bl_image, absolute_dds_path, scalar_channel))
                 return bl_image, get_relative_path(sublayer_path, absolute_dds_path)
 
             if os.path.exists(absolute_dds_path):
@@ -887,74 +975,146 @@ def export_material(blender_material, sublayer_stage, project_root, sublayer_pat
 
         return None, None
 
-    if material_type == "AperturePBR_Translucent":
-        diffuse_image, diffuse_rel_path = find_texture_for_socket('Transmittance/Diffuse Albedo', 'BC7_UNORM_SRGB')
-        metallic_image, metallic_rel_path = None, None
-        roughness_image, roughness_rel_path = None, None
-        normal_image, normal_rel_path = find_texture_for_socket('Normal Map', 'BC5_UNORM')
+    if principled_node:
+        os.makedirs(textures_dir, exist_ok=True)
+
+        if material_type == "AperturePBR_Translucent":
+            diffuse_image, diffuse_rel_path = find_texture_for_socket('Transmittance/Diffuse Albedo', 'BC7_UNORM_SRGB')
+            metallic_image, metallic_rel_path = None, None
+            roughness_image, roughness_rel_path = None, None
+            normal_image, normal_rel_path = find_texture_for_socket('Normal Map', 'BC5_UNORM')
+        else:
+            diffuse_image, diffuse_rel_path = find_texture_for_socket('Base Color', 'BC7_UNORM_SRGB')
+            metallic_image, metallic_rel_path = find_texture_for_socket('Metallic', 'BC4_UNORM')
+            roughness_image, roughness_rel_path = find_texture_for_socket('Roughness', 'BC4_UNORM')
+            normal_image, normal_rel_path = find_texture_for_socket('Normal', 'BC5_UNORM')
+
+        enable_emission = False
+        emissive_image, emissive_rel_path = None, None
+        emissive_socket_name = 'Emissive Color' if principled_node.type == 'GROUP' else 'Emission Color'
+        if emissive_socket_name not in [inp.name for inp in principled_node.inputs]:
+            emissive_socket_name = 'Emission' if 'Emission' in [inp.name for inp in principled_node.inputs] else None
+
+        emissive_socket = principled_node.inputs.get(emissive_socket_name) if emissive_socket_name else None
+
+        if principled_node.type == 'GROUP':
+            enable_emission_socket = principled_node.inputs.get('Enable Emission')
+            if enable_emission_socket and enable_emission_socket.default_value:
+                enable_emission = True
+        else:
+            emission_strength_socket = principled_node.inputs.get('Emission Strength')
+            if emission_strength_socket and emission_strength_socket.default_value > 0.001:
+                enable_emission = True
+
+        if emissive_socket and emissive_socket.is_linked:
+            emissive_image, emissive_rel_path = find_texture_for_socket(emissive_socket_name, 'BC7_UNORM_SRGB')
+            if emissive_rel_path:
+                enable_emission = True
+
+        opacity_image, opacity_rel_path = None, None
+        opacity_socket = node_socket(principled_node, 'Alpha', 'Opacity')
+        if opacity_socket and opacity_socket.is_linked:
+            alpha_uses_same_image = False
+            if diffuse_image and opacity_socket.links:
+                alpha_node = opacity_socket.links[0].from_node
+                if alpha_node and alpha_node.type == 'TEX_IMAGE' and alpha_node.image == diffuse_image:
+                    alpha_uses_same_image = True
+            if not alpha_uses_same_image:
+                opacity_image, opacity_rel_path = find_texture_for_socket('Alpha', 'BC4_UNORM')
+
+        specular_image, specular_rel_path = None, None
+        specular_socket = node_socket(principled_node, 'Specular IOR Level', 'Specular')
+        if specular_socket and specular_socket.is_linked:
+            specular_image, specular_rel_path = find_texture_for_socket(specular_socket.name, 'BC4_UNORM')
+
+        if displacement:
+            height_image, height_channel, displace_in, displace_out = displacement
+            height_path = os.path.normpath(os.path.join(textures_dir, texture_processor.texture_filename(height_image)))
+            key = os.path.normcase(height_path)
+            if key in texture_destinations:
+                raise ValueError(f'Height map conflicts with another texture export: {height_path}')
+            displacement_record = (height_image, height_path, height_channel)
+
+        # --- Phase 3: run every recorded conversion before the first stage
+        # write, so a texture failure raises while nothing was authored yet
+        # (audit A04/A05). Blender image access stays on this (main) thread. ---
+        for conversion_image, conversion_path in normal_conversions:
+            staged_path = texture_transaction.stage_path(texture_processor, conversion_image, conversion_path)
+            if not texture_processor.export_normal_map(conversion_image, staged_path, normal_export.current_mode()):
+                raise RuntimeError(f"Could not export normal map {conversion_image.name} to DDS")
+
+        for conversion_image, conversion_path, conversion_channel in scalar_conversions:
+            staged_path = texture_transaction.stage_path(texture_processor, conversion_image, conversion_path)
+            if not texture_processor.export_height_texture(conversion_image, staged_path, conversion_channel):
+                raise RuntimeError(f"Could not export scalar texture {conversion_image.name} to DDS")
+
+        if displacement_record:
+            conversion_image, conversion_path, conversion_channel = displacement_record
+            staged_path = texture_transaction.stage_path(texture_processor, conversion_image, conversion_path)
+            if not texture_processor.export_height_texture(conversion_image, staged_path, conversion_channel):
+                raise RuntimeError(f'Could not export height map {conversion_image.name} to DDS')
+
+        if texture_tasks and texture_processor:
+            staged_tasks = [(image, texture_transaction.stage_path(texture_processor, image, path), kind, fmt)
+                            for image, path, kind, fmt in texture_tasks]
+            results = texture_processor._convert_texture_batch_sync(staged_tasks)
+            if len(results) != len(texture_tasks) or not all(results):
+                failed = [task[0].name for task, ok in zip(texture_tasks, results) if not ok]
+                raise RuntimeError(f"Could not export textures to DDS: {', '.join(failed) or 'incomplete conversion'}")
+
+    # --- Phase 4: authoring. Runs only after every conversion succeeded, so
+    # texture failures can never leave prims behind (audit A04/A05).
+    # Failures during USD authoring are rolled back by export_material. ---
+    # Inside an asset every prim has to be *defined*, an `over` alone would not
+    # compose once the asset is referenced.
+    if override_material_path is not None:
+        material_prim = sublayer_stage.OverridePrim(mat_path)
+    elif material_scope_path is not None:
+        if not sublayer_stage.GetPrimAtPath(scope_path):
+            sublayer_stage.DefinePrim(scope_path, "Scope")
+        material_prim = sublayer_stage.DefinePrim(mat_path, "Material")
     else:
-        diffuse_image, diffuse_rel_path = find_texture_for_socket('Base Color', 'BC7_UNORM_SRGB')
-        metallic_image, metallic_rel_path = find_texture_for_socket('Metallic', 'BC4_UNORM')
-        roughness_image, roughness_rel_path = find_texture_for_socket('Roughness', 'BC4_UNORM')
-        normal_image, normal_rel_path = find_texture_for_socket('Normal', 'BC5_UNORM')
-    
-    enable_emission = False
-    emissive_image, emissive_rel_path = None, None
-    emissive_socket_name = 'Emissive Color' if principled_node.type == 'GROUP' else 'Emission Color'
-    if emissive_socket_name not in [inp.name for inp in principled_node.inputs]:
-        emissive_socket_name = 'Emission' if 'Emission' in [inp.name for inp in principled_node.inputs] else None
-        
-    emissive_socket = principled_node.inputs.get(emissive_socket_name) if emissive_socket_name else None
-    
-    if principled_node.type == 'GROUP':
-        enable_emission_socket = principled_node.inputs.get('Enable Emission')
-        if enable_emission_socket and enable_emission_socket.default_value:
-            enable_emission = True
+        sublayer_stage.OverridePrim(scope_path)
+        material_prim = sublayer_stage.OverridePrim(mat_path)
+        material_prim.SetTypeName("Material")
+
+    shader_path = mat_path.AppendPath("Shader")
+    if override_material_path is not None:
+        shader_prim = sublayer_stage.OverridePrim(shader_path)
+    elif material_scope_path is not None:
+        shader_prim = sublayer_stage.DefinePrim(shader_path, "Shader")
     else:
-        emission_strength_socket = principled_node.inputs.get('Emission Strength')
-        if emission_strength_socket and emission_strength_socket.default_value > 0.001:
-            enable_emission = True
-    
-    if emissive_socket and emissive_socket.is_linked:
-        emissive_image, emissive_rel_path = find_texture_for_socket(emissive_socket_name, 'BC7_UNORM_SRGB')
-        if emissive_rel_path:
-            enable_emission = True
+        shader_prim = sublayer_stage.OverridePrim(shader_path)
+        shader_prim.SetTypeName("Shader")
 
-    opacity_image, opacity_rel_path = None, None
-    opacity_socket = node_socket(principled_node, 'Alpha', 'Opacity')
-    if opacity_socket and opacity_socket.is_linked:
-        alpha_uses_same_image = False
-        if diffuse_image and opacity_socket.links:
-            alpha_node = opacity_socket.links[0].from_node
-            if alpha_node and alpha_node.type == 'TEX_IMAGE' and alpha_node.image == diffuse_image:
-                alpha_uses_same_image = True
-        if not alpha_uses_same_image:
-            opacity_image, opacity_rel_path = find_texture_for_socket('Alpha', 'BC4_UNORM')
+    if bind_prim_path is not None:
+        target_prim = sublayer_stage.GetPrimAtPath(bind_prim_path)
+        if target_prim:
+            bind_material_on_prim(target_prim, material_prim, bind_strength)
+            print(f"  Bound {mat_path} to {bind_prim_path} ({bind_strength})")
+        else:
+            print(f"  WARNING: cannot bind material, prim {bind_prim_path} was not found")
 
-    specular_image, specular_rel_path = None, None
-    specular_socket = node_socket(principled_node, 'Specular IOR Level', 'Specular')
-    if specular_socket and specular_socket.is_linked:
-        specular_image, specular_rel_path = find_texture_for_socket(specular_socket.name, 'BC4_UNORM')
+    if override_material_path is None:
+        material_api = UsdShade.Material(material_prim)
+        shader_output = UsdShade.Shader(shader_prim).CreateOutput("out", Sdf.ValueTypeNames.Token)
+        shader_output.SetRenderType("material")
+        material_api.CreateSurfaceOutput("mdl").ConnectToSource(shader_output)
+        material_api.CreateDisplacementOutput("mdl").ConnectToSource(shader_output)
+        material_api.CreateVolumeOutput("mdl").ConnectToSource(shader_output)
 
-    if displacement:
+        shader_prim.CreateAttribute("info:implementationSource", Sdf.ValueTypeNames.Token).Set("sourceAsset")
+        shader_prim.CreateAttribute("info:mdl:sourceAsset", Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(f"{material_type}.mdl"))
+        shader_prim.CreateAttribute("info:mdl:sourceAsset:subIdentifier", Sdf.ValueTypeNames.Token).Set(material_type)
+
+    if not principled_node:
+        return mat_path
+
+    if displacement and displacement_record:
         height_image, height_channel, displace_in, displace_out = displacement
-        height_path = os.path.normpath(os.path.join(textures_dir, texture_processor.texture_filename(height_image)))
-        key = os.path.normcase(height_path)
-        if key in texture_destinations:
-            raise ValueError(f'Height map conflicts with another texture export: {height_path}')
-        if not texture_processor.export_height_texture(height_image, height_path, height_channel):
-            raise RuntimeError(f'Could not export height map {height_image.name} to DDS')
-        shader_prim.CreateAttribute('inputs:height_texture', Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(get_relative_path(sublayer_path, height_path)))
+        shader_prim.CreateAttribute('inputs:height_texture', Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(get_relative_path(sublayer_path, displacement_record[1])))
         shader_prim.CreateAttribute('inputs:displace_in', Sdf.ValueTypeNames.Float).Set(displace_in)
         shader_prim.CreateAttribute('inputs:displace_out', Sdf.ValueTypeNames.Float).Set(displace_out)
-
-    if texture_tasks and texture_processor:
-        # Blender image access must stay on the main thread. Do not author
-        # queued texture paths until conversion has completed successfully.
-        results = texture_processor._convert_texture_batch_sync(texture_tasks)
-        if len(results) != len(texture_tasks) or not all(results):
-            failed = [task[0].name for task, ok in zip(texture_tasks, results) if not ok]
-            raise RuntimeError(f"Could not export textures to DDS: {', '.join(failed) or 'incomplete conversion'}")
 
     if material_type == "AperturePBR_Translucent":
         if diffuse_rel_path:

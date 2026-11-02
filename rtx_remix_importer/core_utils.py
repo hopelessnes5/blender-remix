@@ -13,6 +13,27 @@ import tempfile
 from typing import Optional, Tuple, Dict, Any, List, Callable
 from concurrent.futures import ThreadPoolExecutor
 
+
+def _require_blender_main_thread():
+    """Reject Blender datablock access from worker threads."""
+    if threading.current_thread() is not threading.main_thread():
+        raise RuntimeError('Blender image operations require the main thread')
+
+
+def _progress_on_loop(loop, callback):
+    """Forward worker progress to the event loop that started the operation."""
+    if callback is None:
+        return None
+
+    def forward(message):
+        try:
+            loop.call_soon_threadsafe(callback, message)
+        except RuntimeError:
+            # The caller closed its loop while the worker was still running.
+            pass
+
+    return forward
+
 try:
     from pxr import Usd, UsdGeom, UsdShade, Sdf, Gf, Vt
     USD_AVAILABLE = True
@@ -263,6 +284,17 @@ class TextureProcessingQueue:
             await asyncio.gather(*self.worker_tasks, return_exceptions=True)
         
         self.worker_tasks.clear()
+        # Batches which were waiting for a worker never reached its finally
+        # block. Move them out of the active set so waiters do not hang.
+        for task_id, task in list(self.active_tasks.items()):
+            task.status = 'cancelled'
+            task.result = False
+            task.error = 'Queue stopped before processing'
+            self.completed_tasks[task_id] = task
+            del self.active_tasks[task_id]
+        while not self.queue.empty():
+            self.queue.get_nowait()
+            self.queue.task_done()
     
     def shutdown(self):
         """Synchronous shutdown for cleanup."""
@@ -358,7 +390,7 @@ class TextureProcessingQueue:
         return task_ids
     
     async def wait_for_task(self, task_id: str, timeout: Optional[float] = None) -> bool:
-        """Wait for a specific task to complete."""
+        """Wait for a task and return True only when conversion succeeded."""
         start_time = asyncio.get_event_loop().time()
         
         while task_id in self.active_tasks:
@@ -367,11 +399,12 @@ class TextureProcessingQueue:
             
             await asyncio.sleep(0.1)
         
-        return task_id in self.completed_tasks
+        task = self.completed_tasks.get(task_id)
+        return bool(task and task.status == 'completed' and task.result is True)
     
     async def wait_for_all(self, task_ids: List[str], timeout: Optional[float] = None,
                           progress_callback: Optional[Callable[[str], None]] = None) -> bool:
-        """Wait for all specified tasks to complete."""
+        """Return True only when every requested task completed successfully."""
         start_time = asyncio.get_event_loop().time()
         
         while True:
@@ -391,10 +424,18 @@ class TextureProcessingQueue:
             
             await asyncio.sleep(0.5)
         
+        success = all(
+            task_id in self.completed_tasks
+            and self.completed_tasks[task_id].status == 'completed'
+            and self.completed_tasks[task_id].result is True
+            for task_id in task_ids
+        )
         if progress_callback:
-            progress_callback(f"All {len(task_ids)} texture tasks completed")
-        
-        return True
+            if success:
+                progress_callback(f"All {len(task_ids)} texture tasks completed successfully")
+            else:
+                progress_callback("One or more texture tasks failed, were cancelled, or were not found")
+        return success
     
     def get_task_status(self, task_id: str) -> Optional[Dict[str, Any]]:
         """Get the status of a specific task."""
@@ -452,8 +493,7 @@ class TextureProcessingQueue:
                     # Update all tasks in batch to processing status
                     for task in batch:
                         task.status = "processing"
-                        if task.progress_callback:
-                            task.progress_callback(f"[{worker_name}] Processing batch with {task.bl_image.name}")
+                        self._report_task_progress(task, f"[{worker_name}] Processing batch with {task.bl_image.name}")
                     
                     try:
                         # Prepare batch data for texconv
@@ -479,13 +519,18 @@ class TextureProcessingQueue:
                                 task.status = "failed"
                                 task.error = "Batch processing error"
                         
+                    except asyncio.CancelledError:
+                        for task in batch:
+                            task.status = 'cancelled'
+                            task.result = False
+                            task.error = 'Cancelled; a running conversion may still finish in the background'
+                        raise
                     except Exception as e:
                         # Mark all tasks in batch as failed
                         for task in batch:
                             task.status = "failed"
                             task.error = str(e)
-                            if task.progress_callback:
-                                task.progress_callback(f"Error processing batch with {task.bl_image.name}: {e}")
+                            self._report_task_progress(task, f"Error processing batch with {task.bl_image.name}: {e}")
                     
                     finally:
                         # Move all tasks from active to completed
@@ -494,9 +539,8 @@ class TextureProcessingQueue:
                                 del self.active_tasks[task.task_id]
                             self.completed_tasks[task.task_id] = task
                             
-                            if task.progress_callback:
-                                status_msg = "completed successfully" if task.status == "completed" else f"failed: {task.error}"
-                                task.progress_callback(f"[{worker_name}] Task {task.task_id} {status_msg}")
+                            status_msg = "completed successfully" if task.status == "completed" else f"failed: {task.error}"
+                            self._report_task_progress(task, f"[{worker_name}] Task {task.task_id} {status_msg}")
                         
                         self.queue.task_done()
             
@@ -513,26 +557,58 @@ class TextureProcessingQueue:
     def _batch_progress_callback(self, batch: List[TextureTask], message: str):
         """Forward progress messages to all tasks in a batch."""
         for task in batch:
-            if task.progress_callback:
+            self._report_task_progress(task, message)
+
+    @staticmethod
+    def _report_task_progress(task: TextureTask, message: str):
+        if task.progress_callback:
+            try:
                 task.progress_callback(message)
+            except Exception as exc:
+                print(f"Texture progress callback failed: {exc}")
 
 # --- Async Texture Processing ---
 
 class TextureProcessor:
     """Handles texture processing operations asynchronously."""
 
+    def is_source_target(self, bl_image, output_path) -> bool:
+        """Whether writing *output_path* would replace one of *bl_image*'s files.
+
+        Two paths may look different yet name the same data on disk: hard
+        links share the bytes under different names, and symlinks resolve
+        elsewhere.  The check therefore compares resolved paths and falls
+        back to ``os.path.samefile`` when both files exist (audit A02).
+        """
+        output_real = os.path.normcase(os.path.realpath(output_path))
+        for raw in (getattr(bl_image, 'filepath', ''), bl_image.get('remix_normal_source_path', '')):
+            if not raw:
+                continue
+            source_path = bpy.path.abspath(raw)
+            if os.path.normcase(os.path.realpath(source_path)) == output_real:
+                return True
+            if os.path.exists(source_path) and os.path.exists(output_path):
+                try:
+                    if os.path.samefile(source_path, output_path):
+                        return True
+                except OSError:
+                    pass
+        return False
+
     def export_height_texture(self, bl_image, output_path, channel='Color'):
         """Export the height output as linear BC4, without modifying its image."""
+        _require_blender_main_thread()
         import numpy as np
 
+        # The alias guard runs before texconv availability so a bad target
+        # fails loudly even when conversion itself is unavailable.
+        if self.is_source_target(bl_image, output_path):
+            raise ValueError('The height export would overwrite its source image')
         if not self.is_available():
             return False
         width, height = bl_image.size
         if width <= 0 or height <= 0:
             return False
-        source_path = bpy.path.abspath(bl_image.filepath) if bl_image.filepath else ''
-        if source_path and os.path.normcase(os.path.abspath(source_path)) == os.path.normcase(os.path.abspath(output_path)):
-            raise ValueError('The height export would overwrite its source image')
         pixels = np.empty(width * height * 4, dtype=np.float32)
         bl_image.pixels.foreach_get(pixels)
         pixels = pixels.reshape(height, width, 4)
@@ -601,21 +677,15 @@ class TextureProcessor:
 
     def export_normal_map(self, bl_image, output_path, mode):
         """Export normals in the requested encoding without applying color transforms."""
+        _require_blender_main_thread()
         import numpy as np
         from .nvidia_core.octahedral import convert_float_to_octahedral_in_place
         from .normal_export import MODES
 
         if mode not in MODES:
             raise ValueError(f"Unknown normal export encoding: {mode}")
-        for source in (bl_image.filepath, bl_image.get('remix_normal_source_path', '')):
-            if not source:
-                continue
-            source_path = bpy.path.abspath(source)
-            same_path = os.path.normcase(os.path.realpath(source_path)) == os.path.normcase(os.path.realpath(output_path))
-            if not same_path and os.path.exists(source_path) and os.path.exists(output_path):
-                same_path = os.path.samefile(source_path, output_path)
-            if same_path:
-                raise ValueError('The normal export would overwrite its source image')
+        if self.is_source_target(bl_image, output_path):
+            raise ValueError('The normal export would overwrite its source image')
         if not self.is_available():
             return False
         width, height = bl_image.size
@@ -729,6 +799,11 @@ class TextureProcessor:
         progress_callback: Optional[Callable[[str], None]] = None
     ) -> List[bool]:
         """Convert a batch of textures using a single texconv process.
+
+        Blender image access is a main-thread operation, so the batch is
+        prepared (saved to temporary PNGs) on the thread that owns the images
+        before any pool worker sees data; the worker only runs texconv on
+        prepared files (audit A03).
         
         Args:
             texture_batch: List of (bl_image, output_path, texture_type, dds_format) tuples
@@ -737,100 +812,122 @@ class TextureProcessor:
         Returns:
             List of success status for each texture in the batch
         """
+        _require_blender_main_thread()
         if not self.is_available() or not texture_batch:
             return [False] * len(texture_batch)
         
-        def _convert_batch():
-            return self._convert_texture_batch_sync(texture_batch, progress_callback)
+        results, groups = self._prepare_conversion_batch(texture_batch, progress_callback)
+        if not groups:
+            return results
         
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(get_thread_pool(), _convert_batch)
+        worker_progress = _progress_on_loop(loop, progress_callback)
+        return await loop.run_in_executor(
+            get_thread_pool(),
+            lambda: self._run_texconv_batch(results, groups, worker_progress)
+        )
     
-    def _convert_texture_batch_sync(
+    def _prepare_conversion_batch(
         self,
         texture_batch: List[Tuple[bpy.types.Image, str, str, Optional[str]]],
         progress_callback: Optional[Callable[[str], None]] = None
-    ) -> List[bool]:
-        """Convert a batch of textures synchronously using a single texconv process."""
-        if not texture_batch:
-            return []
+    ):
+        """Save the Blender images of a texconv batch to temporary PNG files.
+
+        Blender datablocks may only be touched from Blender's main thread
+        (audit A03), so this runs on the thread that owns the images; the
+        conversion step receives prepared files only.  Returns
+        ``(results, groups)``: *results* is a ``[bool]`` list aligned with
+        *texture_batch*, and *groups* maps ``(output_dir, texconv_format)`` to
+        ``(batch_index, input_png, output_path)`` tuples.  Ownership of every
+        prepared PNG passes to the run step, which removes them.
+        """
+        _require_blender_main_thread()
+        if progress_callback:
+            progress_callback(f"Processing batch of {len(texture_batch)} textures...")
         
         results = [False] * len(texture_batch)
-        temp_files = []
-        
-        try:
-            if progress_callback:
-                progress_callback(f"Processing batch of {len(texture_batch)} textures...")
-            
-            # First, check which textures already exist and skip them
-            textures_to_process = []
-            for i, (bl_image, output_path, texture_type, dds_format) in enumerate(texture_batch):
-                if os.path.exists(output_path):
-                    if progress_callback:
-                        progress_callback(f"Skipping existing texture: {os.path.basename(output_path)}")
-                    results[i] = True  # Mark as successful since file exists
-                else:
-                    textures_to_process.append((i, bl_image, output_path, texture_type, dds_format))
-            
-            if not textures_to_process:
+        groups: Dict[Tuple[str, str], list] = {}
+        existing_count = 0
+        for i, (bl_image, output_path, texture_type, dds_format) in enumerate(texture_batch):
+            if os.path.exists(output_path):
                 if progress_callback:
-                    progress_callback(f"All {len(texture_batch)} textures already exist - skipping batch")
-                return results
+                    progress_callback(f"Skipping existing texture: {os.path.basename(output_path)}")
+                results[i] = True  # Existing output is reused as-is
+                existing_count += 1
+                continue
             
+            if dds_format is None:
+                dds_format = self.get_recommended_format(texture_type)
+            output_dir = os.path.dirname(output_path)
+            texconv_format = self._format_map.get(dds_format, 'BC7_UNORM_SRGB')
+            
+            temp_input_path = None
+            try:
+                temp_file = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+                temp_input_path = temp_file.name
+                temp_file.close()
+                # Blender image access; must run on the owner/main thread.
+                self._save_blender_image_to_file(bl_image, temp_input_path)
+            except Exception as e:
+                if temp_input_path and os.path.exists(temp_input_path):
+                    try:
+                        os.remove(temp_input_path)
+                    except OSError:
+                        pass
+                if progress_callback:
+                    progress_callback(f"Error saving {bl_image.name}: {e}")
+                continue
+            
+            group_key = (output_dir, texconv_format)
+            groups.setdefault(group_key, []).append((i, temp_input_path, output_path))
+            
+        if existing_count and existing_count == len(texture_batch):
             if progress_callback:
-                progress_callback(f"Processing {len(textures_to_process)} new textures (skipped {len(texture_batch) - len(textures_to_process)} existing)...")
-            
-            # Group textures by format and output directory for optimal batching
-            format_groups = {}
-            for i, bl_image, output_path, texture_type, dds_format in textures_to_process:
-                if dds_format is None:
-                    dds_format = self.get_recommended_format(texture_type)
-                
-                output_dir = os.path.dirname(output_path)
-                texconv_format = self._format_map.get(dds_format, 'BC7_UNORM_SRGB')
-                
-                group_key = (output_dir, texconv_format)
-                if group_key not in format_groups:
-                    format_groups[group_key] = []
-                
-                format_groups[group_key].append((i, bl_image, output_path, texture_type, dds_format))
-            
-            # Process each format group with a single texconv call
-            for (output_dir, texconv_format), group_items in format_groups.items():
+                progress_callback(f"All {len(texture_batch)} textures already exist - skipping batch")
+        elif existing_count:
+            if progress_callback:
+                progress_callback(f"Processing {len(texture_batch) - existing_count} new textures (skipped {existing_count} existing)...")
+
+        return results, groups
+
+    def _discard_prepared_groups(self, groups) -> None:
+        """Remove prepared input PNGs that no run step consumed."""
+        for items in (groups or {}).values():
+            for _, temp_input_path, _ in items:
+                try:
+                    if os.path.exists(temp_input_path):
+                        os.remove(temp_input_path)
+                except OSError:
+                    pass
+
+    def _run_texconv_batch(self, results, groups, progress_callback: Optional[Callable[[str], None]] = None) -> List[bool]:
+        """Run one texconv invocation per group of prepared input files.
+
+        Blender data is never touched here, so this may run in any thread
+        (audit A03).  Each converted file lands at its destination via
+        ``os.replace``, and every prepared PNG is removed in ``finally``.
+        """
+        prepared_pngs = [item[1] for items in groups.values() for item in items]
+        try:
+            for (output_dir, texconv_format), group_items in groups.items():
                 if progress_callback:
                     progress_callback(f"Converting {len(group_items)} textures with format {texconv_format}...")
                 
-                # Create temporary input files for this group
-                group_temp_files = []
+                group_temp_files = [item[1] for item in group_items]
                 temp_to_final_mapping = {}
+                for i, temp_input_path, output_path in group_items:
+                    # Map temp file to final output
+                    temp_base = os.path.splitext(os.path.basename(temp_input_path))[0]
+                    temp_output_path = os.path.join(output_dir, f"{temp_base}.dds")
+                    temp_to_final_mapping[temp_output_path] = (i, output_path)
                 
-                for i, bl_image, output_path, texture_type, dds_format in group_items:
-                    # Create temporary PNG file
-                    temp_file = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
-                    temp_input_path = temp_file.name
-                    temp_file.close()
-                    
-                    try:
-                        # Save Blender image to temporary file
-                        self._save_blender_image_to_file(bl_image, temp_input_path)
-                        group_temp_files.append(temp_input_path)
-                        temp_files.append(temp_input_path)
-                        
-                        # Map temp file to final output
-                        temp_base = os.path.splitext(os.path.basename(temp_input_path))[0]
-                        temp_output_path = os.path.join(output_dir, f"{temp_base}.dds")
-                        temp_to_final_mapping[temp_output_path] = (i, output_path)
-                        
-                    except Exception as e:
-                        if progress_callback:
-                            progress_callback(f"Error saving {bl_image.name}: {e}")
-                        continue
-                
-                if not group_temp_files:
+                try:
+                    os.makedirs(output_dir, exist_ok=True)
+                except OSError as e:
+                    if progress_callback:
+                        progress_callback(f"Error creating output directory {output_dir}: {e}")
                     continue
-                
-                # Ensure output directory exists
-                os.makedirs(output_dir, exist_ok=True)
                 
                 # Run texconv on the entire batch
                 cmd = [
@@ -853,48 +950,65 @@ class TextureProcessor:
                         shell=False,
                         timeout=120  # 2 minute timeout for batch
                     )
-                    
-                    if result.returncode == 0:
-                        # Check which files were successfully converted and rename them
-                        for temp_output_path, (batch_index, final_output_path) in temp_to_final_mapping.items():
-                            if os.path.exists(temp_output_path):
-                                try:
-                                    if temp_output_path != final_output_path:
-                                        os.replace(temp_output_path, final_output_path)
-                                    results[batch_index] = True
-                                    if progress_callback:
-                                        progress_callback(f"Converted: {os.path.basename(final_output_path)}")
-                                except Exception as e:
-                                    if progress_callback:
-                                        progress_callback(f"Error moving {temp_output_path}: {e}")
-                            else:
-                                if progress_callback:
-                                    progress_callback(f"Missing output: {temp_output_path}")
-                    else:
-                        if progress_callback:
-                            progress_callback(f"texconv batch failed: {result.stderr}")
-                
                 except subprocess.TimeoutExpired:
                     if progress_callback:
                         progress_callback("texconv batch timed out")
+                    continue
                 except Exception as e:
                     if progress_callback:
                         progress_callback(f"Error running texconv batch: {e}")
-        
+                    continue
+
+                if result.returncode != 0:
+                    if progress_callback:
+                        progress_callback(f"texconv batch failed: {result.stderr}")
+                    continue
+
+                # Check which files were successfully converted and rename them
+                for temp_output_path, (batch_index, final_output_path) in temp_to_final_mapping.items():
+                    if os.path.exists(temp_output_path):
+                        try:
+                            if temp_output_path != final_output_path:
+                                os.replace(temp_output_path, final_output_path)
+                            results[batch_index] = True
+                            if progress_callback:
+                                progress_callback(f"Converted: {os.path.basename(final_output_path)}")
+                        except Exception as e:
+                            if progress_callback:
+                                progress_callback(f"Error moving {temp_output_path}: {e}")
+                    else:
+                        if progress_callback:
+                            progress_callback(f"Missing output: {temp_output_path}")
+
+            successful_count = sum(results)
+            if progress_callback:
+                progress_callback(f"Batch complete: {successful_count}/{len(results)} successful")
+            return results
         finally:
             # Cleanup temporary files
-            for temp_file in temp_files:
+            for temp_file in prepared_pngs:
                 try:
                     if os.path.exists(temp_file):
                         os.remove(temp_file)
-                except:
+                except OSError:
                     pass
+
+    def _convert_texture_batch_sync(
+        self,
+        texture_batch: List[Tuple[bpy.types.Image, str, str, Optional[str]]],
+        progress_callback: Optional[Callable[[str], None]] = None
+    ) -> List[bool]:
+        """Convert a batch of textures on the calling thread.
+
+        Blender image saving happens in ``_prepare_conversion_batch`` (main
+        thread, audit A03); ``_run_texconv_batch`` only invokes texconv on the
+        prepared files.
+        """
+        if not texture_batch:
+            return []
         
-        successful_count = sum(results)
-        if progress_callback:
-            progress_callback(f"Batch complete: {successful_count}/{len(texture_batch)} successful")
-        
-        return results
+        results, groups = self._prepare_conversion_batch(texture_batch, progress_callback)
+        return self._run_texconv_batch(results, groups, progress_callback)
     
     # --- Queue Integration Methods ---
     
@@ -1017,7 +1131,13 @@ class TextureProcessor:
         dds_format: Optional[str] = None,
         progress_callback: Optional[Callable[[str], None]] = None
     ) -> bool:
-        """Convert a Blender image to DDS format asynchronously."""
+        """Convert a Blender image to DDS format asynchronously.
+
+        The Blender image is saved to a temporary PNG on the thread that owns
+        it before any pool worker runs texconv on the prepared file
+        (audit A03).
+        """
+        _require_blender_main_thread()
         if not self.is_available():
             if progress_callback:
                 progress_callback("texconv.exe not found")
@@ -1027,11 +1147,21 @@ class TextureProcessor:
         if dds_format is None:
             dds_format = self.get_recommended_format(texture_type)
         
-        def _convert():
-            return self._convert_png_to_dds_sync(bl_image, output_path, dds_format, progress_callback)
-        
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(get_thread_pool(), _convert)
+        try:
+            temp_input_path = self._prepare_png_source(bl_image, progress_callback)
+            loop = asyncio.get_event_loop()
+            worker_progress = _progress_on_loop(loop, progress_callback)
+            return await loop.run_in_executor(
+                get_thread_pool(),
+                lambda: self._run_png_to_dds(temp_input_path, output_path, dds_format, worker_progress)
+            )
+        except Exception as e:
+            import traceback
+            error_msg = f"Error: {e}\n{traceback.format_exc()}"
+            print(f"[TextureProcessor] Conversion failed for {bl_image.name}: {error_msg}")
+            if progress_callback:
+                progress_callback(f"Error: {e}")
+            return False
     
     def convert_png_to_dds_sync(
         self, 
@@ -1053,96 +1183,123 @@ class TextureProcessor:
         
         return self._convert_png_to_dds_sync(bl_image, output_path, dds_format, progress_callback)
     
+    def _prepare_png_source(
+        self,
+        bl_image: bpy.types.Image,
+        progress_callback: Optional[Callable[[str], None]] = None
+    ) -> str:
+        """Save a Blender image to a temporary PNG for a later texconv run.
+
+        Blender datablocks may only be touched from Blender's main thread
+        (audit A03); the conversion step receives the prepared file only.
+        Raises on failure — callers log it through *progress_callback*.
+        """
+        _require_blender_main_thread()
+        if progress_callback:
+            progress_callback(f"Converting {bl_image.name} to DDS...")
+
+        # Create temporary PNG file
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temp_file:
+            temp_input_path = temp_file.name
+
+        # Save Blender image to temporary file
+        self._save_blender_image_to_file(bl_image, temp_input_path)
+        return temp_input_path
+
+    def _run_png_to_dds(
+        self,
+        temp_input_path: str,
+        output_path: str,
+        dds_format: str,
+        progress_callback: Optional[Callable[[str], None]] = None
+    ) -> bool:
+        """Convert a prepared PNG into a DDS at *output_path* via texconv.
+
+        No Blender data access here, so this may run in any thread (audit
+        A03).  The prepared input file is removed in ``finally``.
+        """
+        try:
+            # Create output directory
+            output_dir = os.path.dirname(output_path)
+            os.makedirs(output_dir, exist_ok=True)
+            
+            if progress_callback:
+                progress_callback("Running texconv...")
+            
+            # Convert using texconv
+            texconv_format = self._format_map.get(dds_format, 'BC7_UNORM_SRGB')
+            cmd = [
+                self.texconv_path,
+                temp_input_path,
+                "-o", output_dir,
+                "-ft", "dds",
+                "-f", texconv_format,
+                "-m", "0",  # Generate all mipmaps
+                "-y",  # Overwrite existing
+                "-nologo",
+            ]
+
+            # Add -sepalpha for formats that support alpha channels
+            # This is critical for BC7, BC3, BC2 to preserve alpha during mipmap generation
+            formats_with_alpha = ['BC7_UNORM', 'BC7_UNORM_SRGB', 'BC3_UNORM', 'BC3_UNORM_SRGB',
+                                 'BC2_UNORM', 'BC2_UNORM_SRGB', 'BC1_UNORM', 'BC1_UNORM_SRGB']
+            if texconv_format in formats_with_alpha:
+                cmd.append("-sepalpha")  # Resize/generate mips alpha channel separately from color channels
+                if progress_callback:
+                    progress_callback(f"Using separate alpha processing for {texconv_format}")
+
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=False,
+                shell=False,
+                timeout=60  # 60 second timeout
+            )
+
+            if result.returncode != 0:
+                if progress_callback:
+                    progress_callback(f"texconv failed: {result.stderr}")
+                return False
+
+            # Handle texconv output file naming
+            temp_output_base = os.path.splitext(os.path.basename(temp_input_path))[0]
+            temp_dds_filename = f"{temp_output_base}.dds"
+            temp_dds_path = os.path.join(output_dir, temp_dds_filename)
+
+            if not os.path.exists(temp_dds_path):
+                if progress_callback:
+                    progress_callback("texconv output file not found")
+                return False
+
+            # Rename to final output path
+            if temp_dds_path != output_path:
+                os.replace(temp_dds_path, output_path)
+
+            if progress_callback:
+                progress_callback("Conversion complete")
+
+            return True
+
+        finally:
+            # Cleanup temporary file
+            if os.path.exists(temp_input_path):
+                try:
+                    os.remove(temp_input_path)
+                except OSError:
+                    pass
+
     def _convert_png_to_dds_sync(
-        self, 
-        bl_image: bpy.types.Image, 
-        output_path: str, 
+        self,
+        bl_image: bpy.types.Image,
+        output_path: str,
         dds_format: str,
         progress_callback: Optional[Callable[[str], None]] = None
     ) -> bool:
         """Internal PNG to DDS conversion implementation."""
         try:
-            if progress_callback:
-                progress_callback(f"Converting {bl_image.name} to DDS...")
-            
-            # Create output directory
-            output_dir = os.path.dirname(output_path)
-            os.makedirs(output_dir, exist_ok=True)
-            
-            # Create temporary PNG file
-            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temp_file:
-                temp_input_path = temp_file.name
-            
-            try:
-                # Save Blender image to temporary file
-                self._save_blender_image_to_file(bl_image, temp_input_path)
-                
-                if progress_callback:
-                    progress_callback("Running texconv...")
-                
-                # Convert using texconv
-                texconv_format = self._format_map.get(dds_format, 'BC7_UNORM_SRGB')
-                cmd = [
-                    self.texconv_path,
-                    temp_input_path,
-                    "-o", output_dir,
-                    "-ft", "dds",
-                    "-f", texconv_format,
-                    "-m", "0",  # Generate all mipmaps
-                    "-y",  # Overwrite existing
-                    "-nologo",
-                ]
-                
-                # Add -sepalpha for formats that support alpha channels
-                # This is critical for BC7, BC3, BC2 to preserve alpha during mipmap generation
-                formats_with_alpha = ['BC7_UNORM', 'BC7_UNORM_SRGB', 'BC3_UNORM', 'BC3_UNORM_SRGB', 
-                                     'BC2_UNORM', 'BC2_UNORM_SRGB', 'BC1_UNORM', 'BC1_UNORM_SRGB']
-                if texconv_format in formats_with_alpha:
-                    cmd.append("-sepalpha")  # Resize/generate mips alpha channel separately from color channels
-                    if progress_callback:
-                        progress_callback(f"Using separate alpha processing for {texconv_format}")
-                
-                result = subprocess.run(
-                    cmd, 
-                    capture_output=True, 
-                    text=True, 
-                    check=False, 
-                    shell=False,
-                    timeout=60  # 60 second timeout
-                )
-                
-                if result.returncode != 0:
-                    if progress_callback:
-                        progress_callback(f"texconv failed: {result.stderr}")
-                    return False
-                
-                # Handle texconv output file naming
-                temp_output_base = os.path.splitext(os.path.basename(temp_input_path))[0]
-                temp_dds_filename = f"{temp_output_base}.dds"
-                temp_dds_path = os.path.join(output_dir, temp_dds_filename)
-                
-                if not os.path.exists(temp_dds_path):
-                    if progress_callback:
-                        progress_callback("texconv output file not found")
-                    return False
-                
-                # Rename to final output path
-                if temp_dds_path != output_path:
-                    os.replace(temp_dds_path, output_path)
-                
-                if progress_callback:
-                    progress_callback("Conversion complete")
-                
-                return True
-                
-            finally:
-                # Cleanup temporary file
-                if os.path.exists(temp_input_path):
-                    try:
-                        os.remove(temp_input_path)
-                    except:
-                        pass
-                        
+            temp_input_path = self._prepare_png_source(bl_image, progress_callback)
+            return self._run_png_to_dds(temp_input_path, output_path, dds_format, progress_callback)
         except Exception as e:
             import traceback
             error_msg = f"Error: {e}\n{traceback.format_exc()}"
@@ -1153,6 +1310,7 @@ class TextureProcessor:
     
     def _save_blender_image_to_file(self, bl_image: bpy.types.Image, filepath: str):
         """Save a Blender image to a file with alpha channel preserved."""
+        _require_blender_main_thread()
         # Store original file format settings
         orig_file_format = bl_image.file_format
         
@@ -1272,10 +1430,12 @@ class TextureProcessor:
                 progress_callback("texconv.exe not found")
             return False
 
-        def _convert():
-            return self.convert_dds_to_png_sync(dds_path, output_path, progress_callback)
-
         loop = asyncio.get_event_loop()
+        worker_progress = _progress_on_loop(loop, progress_callback)
+
+        def _convert():
+            return self.convert_dds_to_png_sync(dds_path, output_path, worker_progress)
+
         return await loop.run_in_executor(get_thread_pool(), _convert)
 
     def batch_convert_dds_to_png(
@@ -1375,84 +1535,113 @@ class BackgroundTextureProcessor:
         self.timer_registered = False
         
     def start_background_job(self, textures: List[Tuple], progress_callback=None, completion_callback=None):
-        """Start a background texture processing job."""
+        """Start a background texture processing job.
+
+        Blender images may only be touched from the thread that calls this
+        (the main thread), so every image is saved to a temporary PNG right
+        here, before the worker starts; the worker only receives prepared
+        files (audit A03).
+        """
+        _require_blender_main_thread()
         self.job_counter += 1
         job_id = f"texture_job_{self.job_counter}"
-        
+
         job_info = {
             'id': job_id,
-            'textures': textures,
             'progress_callback': progress_callback,
             'completion_callback': completion_callback,
             'status': 'queued',
             'progress': 0,
             'total': len(textures),
             'results': [],
+            'prepared_results': [],
+            'prepared_groups': {},
             'thread': None,
             'start_time': time.time()
         }
-        
+
         self.active_jobs[job_id] = job_info
-        
-        # Start the processing thread
-        import threading
-        thread = threading.Thread(target=self._process_job_thread, args=(job_id,))
-        thread.daemon = True
-        job_info['thread'] = thread
-        thread.start()
-        
-        # Register timer if not already registered
+
+        texture_processor = get_texture_processor()
+        if not texture_processor.is_available():
+            job_info['status'] = 'failed'
+            job_info['error'] = 'texconv.exe not available'
+        else:
+            results, groups = texture_processor._prepare_conversion_batch(
+                textures,
+                progress_callback=lambda msg: self._update_progress(job_id, msg)
+            )
+            job_info['prepared_results'] = results
+            job_info['prepared_groups'] = groups
+            job_info['progress'] = sum(1 for ok in results if ok)
+
         if not self.timer_registered:
             bpy.app.timers.register(self._timer_callback, first_interval=0.1, persistent=True)
             self.timer_registered = True
-            
+
+        if job_info['status'] != 'failed':
+            # Start the processing thread
+            import threading
+            thread = threading.Thread(target=self._process_job_thread, args=(job_id,))
+            thread.daemon = True
+            job_info['thread'] = thread
+            thread.start()
+
         print(f"Started background texture job: {job_id} with {len(textures)} textures")
         return job_id
-    
+
     def _process_job_thread(self, job_id):
-        """Process textures in a background thread."""
+        """Run texconv over prepared files in a background thread.
+
+        Blender data access is forbidden here (audit A03): the job only
+        receives the file groups prepared in ``start_background_job``.
+        """
         job_info = self.active_jobs.get(job_id)
         if not job_info:
             return
-            
+
         try:
             job_info['status'] = 'processing'
             texture_processor = get_texture_processor()
-            
-            if not texture_processor.is_available():
-                job_info['status'] = 'failed'
-                job_info['error'] = 'texconv.exe not available'
-                return
-            
-            # Process textures in batches
-            textures = job_info['textures']
-            batch_size = 4  # Process 4 textures per batch
-            results = []
-            
-            for i in range(0, len(textures), batch_size):
-                batch = textures[i:i + batch_size]
-                
-                # Process this batch
-                batch_results = texture_processor._convert_texture_batch_sync(
-                    batch,
-                    progress_callback=lambda msg: self._update_progress(job_id, msg)
-                )
-                
-                results.extend(batch_results)
-                job_info['progress'] = len(results)
-                
-                # Small delay to prevent overwhelming the system
-                time.sleep(0.1)
-                
+
+            results = job_info['prepared_results']
+            groups = job_info['prepared_groups']
+
+            for group_key in list(groups.keys()):
                 # Check if job was cancelled
                 if job_info.get('cancelled', False):
+                    texture_processor._discard_prepared_groups(groups)
+                    groups.clear()
                     job_info['status'] = 'cancelled'
                     return
-            
+
+                group_items = groups.pop(group_key)
+                texture_processor._run_texconv_batch(
+                    results,
+                    {group_key: group_items},
+                    progress_callback=lambda msg: self._update_progress(job_id, msg)
+                )
+                job_info['progress'] = sum(1 for ok in results if ok)
+
+                # Small delay to prevent overwhelming the system
+                time.sleep(0.1)
+
+            groups.clear()
             job_info['results'] = results
-            job_info['status'] = 'completed'
-            
+
+            if all(results):
+                job_info['status'] = 'completed'
+            else:
+                # A texture error must never read as success (audit A04).
+                failed = sum(1 for ok in results if not ok)
+                job_info['status'] = 'failed'
+                job_info['error'] = f'{failed} of {len(results)} texture conversions failed'
+
         except Exception as e:
+            # Discard prepared files that no run step consumed.
+            get_texture_processor()._discard_prepared_groups(job_info.get('prepared_groups') or {})
+            job_info['prepared_groups'] = {}
+            job_info['results'] = list(job_info['prepared_results'])
             job_info['status'] = 'failed'
             job_info['error'] = str(e)
             print(f"Background job {job_id} failed: {e}")
@@ -1507,16 +1696,18 @@ class BackgroundTextureProcessor:
                 'status': job_info['status'],
                 'progress': job_info['progress'],
                 'total': job_info['total'],
-                'elapsed': time.time() - job_info['start_time']
+                'elapsed': time.time() - job_info['start_time'],
+                'error': job_info.get('error')
             }
         elif job_id in self.completed_jobs:
             job_info = self.completed_jobs[job_id]
             return {
                 'status': job_info['status'],
-                'progress': job_info['total'],
+                'progress': job_info['progress'],
                 'total': job_info['total'],
                 'elapsed': time.time() - job_info['start_time'],
-                'results': job_info.get('results', [])
+                'results': job_info.get('results', []),
+                'error': job_info.get('error')
             }
         else:
             return None
