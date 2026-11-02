@@ -26,6 +26,10 @@ class TestPrincipledMaterials(unittest.TestCase):
     def input(self, name, value_type, value):
         self.shader.CreateInput(name, value_type).Set(value)
 
+    def test_import_defaults_to_full_roughness(self):
+        material_utils.process_pbr(self.shader, self.material, self.node, '')
+        self.assertAlmostEqual(self.node.inputs['Roughness'].default_value, 1.0)
+
     def test_imports_constants_and_gates_opacity(self):
         self.input('diffuse_color_constant', Sdf.ValueTypeNames.Color3f, Gf.Vec3f(.2, .3, .4))
         self.input('metallic_constant', Sdf.ValueTypeNames.Float, .7)

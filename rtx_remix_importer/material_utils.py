@@ -116,6 +116,7 @@ def _create_principled_material(name, is_translucent=False):
 
     bsdf = nodes.new(type='ShaderNodeBsdfPrincipled')
     bsdf.location = (0, 0)
+    bsdf.inputs['Roughness'].default_value = 1.0
     links.new(bsdf.outputs['BSDF'], output_node.inputs['Surface'])
 
     if is_translucent:
