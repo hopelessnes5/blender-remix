@@ -20,6 +20,7 @@ turns the plain data below into Blender datablocks.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 from pxr import Gf, Usd, UsdGeom
 
@@ -77,8 +78,10 @@ class InterpolatedAttribute:
             value_index = point_index
         elif self.interpolation == UsdGeom.Tokens.uniform:
             value_index = face_index
-        else:  # constant
+        elif self.interpolation == UsdGeom.Tokens.constant:
             value_index = 0
+        else:
+            return None
 
         if self.indices is not None:
             if not 0 <= value_index < len(self.indices):
@@ -151,7 +154,15 @@ class MeshData:
             value = attribute.resolve(corner, point, face, self.original_corner_count)
             if value is None:
                 return None
-            result.append(tuple(float(component) for component in value[:width]))
+            try:
+                if len(value) < width:
+                    return None
+                components = tuple(float(component) for component in value[:width])
+            except (TypeError, ValueError, OverflowError):
+                return None
+            if len(components) != width or not all(math.isfinite(component) for component in components):
+                return None
+            result.append(components)
         return result
 
     def corner_uvs(self) -> list[tuple[float, float]] | None:

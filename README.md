@@ -12,11 +12,11 @@ Not affiliated with NVIDIA. RTX Remix, the RTX Remix Toolkit and AperturePBR mat
 
 ## Status
 
-[![Toolkit parity: 38%](docs/badge-parity.svg)](docs/PARITY.md) [![Tests: 277/277](docs/badge-tests.svg)](docs/PARITY.md#tests)
+[![Toolkit parity: 38%](docs/badge-parity.svg)](docs/PARITY.md) [![Tests: 305/305](docs/badge-tests.svg)](docs/PARITY.md#tests)
 
 [![Feature parity progress map](docs/progress.svg)](docs/PARITY.md)
 
-17 of 45 tracked Toolkit features are fully implemented, 13 are partial. Snapshot: 1 November 2026. Tested on Blender 4.5.5 LTS and 5.1.2, 277/277 tests. Full tables and unverified items: [docs/PARITY.md](docs/PARITY.md).
+17 of 45 tracked Toolkit features are fully implemented, 13 are partial. Snapshot: 1 November 2026. Tested on Blender 4.5.5 LTS and 5.1.2, 305/305 tests. Full tables and unverified items: [docs/PARITY.md](docs/PARITY.md).
 
 ## How it works
 
@@ -52,6 +52,7 @@ In `Export Settings > Normal Encoding`, choose conversion from OpenGL RGB to oct
 - `Apply Mod File Changes` is experimental.
 - Lights exported without a target mesh go to `/RootNode/remix_assets`, not `/RootNode/lights/light_<HASH>`.
 - Albedo textures with alpha may not round-trip; some DDS files appear purple — use `Captures > Fix Broken Textures`.
+- Geometry export splits meshes with multiple materials into separate USD meshes. Direct import of a prototype containing multiple meshes is not yet supported and stops with an error to avoid losing parts; material-only replacement still uses the first slot.
 - Materials missing from a capture are handled; legacy Aperture node groups written by old releases render as-is, new materials always build on a standard Principled BSDF.
 - Only one reference per mesh prim is supported; assets cannot be combined into one mesh.
 

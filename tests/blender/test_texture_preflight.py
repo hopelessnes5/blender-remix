@@ -27,6 +27,14 @@ class TexturePreflightTests(unittest.TestCase):
         self.materials = []
         self.images = []
         self.addCleanup(self.cleanup_data)
+        original = export._used_mesh_materials
+        def used(obj, context):
+            if isinstance(obj, types.SimpleNamespace):
+                return [obj.material_slots[0].material]
+            return original(obj, bpy.context)
+        patcher = mock.patch.object(export, '_used_mesh_materials', side_effect=used)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def cleanup_data(self):
         for material in self.materials:
@@ -59,7 +67,8 @@ class TexturePreflightTests(unittest.TestCase):
         context = types.SimpleNamespace(scene=scene)
         operator = mock.Mock()
         target = os.path.join(self.temp.name, 'target.usda')
-        with mock.patch.object(export, 'ensure_mdl_files') as mdl:
+        with mock.patch.object(export, 'get_mesh_name_from_object', side_effect=lambda obj: obj.material_slots[0].material.name), \
+             mock.patch.object(export, 'ensure_mdl_files') as mdl:
             result = export._export_remix_objects(operator, context, target, [self.obj(a), self.obj(b)])
         self.assertEqual(result, (False, 0, 0))
         self.assertIn('same export path', str(operator.report.call_args))
@@ -110,6 +119,7 @@ class TexturePreflightTests(unittest.TestCase):
         a, _ = self.material('instance.png')
         b, _ = self.material('instance.jpg')
         mesh = bpy.data.meshes.new('PreflightSharedMesh')
+        mesh.from_pydata([(0,0,0), (1,0,0), (0,1,0)], [], [(0,1,2)])
         self.addCleanup(bpy.data.meshes.remove, mesh, do_unlink=True)
         mesh.materials.append(a)
         objects = [bpy.data.objects.new('PreflightInstance', mesh) for _ in range(2)]

@@ -162,8 +162,8 @@ def import_rtx_remix_usd_with_materials(
             raise USDImportError(
                 f"Direct import failed for '{usd_file_path}' and rollback failed: {rollback_exc}"
             ) from exc
-        from .nvidia_core.errors import InvalidTopologyError
-        if isinstance(exc, InvalidTopologyError):
+        from .nvidia_core.errors import InvalidTopologyError, UnsupportedGeometryError
+        if isinstance(exc, (InvalidTopologyError, UnsupportedGeometryError)):
             raise USDImportError(f"Direct import failed for '{usd_file_path}': {exc}") from exc
         if backend == BACKEND_DIRECT_ONLY:
             raise USDImportError(f"Direct import failed for '{usd_file_path}': {exc}") from exc

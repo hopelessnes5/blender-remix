@@ -19,6 +19,7 @@ from ..legacy_import_core import get_remix_metadata, setup_blender_collections
 from ..light_utils import import_lights_from_usd
 from ..nvidia_core import constants, geometry, prim_utils
 from ..nvidia_core.composition import ProjectComposition
+from ..nvidia_core.errors import UnsupportedGeometryError
 from .materials import assign_material, resolve_bound_material_path
 from .mesh import create_mesh_datablock
 
@@ -112,6 +113,9 @@ def _build_prototypes(stage: Usd.Stage, registry: _MeshRegistry, normal_mode: st
         if not (prototype_prim.IsA(UsdGeom.Xformable) or prototype_prim.IsA(UsdGeom.Mesh)):
             continue
         prototype_path = str(prototype_prim.GetPath())
+        mesh_prims = [prim for prim in Usd.PrimRange(prototype_prim) if prim.IsA(UsdGeom.Mesh)]
+        if len(mesh_prims) > 1:
+            raise UnsupportedGeometryError(f"Multiple meshes under {prototype_path} are not supported; import cancelled to avoid data loss")
         mesh_prim = geometry.find_mesh_prim(prototype_prim)
         if mesh_prim is None:
             if prim_utils.is_empty_mesh_prim(prototype_prim):

@@ -534,10 +534,39 @@ def create_asset_default_material(stage, mesh_prim_path, mesh_name):
     return mat_path
 
 
+def _used_mesh_materials(obj, context):
+    """Return effective materials in first-use order from evaluated faces."""
+    depsgraph = context.evaluated_depsgraph_get()
+    evaluated = obj.evaluated_get(depsgraph)
+    mesh = evaluated.to_mesh()
+    try:
+        slots = evaluated.material_slots
+        materials = []
+        for polygon in mesh.polygons:
+            index = polygon.material_index
+            material = slots[index].material if index < len(slots) else None
+            if material:
+                material = material.original
+            if material not in materials:
+                materials.append(material)
+        return materials
+    finally:
+        to_mesh_clear_compatible(evaluated)
+
+
 def write_ingested_mesh_asset(stage, obj, context, mesh_name_sanitized, points_matrix, bl_mat,
                               inherit_material, project_root, mesh_file_path, up_axis,
                               report_fn=print):
     """Restore mesh-stage edits and staged textures if ingest fails."""
+    if not inherit_material:
+        plan = {}
+        materials = _used_mesh_materials(obj, context)
+        if not obj.material_slots and bl_mat:
+            materials = [bl_mat]
+        for material in materials:
+            if material:
+                _export_material_impl(material, None, project_root, mesh_file_path, obj=obj,
+                                      override_material_path='/RootNode/Looks/preflight', texture_plan=plan)
     layer = stage.GetRootLayer()
     write_guard.ensure_writable_layer(layer)
     write_guard.ensure_editable_edit_target(stage)
@@ -599,13 +628,6 @@ def _write_ingested_mesh_asset_impl(stage, obj, context, mesh_name_sanitized, po
 
     stage.DefinePrim(looks_path, "Scope")
 
-    mesh_prim = stage.DefinePrim(mesh_prim_path, "Mesh")
-    if not mesh_prim:
-        report_fn({'ERROR'}, "Failed to define mesh prim %s" % mesh_prim_path)
-        return None
-    mesh_api = UsdGeom.Mesh(mesh_prim)
-    UsdShade.MaterialBindingAPI.Apply(mesh_prim)
-
     try:
         depsgraph = context.evaluated_depsgraph_get()
         eval_obj = obj.evaluated_get(depsgraph)
@@ -620,69 +642,67 @@ def _write_ingested_mesh_asset_impl(stage, obj, context, mesh_name_sanitized, po
             return None
 
         normal_matrix = points_matrix.to_3x3().inverted_safe().transposed()
-
-        points = []
-        for vertex in mesh_data.vertices:
-            co = points_matrix @ vertex.co
-            points.append((co[0], co[1], co[2]))
-        mesh_api.CreatePointsAttr().Set(Vt.Vec3fArray(points))
-
-        face_vertex_counts = [len(poly.vertices) for poly in mesh_data.polygons]
-        face_vertex_indices = [index for poly in mesh_data.polygons for index in poly.vertices]
-        mesh_api.CreateFaceVertexCountsAttr().Set(Vt.IntArray(face_vertex_counts))
-        mesh_api.CreateFaceVertexIndicesAttr().Set(Vt.IntArray(face_vertex_indices))
-        mesh_api.CreateOrientationAttr().Set(UsdGeom.Tokens.rightHanded)
-        mesh_api.CreateDoubleSidedAttr().Set(False)
-        # Without an authored subdivisionScheme USD falls back to catmullClark
-        # and the replacement geometry gets subdivided in any conforming consumer.
-        mesh_api.CreateSubdivisionSchemeAttr().Set(UsdGeom.Tokens.none)
-        if points:
-            extent_min = Gf.Vec3f(*[min(p[axis] for p in points) for axis in range(3)])
-            extent_max = Gf.Vec3f(*[max(p[axis] for p in points) for axis in range(3)])
-            mesh_api.CreateExtentAttr().Set(Vt.Vec3fArray([extent_min, extent_max]))
-
-        if mesh_data.uv_layers and mesh_data.uv_layers.active:
-            active_uv_layer = mesh_data.uv_layers.active
-            uv_values = []
-            for loop_index in range(len(mesh_data.loops)):
-                uv = active_uv_layer.data[loop_index].uv
-                uv_values.append((uv[0], uv[1]))
-            if uv_values:
-                uv_primvar = UsdGeom.PrimvarsAPI(mesh_prim).CreatePrimvar(
-                    "st", Sdf.ValueTypeNames.TexCoord2fArray, UsdGeom.Tokens.faceVarying
-                )
-                uv_primvar.Set(Vt.Vec2fArray(uv_values))
-
         corner_normals = get_corner_normals_compatible(mesh_data)
-        if corner_normals:
-            normal_values = []
-            for normal in corner_normals:
-                n = normal_matrix @ mathutils.Vector((normal[0], normal[1], normal[2]))
-                normal_values.append((n[0], n[1], n[2]))
-            mesh_api.CreateNormalsAttr().Set(Vt.Vec3fArray(normal_values))
-            mesh_api.SetNormalsInterpolation(UsdGeom.Tokens.faceVarying)
-        else:
-            print("  Could not read corner normals - Remix will compute them.")
+        slots = eval_obj.material_slots
+        groups = []
+        for poly in mesh_data.polygons:
+            index = poly.material_index
+            material = None if inherit_material else (slots[index].material if index < len(slots) else (bl_mat if not slots else None))
+            if material:
+                material = material.original
+            group = next((group for group in groups if group[0] == material), None)
+            if group is None:
+                group = (material, [])
+                groups.append(group)
+            group[1].append(poly)
 
         material_path = None
-        if inherit_material:
-            print("  [Inherit Parent Material] no material is written into the asset")
-        else:
-            if bl_mat is not None:
-                material_path = export_material(
-                    bl_mat,
-                    stage,
-                    project_root,
-                    mesh_file_path,
-                    obj=obj,
-                    material_scope_path=looks_path,
-                    bind_prim_path=mesh_prim_path,
-                    bind_strength="weakerThanDescendants",
-                    material_name="%s__" % mesh_name_sanitized,
-                    _texture_transaction=texture_transaction,
-                )
-            if not material_path:
-                material_path = create_asset_default_material(stage, mesh_prim_path, mesh_name_sanitized)
+        first_material_path = None
+        for group_index, (material, polygons) in enumerate(groups):
+            part_name = mesh_name_sanitized if len(groups) == 1 else f'{mesh_name_sanitized}_part_{group_index + 1}'
+            part_path = xforms_path.AppendPath(part_name)
+            if group_index == 0:
+                mesh_prim_path = part_path
+            mesh_prim = stage.DefinePrim(part_path, 'Mesh')
+            mesh_api = UsdGeom.Mesh(mesh_prim)
+            UsdShade.MaterialBindingAPI.Apply(mesh_prim)
+            vertex_indices = list(range(len(mesh_data.vertices))) if len(groups) == 1 else list(dict.fromkeys(index for poly in polygons for index in poly.vertices))
+            remap = {old: new for new, old in enumerate(vertex_indices)}
+            points = []
+            for index in vertex_indices:
+                co = points_matrix @ mesh_data.vertices[index].co
+                points.append((co[0], co[1], co[2]))
+            mesh_api.CreatePointsAttr().Set(Vt.Vec3fArray(points))
+            mesh_api.CreateFaceVertexCountsAttr().Set(Vt.IntArray([len(poly.vertices) for poly in polygons]))
+            mesh_api.CreateFaceVertexIndicesAttr().Set(Vt.IntArray([remap[index] for poly in polygons for index in poly.vertices]))
+            mesh_api.CreateOrientationAttr().Set(UsdGeom.Tokens.rightHanded)
+            mesh_api.CreateDoubleSidedAttr().Set(False)
+            mesh_api.CreateSubdivisionSchemeAttr().Set(UsdGeom.Tokens.none)
+            mesh_api.CreateExtentAttr().Set(Vt.Vec3fArray([Gf.Vec3f(*[min(p[a] for p in points) for a in range(3)]), Gf.Vec3f(*[max(p[a] for p in points) for a in range(3)])]))
+            loops = [index for poly in polygons for index in poly.loop_indices]
+            if mesh_data.uv_layers and mesh_data.uv_layers.active:
+                uvs = mesh_data.uv_layers.active.data
+                values = [(uvs[index].uv[0], uvs[index].uv[1]) for index in loops]
+                UsdGeom.PrimvarsAPI(mesh_prim).CreatePrimvar('st', Sdf.ValueTypeNames.TexCoord2fArray, UsdGeom.Tokens.faceVarying).Set(Vt.Vec2fArray(values))
+            if corner_normals:
+                normals = []
+                for index in loops:
+                    normal = normal_matrix @ mathutils.Vector(corner_normals[index])
+                    normals.append((normal[0], normal[1], normal[2]))
+                mesh_api.CreateNormalsAttr().Set(Vt.Vec3fArray(normals))
+                mesh_api.SetNormalsInterpolation(UsdGeom.Tokens.faceVarying)
+            if not inherit_material:
+                if material:
+                    material_path = export_material(material, stage, project_root, mesh_file_path, obj=obj,
+                        material_scope_path=looks_path, bind_prim_path=part_path,
+                        bind_strength='weakerThanDescendants', material_name=f'{part_name}__',
+                        _texture_transaction=texture_transaction)
+                else:
+                    material_path = create_asset_default_material(stage, part_path, part_name)
+                if not material_path:
+                    raise RuntimeError(f'Could not export material for {part_path}')
+                if group_index == 0:
+                    first_material_path = material_path
 
         stage.SetDefaultPrim(ref_target_prim)
         write_guard.ensure_writable_layer(stage.GetRootLayer())
@@ -690,7 +710,7 @@ def _write_ingested_mesh_asset_impl(stage, obj, context, mesh_name_sanitized, po
         if not stage.GetRootLayer().Save():
             raise RuntimeError(f'Could not save mesh layer: {mesh_file_path}')
         print("  Saved mesh data to: %s" % mesh_file_path)
-        return mesh_prim_path, material_path
+        return mesh_prim_path, first_material_path
     except Exception as e:
         report_fn({'ERROR'}, "Failed to write mesh asset %s: %s" % (mesh_file_path, e))
         traceback.print_exc()
@@ -829,6 +849,40 @@ def export_material(blender_material, sublayer_stage, project_root, sublayer_pat
             textures.close()
 
 
+def _validate_normal_map_strength(shader_node):
+    """Reject Normal Map strengths that raw-image export cannot represent."""
+    if shader_node is None:
+        return
+    socket = shader_node.inputs.get('Normal Map' if shader_node.type == 'GROUP' else 'Normal')
+    if not socket or not socket.is_linked:
+        return
+
+    def upstream_nodes(start):
+        pending = [link.from_node for link in start.links]
+        visited = set()
+        while pending:
+            node = pending.pop()
+            key = node.as_pointer()
+            if key in visited:
+                continue
+            visited.add(key)
+            yield node
+            for input_socket in node.inputs:
+                pending.extend(link.from_node for link in input_socket.links)
+
+    for node in upstream_nodes(socket):
+        if node.type != 'NORMAL_MAP':
+            continue
+        color = node.inputs.get('Color')
+        if not color or not color.is_linked or not any(
+            n.type == 'TEX_IMAGE' and n.image for n in upstream_nodes(color)
+        ):
+            continue
+        strength = node.inputs.get('Strength')
+        if strength and (strength.is_linked or not math.isclose(float(strength.default_value), 1.0, rel_tol=0.0, abs_tol=1e-6)):
+            raise ValueError(f"Normal Map strength on '{node.name}' must be an unlinked 1.0 for export")
+
+
 def _export_material_impl(blender_material, sublayer_stage, project_root, sublayer_path, parent_mesh_path=None, obj=None,
                     material_scope_path=None, bind_prim_path=None,
                     bind_strength="weakerThanDescendants", material_name=None, override_material_path=None,
@@ -854,6 +908,9 @@ def _export_material_impl(blender_material, sublayer_stage, project_root, sublay
     if displacement and material_type != 'AperturePBR_Opacity':
         raise ValueError('Height displacement is not supported by AperturePBR_Translucent')
 
+    principled_node = NodeAnalyzer.find_surface_shader(blender_material)
+    _validate_normal_map_strength(principled_node)
+
     if override_material_path is None:
         ensure_mdl_files(project_root)
 
@@ -874,8 +931,6 @@ def _export_material_impl(blender_material, sublayer_stage, project_root, sublay
 
     if override_material_path is None:
         mat_path = scope_path.AppendPath(mat_name_sanitized)
-
-    principled_node = NodeAnalyzer.find_surface_shader(blender_material)
 
     # --- Phase 2: discovery. Sockets are only read here and conversions are
     # recorded; they run in phase 3, still before the first stage write ---
@@ -1512,12 +1567,16 @@ def _preflight_texture_destinations(context, selected_objects, project_root, tar
             continue
         if obj.type == 'MESH' and not material_replacement_mode and getattr(context.scene, 'remix_inherit_parent_material', False):
             continue
-        if not obj.material_slots or not obj.material_slots[0].material:
-            continue
-        _export_material_impl(
-            obj.material_slots[0].material, None, project_root, target_filepath,
-            obj=obj, override_material_path='/RootNode/Looks/preflight', texture_plan=plan,
-        )
+        if obj.type == 'MESH' and not material_replacement_mode:
+            materials = _used_mesh_materials(obj, context)
+        else:
+            materials = [obj.material_slots[0].material] if obj.material_slots else []
+        for material in materials:
+            if material:
+                _export_material_impl(
+                    material, None, project_root, target_filepath,
+                    obj=obj, override_material_path='/RootNode/Looks/preflight', texture_plan=plan,
+                )
     return plan
 
 
@@ -1529,6 +1588,17 @@ def _export_remix_objects(operator, context, target_filepath, selected_objects, 
     if not selected_objects:
         operator.report({'WARNING'}, "No objects selected for export.")
         return False, 0, 0
+
+    if not material_replacement_mode:
+        mesh_names = {}
+        for obj in selected_objects:
+            if obj.type != 'MESH':
+                continue
+            name = os.path.normcase(sanitize_prim_name(get_mesh_name_from_object(obj)) + '.usda')
+            if name in mesh_names and mesh_names[name] != obj:
+                operator.report({'ERROR'}, f"Meshes '{mesh_names[name].name}' and '{obj.name}' have the same export asset name '{name}'.")
+                return False, 0, 0
+            mesh_names[name] = obj
 
     mod_file_path = bpy.path.abspath(context.scene.remix_mod_file_path)
     if not mod_file_path or not os.path.exists(os.path.dirname(mod_file_path)):
