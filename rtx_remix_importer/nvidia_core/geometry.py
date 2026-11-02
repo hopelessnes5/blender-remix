@@ -34,6 +34,8 @@ __all__ = [
 
 _LEFT_HANDED = "leftHanded"
 
+from .errors import InvalidTopologyError
+
 
 @dataclass(frozen=True)
 class SubsetData:
@@ -247,8 +249,23 @@ def extract_mesh_data(
     points = mesh.GetPointsAttr().Get(time_code)
     counts = mesh.GetFaceVertexCountsAttr().Get(time_code)
     indices = mesh.GetFaceVertexIndicesAttr().Get(time_code)
-    if not points or not counts or not indices:
+    if points is None or counts is None or indices is None:
         return None
+
+    for face_index, count in enumerate(counts):
+        if count < 0:
+            raise InvalidTopologyError(f"Invalid topology on {prim.GetPath()}: face {face_index} has negative vertex count {count}")
+    expected_corners = sum(int(count) for count in counts)
+    if expected_corners != len(indices):
+        raise InvalidTopologyError(
+            f"Invalid topology on {prim.GetPath()}: face counts require {expected_corners} indices, got {len(indices)}"
+        )
+    for corner_index, point_index in enumerate(indices):
+        if not 0 <= point_index < len(points):
+            raise InvalidTopologyError(
+                f"Invalid topology on {prim.GetPath()}: corner {corner_index} has point index {point_index}, "
+                f"expected 0..{len(points) - 1}"
+            )
 
     kept_counts: list[int] = []
     kept_offsets: list[int] = []

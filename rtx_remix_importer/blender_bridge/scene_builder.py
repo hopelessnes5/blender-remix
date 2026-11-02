@@ -127,6 +127,8 @@ def _build_prototypes(stage: Usd.Stage, registry: _MeshRegistry, normal_mode: st
             bl_mesh = create_mesh_datablock(mesh_data, f"{_blender_name(prototype_prim)}_data", normal_mode)
             registry.add(prototype_path, str(mesh_prim.GetPath()), bl_mesh)
             created += 1
+        except geometry.InvalidTopologyError:
+            raise
         except Exception:
             print(f"ERROR extracting geometry from {prototype_path}:")
             traceback.print_exc()

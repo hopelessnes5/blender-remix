@@ -932,6 +932,14 @@ class TextureProcessor:
         _require_blender_main_thread()
         if progress_callback:
             progress_callback(f"Processing batch of {len(texture_batch)} textures...")
+
+        # Reject the whole batch before converting any outputs. Dirty Blender
+        # pixels cannot be assumed to match an existing DDS (A13).
+        for bl_image, output_path, _, _ in texture_batch:
+            if os.path.exists(output_path) and bl_image.is_dirty:
+                if progress_callback:
+                    progress_callback(f"Cannot reuse existing DDS for modified image '{bl_image.name}': {output_path}")
+                return [False] * len(texture_batch), {}
         
         results = [False] * len(texture_batch)
         groups: Dict[Tuple[str, str], list] = {}

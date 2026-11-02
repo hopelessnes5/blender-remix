@@ -61,8 +61,8 @@ class TestMaterialOverrideExport(unittest.TestCase):
                 shader = prim.GetChild('Shader')
                 self.assertEqual(shader.GetSpecifier(), Sdf.SpecifierOver)
                 self.assertFalse(shader.GetAttribute('info:mdl:sourceAsset'))
-                self.assertFalse(shader.GetAttribute('inputs:metallic_constant'))
-                self.assertFalse(shader.GetAttribute('inputs:reflection_roughness_constant'))
+                self.assertEqual(shader.GetAttribute('inputs:metallic_constant').Get(), 0.0)
+                self.assertAlmostEqual(shader.GetAttribute('inputs:reflection_roughness_constant').Get(), 0.5)
                 self.assertFalse(stage.GetPrimAtPath(obj['usd_prim_path']))
                 self.assertAlmostEqual(shader.GetAttribute('inputs:diffuse_color_constant').Get()[0], .8)
         finally:

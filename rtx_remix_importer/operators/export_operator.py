@@ -721,6 +721,26 @@ def get_mesh_name_from_object(obj):
             mesh_name_to_use = mesh_data_name
     return mesh_name_to_use
 
+def _clear_stale_local_input(shader, name, value_type, replacement, stale_value):
+    """Override a stale local default without disturbing connected/animated inputs.
+
+    An explicit neutral value, rather than removal, also masks a weaker layer.
+    Other inputs and properties authored only in weaker layers are untouched.
+    """
+    layer = shader.GetStage().GetEditTarget().GetLayer()
+    path = shader.GetPath().AppendProperty('inputs:' + name)
+    spec = layer.GetAttributeAtPath(path)
+    if not spec or spec.typeName != value_type or not spec.HasInfo('default'):
+        return
+    attribute = shader.GetAttribute('inputs:' + name)
+    if (spec.HasInfo('connectionPaths') or attribute.GetConnections()
+            or any(item.layer.ListTimeSamplesForPath(item.path) for item in attribute.GetPropertyStack())):
+        return
+    if not stale_value(spec.default):
+        return
+    shader.CreateAttribute('inputs:' + name, value_type).Set(replacement)
+
+
 class _MaterialTextureTransaction:
     """Stage DDS files next to their destinations and restore partial publication."""
 
@@ -812,7 +832,7 @@ def export_material(blender_material, sublayer_stage, project_root, sublayer_pat
 def _export_material_impl(blender_material, sublayer_stage, project_root, sublayer_path, parent_mesh_path=None, obj=None,
                     material_scope_path=None, bind_prim_path=None,
                     bind_strength="weakerThanDescendants", material_name=None, override_material_path=None,
-                    texture_transaction=None):
+                    texture_transaction=None, texture_plan=None):
     """Export a Blender material into `sublayer_stage`.
 
     Two destinations are supported, both matching what the RTX Remix Toolkit
@@ -864,7 +884,8 @@ def _export_material_impl(blender_material, sublayer_stage, project_root, sublay
     displacement_record = None
 
     texture_tasks = []
-    texture_destinations = {}
+    dirty_existing_textures = []
+    texture_destinations = texture_plan if texture_plan is not None else {}
     from .. import core_utils
     texture_processor = core_utils.get_texture_processor()
 
@@ -952,7 +973,8 @@ def _export_material_impl(blender_material, sublayer_stage, project_root, sublay
             dds_file_name = texture_processor.texture_filename(bl_image)
             absolute_dds_path = os.path.normpath(os.path.join(textures_dir, dds_file_name))
             key = os.path.normcase(absolute_dds_path)
-            source = (bl_image.as_pointer(), texture_type, scalar_channel)
+            source = (bl_image.as_pointer(), texture_type, scalar_channel, dds_format,
+                      normal_export.current_mode() if texture_type == 'normal' else None)
             if key in texture_destinations and texture_destinations[key] != source:
                 raise ValueError(f"Multiple textures need different data at the same export path: {absolute_dds_path}")
             texture_destinations[key] = source
@@ -968,6 +990,8 @@ def _export_material_impl(blender_material, sublayer_stage, project_root, sublay
                 return bl_image, get_relative_path(sublayer_path, absolute_dds_path)
 
             if os.path.exists(absolute_dds_path):
+                if bl_image.is_dirty:
+                    dirty_existing_textures.append((bl_image, absolute_dds_path))
                 return bl_image, get_relative_path(sublayer_path, absolute_dds_path)
             
             texture_tasks.append((bl_image, absolute_dds_path, texture_type, dds_format))
@@ -976,7 +1000,8 @@ def _export_material_impl(blender_material, sublayer_stage, project_root, sublay
         return None, None
 
     if principled_node:
-        os.makedirs(textures_dir, exist_ok=True)
+        if texture_plan is None:
+            os.makedirs(textures_dir, exist_ok=True)
 
         if material_type == "AperturePBR_Translucent":
             diffuse_image, diffuse_rel_path = find_texture_for_socket('Transmittance/Diffuse Albedo', 'BC7_UNORM_SRGB')
@@ -1031,9 +1056,18 @@ def _export_material_impl(blender_material, sublayer_stage, project_root, sublay
             height_image, height_channel, displace_in, displace_out = displacement
             height_path = os.path.normpath(os.path.join(textures_dir, texture_processor.texture_filename(height_image)))
             key = os.path.normcase(height_path)
-            if key in texture_destinations:
+            source = (height_image.as_pointer(), 'height', height_channel, 'BC4_UNORM', None)
+            if key in texture_destinations and texture_destinations[key] != source:
                 raise ValueError(f'Height map conflicts with another texture export: {height_path}')
+            texture_destinations[key] = source
             displacement_record = (height_image, height_path, height_channel)
+
+        if dirty_existing_textures:
+            image, path = dirty_existing_textures[0]
+            raise ValueError(f"Cannot reuse existing DDS for modified image '{image.name}': {path}")
+
+        if texture_plan is not None:
+            return None
 
         # --- Phase 3: run every recorded conversion before the first stage
         # write, so a texture failure raises while nothing was authored yet
@@ -1061,6 +1095,9 @@ def _export_material_impl(blender_material, sublayer_stage, project_root, sublay
             if len(results) != len(texture_tasks) or not all(results):
                 failed = [task[0].name for task, ok in zip(texture_tasks, results) if not ok]
                 raise RuntimeError(f"Could not export textures to DDS: {', '.join(failed) or 'incomplete conversion'}")
+
+    if texture_plan is not None:
+        return None
 
     # --- Phase 4: authoring. Runs only after every conversion succeeded, so
     # texture failures can never leave prims behind (audit A04/A05).
@@ -1225,8 +1262,40 @@ def _export_material_impl(blender_material, sublayer_stage, project_root, sublay
             if specular_socket and specular_socket.default_value != 0.5:
                 shader_prim.CreateAttribute("inputs:specular_constant", Sdf.ValueTypeNames.Float).Set(float(specular_socket.default_value))
 
+    # Reconcile only locally authored managed defaults. Empty asset paths and
+    # false flags mask older values in weaker capture layers; merely removing
+    # these properties would make those values visible again.
+    absent_textures = {
+        'normalmap_texture': not normal_rel_path,
+        'height_texture': not displacement_record,
+        'emissive_mask_texture': not emissive_rel_path,
+    }
+    if material_type == 'AperturePBR_Translucent':
+        absent_textures['transmittance_texture'] = not diffuse_rel_path
+    else:
+        absent_textures.update({
+            'diffuse_texture': not diffuse_rel_path,
+            'metallic_texture': not metallic_rel_path,
+            'reflectionroughness_texture': not roughness_rel_path,
+            'opacity_texture': not opacity_rel_path,
+            'specular_texture': not specular_rel_path,
+        })
+    for input_name, absent in absent_textures.items():
+        if absent:
+            _clear_stale_local_input(shader_prim, input_name, Sdf.ValueTypeNames.Asset,
+                                     Sdf.AssetPath(), lambda value: isinstance(value, Sdf.AssetPath) and bool(value.path))
+    if not enable_emission:
+        _clear_stale_local_input(shader_prim, 'enable_emission', Sdf.ValueTypeNames.Bool,
+                                 False, lambda value: value is True)
+    if material_type != 'AperturePBR_Translucent' and not has_alpha:
+        for input_name in ('enable_opacity', 'blend_enabled'):
+            _clear_stale_local_input(shader_prim, input_name, Sdf.ValueTypeNames.Bool,
+                                     False, lambda value: value is True)
+
+    # A replacement target may be opened on its own, without the weaker
+    # capture. Keep authored defaults: they may be needed to override it.
     from ..material_defaults import remove_default_inputs
-    remove_default_inputs(shader_prim, material_type)
+    remove_default_inputs(shader_prim, material_type, preserve_authored=override_material_path is not None)
     return mat_path
 
 # --- Light Export Helper ---
@@ -1430,6 +1499,28 @@ def export_light(operator, context, obj, sublayer_stage, project_root, target_su
 
 # --- Core Export Logic Helper ---
 
+def _preflight_texture_destinations(context, selected_objects, project_root, target_filepath,
+                                    material_replacement_mode=False):
+    """Reject conflicting material outputs before any selected object is exported.
+
+    This shares material discovery with the exporter. It does not establish
+    ownership of pre-existing DDS files or coordinate separate operations.
+    """
+    plan = {}
+    for obj in selected_objects:
+        if obj.type not in ('MESH', 'LIGHT') or (material_replacement_mode and obj.type != 'MESH'):
+            continue
+        if obj.type == 'MESH' and not material_replacement_mode and getattr(context.scene, 'remix_inherit_parent_material', False):
+            continue
+        if not obj.material_slots or not obj.material_slots[0].material:
+            continue
+        _export_material_impl(
+            obj.material_slots[0].material, None, project_root, target_filepath,
+            obj=obj, override_material_path='/RootNode/Looks/preflight', texture_plan=plan,
+        )
+    return plan
+
+
 def _export_remix_objects(operator, context, target_filepath, selected_objects, material_replacement_mode=False):
     if not USD_AVAILABLE:
         operator.report({'ERROR'}, "USD Python libraries (pxr) not available.")
@@ -1445,6 +1536,12 @@ def _export_remix_objects(operator, context, target_filepath, selected_objects, 
         return False, 0, 0
 
     project_root_dir = os.path.dirname(mod_file_path)
+    try:
+        _preflight_texture_destinations(context, selected_objects, project_root_dir,
+                                        os.path.abspath(target_filepath), material_replacement_mode)
+    except Exception as exc:
+        operator.report({'ERROR'}, f'Texture export preflight failed: {exc}')
+        return False, 0, 0
     ensure_mdl_files(project_root_dir)
 
     target_filepath_abs = os.path.abspath(target_filepath)

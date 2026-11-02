@@ -41,8 +41,10 @@ def _matches(value, default):
     return math.isclose(float(value), float(default), rel_tol=1e-6, abs_tol=1e-6)
 
 
-def remove_default_inputs(shader, material_type):
-    """Omit MDL defaults, unless a weaker layer supplies a different value."""
+def remove_default_inputs(shader, material_type, preserve_authored=False):
+    """Omit MDL defaults only when the weaker composition is known."""
+    if preserve_authored:
+        return
     for name, default in DEFAULTS.get(material_type, {}).items():
         attribute = shader.GetAttribute('inputs:' + name)
         if not attribute or not _matches(attribute.Get(), default):
