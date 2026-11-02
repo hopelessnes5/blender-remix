@@ -1,10 +1,10 @@
 bl_info = {
-    "name": "Remix Toolkit for Blender",
-    "author": "CR",
-    "version": (0, 4),
+    "name": "Blender Remix Toolkit",
+    "author": "hopelessness, CR(legacy)",
+    "version": (0, 5, 0),
     "blender": (4, 0, 0),
     "description": "An alternative to the official NVIDIA RTX Remix Toolkit. Imports RTX Remix captures and export assets back in a RTX Remix compatible format.",
-    "doc_url": "",
+    "doc_url": "https://github.com/hopelessnes5/blender-remix",
     "category": "Import-Export",
 }
 
@@ -12,6 +12,7 @@ import bpy
 from bpy.app.handlers import persistent
 from . import ui
 from . import operators
+from . import update_checker
 from .core_utils import get_blender_version, is_blender_4_1_or_newer
 
 
@@ -30,6 +31,7 @@ def register():
     
     operators.register()
     ui.register()
+    update_checker.register()
     if _cleanup_before_load not in bpy.app.handlers.load_pre:
         bpy.app.handlers.load_pre.append(_cleanup_before_load)
 
@@ -38,5 +40,6 @@ def unregister():
         bpy.app.handlers.load_pre.remove(_cleanup_before_load)
     from .core_utils import cleanup_addon_resources
     cleanup_addon_resources()
+    update_checker.unregister()
     ui.unregister()
     operators.unregister()
