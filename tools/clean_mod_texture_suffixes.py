@@ -47,9 +47,21 @@ def resolve_reference(layer_path, value, root):
 
 
 def build_plan(folder):
-    root = Path(folder).resolve(strict=True)
+    base = Path(folder)
+    root = base.resolve(strict=True)
     if not root.is_dir():
         raise ValueError('The mod path must be a directory')
+
+    def public(path):
+        """Re-key an internal path onto the caller's path form.
+
+        ``Path.resolve`` expands Windows 8.3 short names and symlinks, so the
+        resolved root can differ from paths the caller built directly from the
+        given folder.  Safety checks run inside on resolved paths; the returned
+        plan is anchored to ``base`` so keys compare equal for the caller.
+        """
+        return base / path.relative_to(root)
+
     files = []
     for path in root.rglob('*'):
         if BACKUPS in path.relative_to(root).parts:
@@ -116,7 +128,9 @@ def build_plan(folder):
         updated = TOKENS.sub(rewrite, content)
         if updated != content:
             edits[path] = updated.encode('utf-8')
-    return root, candidates, edits
+    renames = {public(src): public(dst) for src, dst in candidates.items()}
+    edits = {public(path): data for path, data in edits.items()}
+    return base, renames, edits
 
 
 def apply_plan(root, renames, edits):

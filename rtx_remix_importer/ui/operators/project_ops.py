@@ -15,17 +15,12 @@ except ImportError:
     UsdLux = None
     Gf = None
 
+from ... import write_guard
 
 def _require_writable_layer(path):
     """Open a layer for authoring, refusing capture and locked layers."""
-    layer = Sdf.Layer.FindOrOpen(path)
-    if not layer:
-        raise ValueError(f"Could not open layer: {path}")
-    if layer.customLayerData.get('lightspeed_layer_type') == 'capture':
-        raise ValueError(f"Cannot edit capture layer: {path}")
-    if not layer.permissionToEdit:
-        raise ValueError(f"Layer is locked: {path}")
-    return layer
+    # Shared guard: identical semantics for every write entry point (audit A01).
+    return write_guard.open_writable_layer(path)
 
 
 def _layer_identity(layer):
@@ -384,6 +379,7 @@ class CreateRemixSublayer(bpy.types.Operator):
             if root_layer.HasDefaultPrim():
                  root_layer.ClearDefaultPrim()
             
+            write_guard.ensure_writable_layer(root_layer)
             new_stage.GetRootLayer().Save()
             print(f"Created new sublayer file: {new_sublayer_path}")
         except Exception as e:
@@ -416,6 +412,7 @@ class CreateRemixSublayer(bpy.types.Operator):
             if not _insert_sublayer(target_layer, new_sublayer_path):
                 self.report({'INFO'}, f"Sublayer '{relative_path}' already exists in {target_name}.")
             else:
+                write_guard.ensure_writable_layer(target_layer)
                 target_layer.Save()
                 print(f"Added '{relative_path}' to sublayers in {target_name}")
                 if active_sublayer:
@@ -496,6 +493,7 @@ class AddRemixSublayer(bpy.types.Operator, bpy_extras.io_utils.ImportHelper):
             if not _insert_sublayer(target_layer, existing_sublayer_path):
                 self.report({'INFO'}, f"Sublayer '{relative_path}' already exists in {target_name}. No changes made.")
             else:
+                write_guard.ensure_writable_layer(target_layer)
                 target_layer.Save()
                 print(f"Added '{relative_path}' to sublayers in {target_name}")
                 if active_sublayer:
@@ -575,6 +573,7 @@ class CreateRemixModFile(bpy.types.Operator, bpy_extras.io_utils.ExportHelper):
                  root_layer.ClearDefaultPrim()
             
             # Ensure the file has content before trying to load it
+            write_guard.ensure_writable_layer(root_layer)
             root_layer.Save()
             print(f"Created new mod file: {new_mod_path}")
             self.report({'INFO'}, f"Created new mod file: {os.path.basename(new_mod_path)}")

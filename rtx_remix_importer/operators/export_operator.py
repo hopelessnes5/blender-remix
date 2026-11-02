@@ -20,6 +20,7 @@ except ImportError:
     USD_AVAILABLE = False
 
 from .. import constants
+from .. import write_guard
 from ..core_utils import (
     calc_normals_split_compatible,
     get_corner_normals_compatible,
@@ -650,6 +651,7 @@ def write_ingested_mesh_asset(stage, obj, context, mesh_name_sanitized, points_m
                 material_path = create_asset_default_material(stage, mesh_prim_path, mesh_name_sanitized)
 
         stage.SetDefaultPrim(ref_target_prim)
+        write_guard.ensure_writable_layer(stage.GetRootLayer())
         stage.GetRootLayer().Save()
         print("  Saved mesh data to: %s" % mesh_file_path)
         return mesh_prim_path, material_path
@@ -1315,6 +1317,7 @@ def _export_remix_objects(operator, context, target_filepath, selected_objects, 
 
     if stage.GetRootLayer().dirty:
         try:
+            write_guard.ensure_writable_layer(stage.GetRootLayer())
             stage.GetRootLayer().Save()
         except Exception as e:
             operator.report({'ERROR'}, f"Failed to save stage {target_filepath_abs}: {e}")
@@ -1364,10 +1367,12 @@ class ExportRemixAsset(Operator):
                 if not stage:
                     self.report({'ERROR'}, f"Failed to open existing stage: {file_path}")
                     return None
-                if stage.GetRootLayer().customLayerData.get('lightspeed_layer_type') == 'capture':
-                    self.report({'ERROR'}, f"Cannot export into a capture layer: {file_path}")
+                try:
+                    write_guard.ensure_writable_layer(stage.GetRootLayer(), open_path=file_path, verb="export into a")
+                except ValueError as exc:
+                    self.report({'ERROR'}, str(exc))
                     return None
-                return stage 
+                return stage
             else:
                 stage = Usd.Stage.CreateNew(file_path)
                 if not stage:

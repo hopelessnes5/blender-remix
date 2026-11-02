@@ -21,6 +21,7 @@ from pathlib import Path
 from pxr import Sdf, Tf, Usd, UsdGeom
 
 from . import capture, constants
+from .. import write_guard
 
 _LOG = logging.getLogger(__name__)
 
@@ -286,9 +287,20 @@ class ProjectComposition:
         return self.mod_layer
 
     def save(self) -> None:
-        """Save every dirty, writable layer of the composition."""
+        """Save every dirty, writable layer of the composition.
+
+        Guards run immediately before the write (audit A01): every capture
+        layer in the stack must still be locked and the edit target must not
+        be the capture, so no code path can race its way into the capture.
+        """
         if self._stage is None:
             return
+        for layer in self._stage.GetLayerStack(includeSessionLayers=False):
+            if write_guard.is_capture_layer(layer) and layer.permissionToEdit:
+                raise ValueError(
+                    f"Cannot save the composition: the capture layer {layer.identifier} is unlocked"
+                )
+        write_guard.ensure_editable_edit_target(self._stage)
         self._stage.Save()
 
     # -- helpers ----------------------------------------------------------

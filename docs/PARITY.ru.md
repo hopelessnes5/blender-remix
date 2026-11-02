@@ -127,8 +127,8 @@ StageCraft, MCP-сервер или HTTP/REST-сервис, и не создаю
 | `lightspeed.common.lightspeed.common.constants` | `nvidia_core/constants.py` | Значения и регулярные выражения скопированы; удалён импорт `omni.ui`, из-за которого модуль нельзя было использовать вне Kit. |
 | `lightspeed.trex.utils.common.prim_utils` | `nvidia_core/prim_utils.py` | Перенесены алгоритмы: классификация, поиск прототипа, поиск ссылок, transferable-спецификации, обнаружение «ghost»-объектов. Неявный контекст `omni.usd` и выделение заменены явными аргументами `stage` / `selection`. |
 | `lightspeed.trex.capture.core.shared.setup` | `nvidia_core/capture.py` | Перенесены определение захвата, метаданные слоя, поиск хешей, копирование метаданных сцены и публикация `remix_config`. Менеджер слоёв Kit, миниатюры, листинг через `omni.client` и undo не переносились. |
-| `lightspeed.trex.asset_replacements.core.shared.Setup.copy_replacement_overrides_to_path` | `nvidia_core/copier.py` | Перенесено копирование переопределений потомков: спецификации prim под исходным путём по replacement-слою и его подслоям, спецификации атрибутов через `Sdf.CopySpec`, связи (например `material:binding`) с ремапом внутренних целей. `SetRelationshipTargetsCommand` заменён на `Usd.Relationship.SetTargets`; capture-слой как источник или цель записи отклоняется. UI дублирования в Blender пока нет. |
-| Порядок слоёв `lightspeed.layer_manager.core` | `nvidia_core/composition.py` | Повторно реализовано на `pxr`: захват всегда является самым слабым подслоем, mod/replacement-слой становится целевым для редактирования, захват блокируется от записи, а метаданные `omni_layer.muteness` / `omni_layer.locked` рабочего файла применяются при открытии. Полная модель слоёв, интерфейс mute/lock/reorder и события не переносились. |
+| `lightspeed.trex.asset_replacements.core.shared.Setup.copy_replacement_overrides_to_path` | `nvidia_core/copier.py` | Перенесено копирование переопределений потомков: спецификации prim под исходным путём по replacement-слою и его подслоям, спецификации атрибутов через `Sdf.CopySpec`, связи (например `material:binding`) с ремапом внутренних целей. `SetRelationshipTargetsCommand` заменён на `Usd.Relationship.SetTargets`; capture- или заблокированный слой как источник и capture как цель записи отклоняются. UI дублирования в Blender пока нет. |
+| Порядок слоёв `lightspeed.layer_manager.core` | `nvidia_core/composition.py` | Повторно реализовано на `pxr`: захват всегда является самым слабым подслоем, mod/replacement-слой становится целевым для редактирования, захват блокируется от записи, а метаданные `omni_layer.muteness` / `omni_layer.locked` рабочего файла применяются при открытии. Каждое сохранение повторно проверяет capture-слои стека и целевой слой перед записью. Полная модель слоёв, интерфейс mute/lock/reorder и события не переносились. |
 | `omni.usd.get_composed_references_from_prim`, `omni.usd.get_introducing_layer` | `compatibility/kit_adapters.py` | Повторно реализовано через `Sdf` / `Usd.PrimCompositionQuery`, включая определение слоя-автора и относительные пути к ресурсам. |
 | `omni.flux.utils.common.lights.get_light_type` | `compatibility/kit_adapters.py` | Перенесены перечисление типов источников света и исторический псевдоним `DomeLight_1`. |
 | Соглашения Toolkit о mesh/prim | `nvidia_core/geometry.py` | Извлечение для Blender написано под ту же структуру `mesh_<HASH>` / `inst_<HASH>_<N>`. N-угольники сохраняются, левосторонняя намотка (`leftHanded`) разворачивается, массивы UV/нормалей на угол остаются согласованными с `faceVertexIndices`. |
@@ -223,14 +223,20 @@ UI-операторы (`remix.import_capture`, `remix.scan_capture_folder`) це
 и отдельные значения при экспорте USD на реальных узлах Blender. `tests/unit/test_material_defaults.py` проверяет удаление значений по умолчанию и сохранение переопределений слабых слоёв.
 `tests/blender/test_capture_thumbnails.py` проверяет поиск DDS-превью, чтение,
 обновление и обработку отсутствующих файлов без файлового кэша.
+`tests/blender/test_write_guard.py` проверяет общий guard записи, стоящий за
+каждой точкой сохранения слоя: capture- и заблокированные слои и capture-редактируемый
+target отклоняются непосредственно перед каждой записью, глобально разблокированный
+захват блокирует сохранение композиции, а экспортный путь сообщает об отказ,
+не трогая байты.
 
-**Фактический результат:** 153 теста проходят и на Blender 4.5.5 LTS
+**Фактический результат:** 200 тестов проходят и на Blender 4.5.5 LTS
 (встроенный OpenUSD 25.02), и на Blender 5.1.2 (встроенный OpenUSD 25.08) под
-Windows, код возврата `0`; `register()` / `unregister()` также проверены на обеих
-версиях. Свежесобранный `rtx_remix_importer.zip` установлен через
-`preferences.addon_install` в чистый профиль на обеих версиях и импортировал
-фикстуру (763 вершины, 1 материал, backend `direct`). `git diff --check` и
-`python -m compileall` проходят.
+Windows, код возврата `0`; `register()` / `unregister()` вызываются в составе
+набора через тесты UI-операторов. Дым-проверка установки — свежесобранный
+`rtx_remix_importer.zip` через `preferences.addon_install` в чистый профиль на
+обеих версиях, импорт фикстуры (763 вершины, 1 материал, backend `direct`) —
+была выполнена ранее на меньшем наборе и с тех пор не повторялась.
+`git diff --check` и `python -m compileall` проходят.
 
 **Не проверено:**
 

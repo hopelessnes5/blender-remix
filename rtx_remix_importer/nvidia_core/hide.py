@@ -41,6 +41,7 @@ import re
 from pxr import Sdf
 
 from . import constants
+from .. import write_guard
 
 _LOG = logging.getLogger(__name__)
 
@@ -80,15 +81,16 @@ def _authored_items(op) -> list:
 
 
 def _ensure_mod_layer(layer: Sdf.Layer | None) -> Sdf.Layer:
-    """Reject capture layers so a hide can never edit the game capture."""
+    """Reject capture and locked layers so a hide can never edit the game capture."""
     if layer is None:
         raise ValueError("No mod layer to author into")
-    layer_type = layer.customLayerData.get(constants.LAYER_TYPE_KEY)
-    if layer_type == constants.LAYER_TYPE_CAPTURE:
+    if write_guard.is_capture_layer(layer):
         raise ValueError(
             f"Refusing to write into the capture layer {layer.identifier}; "
             "hide meshes in the mod (replacement) layer instead"
         )
+    if not layer.permissionToEdit:
+        raise ValueError(f"Layer is locked: {layer.identifier}")
     return layer
 
 

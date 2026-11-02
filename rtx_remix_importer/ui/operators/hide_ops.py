@@ -23,6 +23,7 @@ try:
 except ImportError:
     USD_AVAILABLE = False
 
+from ... import write_guard
 from ...nvidia_core import composition, constants, hide
 from ...operators.export_operator import (
     invalidate_game_stage_cache,
@@ -134,8 +135,9 @@ class _MeshMaskOperator(bpy.types.Operator):
 
         if changed:
             try:
+                write_guard.ensure_writable_layer(layer)
                 layer.Save()
-            except Tf.ErrorException as exc:
+            except (ValueError, Tf.ErrorException) as exc:
                 self.report({"ERROR"}, f"Could not save {layer.identifier}: {exc}")
                 return {"CANCELLED"}
             invalidate_game_stage_cache(mod_path)

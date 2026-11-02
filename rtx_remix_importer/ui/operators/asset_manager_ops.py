@@ -11,6 +11,7 @@ except ImportError:
     UsdGeom = None
     UsdLux = None
 
+from ... import write_guard
 
 class ScanExportedAssets(bpy.types.Operator):
     """Scan mod.usda and sublayers to find all exported meshes and lights"""
@@ -356,6 +357,7 @@ class DeleteExportedAsset(bpy.types.Operator):
                     return {'CANCELLED'}
             
             # Save the layer
+            write_guard.ensure_writable_layer(layer)
             layer.Save()
             
             self.report({'INFO'}, f"Removed {asset_type.lower()} reference: {asset_name}")

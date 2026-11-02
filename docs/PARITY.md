@@ -127,8 +127,8 @@ Source paths refer to RTX Remix Toolkit 1.6.1 (`source/extensions/...`, Apache-2
 | `lightspeed.common.lightspeed.common.constants` | `nvidia_core/constants.py` | Values and regexes copied; the `omni.ui` import that made the module unusable outside Kit was removed. |
 | `lightspeed.trex.utils.common.prim_utils` | `nvidia_core/prim_utils.py` | Algorithms ported (classification, prototype lookup, reference discovery, transferable specs, ghost detection). The implicit `omni.usd` context and selection were replaced by explicit `stage` / `selection` arguments. |
 | `lightspeed.trex.capture.core.shared.setup` | `nvidia_core/capture.py` | Capture detection, layer metadata, hash discovery, stage-metadata copy and `remix_config` publishing ported. Kit layer manager, thumbnails, `omni.client` listing and undo are not ported. |
-| `lightspeed.trex.asset_replacements.core.shared.Setup.copy_replacement_overrides_to_path` | `nvidia_core/copier.py` | Descendant override copying ported: prim specs under the source path across the replacement layer and its sublayers, attribute specs through `Sdf.CopySpec`, relationships (e.g. `material:binding`) with internal-target remapping. `SetRelationshipTargetsCommand` became `Usd.Relationship.SetTargets`; capture-typed source layers or edit targets are rejected. No Blender duplicate UI yet. |
-| `lightspeed.layer_manager.core` layer ordering | `nvidia_core/composition.py` | Reimplemented with `pxr`: capture is always the weakest sublayer, the mod/replacement layer is the edit target, capture is locked read-only, and the workfile's `omni_layer.muteness` / `omni_layer.locked` metadata is applied on open. The full layer model, mute/lock/reorder UI and events are not ported. |
+| `lightspeed.trex.asset_replacements.core.shared.Setup.copy_replacement_overrides_to_path` | `nvidia_core/copier.py` | Descendant override copying ported: prim specs under the source path across the replacement layer and its sublayers, attribute specs through `Sdf.CopySpec`, relationships (e.g. `material:binding`) with internal-target remapping. `SetRelationshipTargetsCommand` became `Usd.Relationship.SetTargets`; capture-typed or locked source layers and capture edit targets are rejected. No Blender duplicate UI yet. |
+| `lightspeed.layer_manager.core` layer ordering | `nvidia_core/composition.py` | Reimplemented with `pxr`: capture is always the weakest sublayer, the mod/replacement layer is the edit target, capture is locked read-only, and the workfile's `omni_layer.muteness` / `omni_layer.locked` metadata is applied on open. Every save re-checks the stack's capture layers and the edit target before writing. The full layer model, mute/lock/reorder UI and events are not ported. |
 | `omni.usd.get_composed_references_from_prim`, `omni.usd.get_introducing_layer` | `compatibility/kit_adapters.py` | Reimplemented with `Sdf` / `Usd.PrimCompositionQuery`, including authoring-layer resolution and relative asset paths. |
 | `omni.flux.utils.common.lights.get_light_type` | `compatibility/kit_adapters.py` | Light type enum and the historical `DomeLight_1` alias ported. |
 | Toolkit mesh/prim conventions | `nvidia_core/geometry.py` | Blender extraction written against the same `mesh_<HASH>` / `inst_<HASH>_<N>` layout. N-gons are preserved, left-handed winding is reversed, and per-corner UV/normal arrays stay aligned with `faceVertexIndices`. |
@@ -215,14 +215,20 @@ standard USD can still compose instance geometry from capture-layer references. 
 Principled constants, opacity gating, transmission type detection and selected
 USD export values on real Blender nodes. `tests/unit/test_material_defaults.py` checks omission of MDL defaults and preservation of stronger opinions over weaker layers. `tests/blender/test_capture_thumbnails.py`
 checks direct DDS thumbnail lookup, decoding, refresh and missing files without
-a converted-file cache.
+a converted-file cache. `tests/blender/test_write_guard.py` checks the shared
+write guard behind every layer-save entry point: capture and locked layers and
+capture edit targets are refused immediately before each write, a globally
+unlocked capture blocks saving the composition, and the export stage path
+reports rejection without touching bytes.
 
-**Executed result:** 153 tests pass on both Blender 4.5.5 LTS (bundled OpenUSD
-25.02) and Blender 5.1.2 (bundled OpenUSD 25.08) on Windows, exit code `0`;
-`register()` / `unregister()` was smoke-tested on both as well. A freshly built
-`rtx_remix_importer.zip` was installed through `preferences.addon_install` into a
-clean profile on both versions and imported the fixture (763 vertices, 1
-material, `direct` backend). `git diff --check` and `python -m compileall` also
+**Executed result:** 200 tests pass on both Blender 4.5.5 LTS (bundled OpenUSD
+25.02) and Blender 5.1.2 (bundled OpenUSD 25.08) on Windows, exit code `0`.
+`register()` / `unregister()` are exercised by the suite through the
+UI-operator tests. The package-install smoke check — a freshly built
+`rtx_remix_importer.zip` installed through `preferences.addon_install` into a
+clean profile on both versions, importing the fixture (763 vertices, 1
+material, `direct` backend) — was verified on the earlier, smaller suite and
+has not been repeated since. `git diff --check` and `python -m compileall` also
 pass.
 
 **Not verified:**

@@ -38,30 +38,26 @@ import logging
 from pxr import Sdf, Usd
 
 from . import composition, constants
+from .. import write_guard
 
 _LOG = logging.getLogger(__name__)
 
 
 def _ensure_mod_layer(layer: Sdf.Layer) -> Sdf.Layer:
-    """Reject capture layers so override copying can never edit the game capture."""
-    layer_type = layer.customLayerData.get(constants.LAYER_TYPE_KEY)
-    if layer_type == constants.LAYER_TYPE_CAPTURE:
+    """Reject capture and locked layers so override copying can never edit the game capture."""
+    if write_guard.is_capture_layer(layer):
         raise ValueError(
             f"Refusing to read from or write into the capture layer {layer.identifier}; "
             "copy replacement overrides in the mod (replacement) layer instead"
         )
+    if not layer.permissionToEdit:
+        raise ValueError(f"Layer is locked: {layer.identifier}")
     return layer
 
 
 def _ensure_capture_edit_target(stage: Usd.Stage) -> None:
     """Reject an edit target that would author the copied overrides into the capture."""
-    target_layer = stage.GetEditTarget().GetLayer()
-    layer_type = target_layer.customLayerData.get(constants.LAYER_TYPE_KEY) if target_layer else None
-    if layer_type == constants.LAYER_TYPE_CAPTURE:
-        raise ValueError(
-            f"Refusing to author into the capture layer {target_layer.identifier}; "
-            "set the edit target to the mod (replacement) layer first"
-        )
+    write_guard.ensure_editable_edit_target(stage)
 
 
 def copy_replacement_overrides_to_path(
