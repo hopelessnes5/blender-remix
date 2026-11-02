@@ -72,4 +72,4 @@ For existing mods, the [texture suffix cleanup utility](docs/MOD_CLEANUP.ru.md) 
 - Based on the original *Remix Toolkit for Blender* by sambow23; this fork is maintained by [hopelessnes5](https://github.com/hopelessnes5/).
 - Ported NVIDIA code retains its Apache-2.0 attribution headers.
 
-Version 0.4.
+Version 0.5.

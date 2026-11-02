@@ -72,4 +72,4 @@
 - На основе оригинального *Remix Toolkit for Blender* от sambow23; форк сопровождает [hopelessnes5](https://github.com/hopelessnes5/).
 - Порты кода NVIDIA сохраняют заголовки атрибуции Apache-2.0.
 
-Версия 0.4.
+Версия 0.5.
