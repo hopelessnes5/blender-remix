@@ -22,6 +22,7 @@ Not affiliated with NVIDIA. RTX Remix, the RTX Remix Toolkit and AperturePBR mat
 
 - **Direct backend.** NVIDIA's capture algorithms run in-process on Blender's bundled `pxr`/OpenUSD. No Kit, StageCraft, MCP or HTTP/REST service, and no intermediate import files.
 - **Read-only captures.** Capture layers are locked; only the mod/active target layer is authored.
+- **Capture normals.** As in version 0.4.1, captures use `primvars:normals` when present; otherwise Blender calculates smooth normals.
 - **Instant rollback.** Set `REMIX_IMPORT_BACKEND=legacy` to use the previous importer, or `direct-only` to forbid fallback. Details in [PARITY](docs/PARITY.md#backend-switch-and-rollback).
 
 ## Install

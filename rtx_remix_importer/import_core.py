@@ -145,7 +145,6 @@ def import_rtx_remix_usd_with_materials(
     ``(objects, lights, cameras, message)``.
     """
     backend = get_import_backend(context)
-
     if backend == BACKEND_LEGACY:
         return _legacy_import(context, usd_file_path, import_materials, import_lights, scene_scale)
 

@@ -859,6 +859,8 @@ def unregister_properties():
         del bpy.types.Scene.remix_capture_folder_path
     if hasattr(bpy.types.Scene, "remix_capture_scene_scale"):
         del bpy.types.Scene.remix_capture_scene_scale
+    if hasattr(bpy.types.Scene, "remix_capture_normal_mode"):
+        del bpy.types.Scene.remix_capture_normal_mode
     if hasattr(bpy.types.Scene, "remix_capture_import_materials"):
         del bpy.types.Scene.remix_capture_import_materials
     if hasattr(bpy.types.Scene, "remix_capture_import_lights"):

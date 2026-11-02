@@ -103,6 +103,8 @@ class MeshData:
     normals: InterpolatedAttribute | None = None
     subsets: tuple[SubsetData, ...] = ()
     original_corner_count: int = 0
+    subdivision_scheme: str = "catmullClark"
+    normals_source: str = "primvar"
 
     @property
     def is_left_handed(self) -> bool:
@@ -266,7 +268,9 @@ def extract_mesh_data(
     original_corner_count = int(sum(int(count) for count in counts))
 
     normals = _get_primvar(prim, "normals", time_code)
+    normals_source = "primvar"
     if normals is None:
+        normals_source = "attribute"
         normal_values = mesh.GetNormalsAttr().Get(time_code)
         if normal_values is not None:
             normals = InterpolatedAttribute(
@@ -286,6 +290,8 @@ def extract_mesh_data(
         normals=normals,
         subsets=_read_subsets(prim, time_code),
         original_corner_count=original_corner_count,
+        subdivision_scheme=str(mesh.GetSubdivisionSchemeAttr().Get(time_code) or UsdGeom.Tokens.catmullClark),
+        normals_source=normals_source,
     )
 
 

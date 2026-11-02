@@ -52,6 +52,14 @@ class BlenderTestCase(unittest.TestCase):
 
 
 class TestDirectImportCapture(BlenderTestCase):
+    def test_old_saved_normal_choice_does_not_change_capture_import(self):
+        self.context.scene['remix_capture_normal_mode'] = 'USD'
+        objects, _, _, _ = import_with_direct_backend(
+            self.context, str(CAPTURE), False, False, LEGACY_DEFAULT_SCENE_SCALE
+        )
+        mesh = next(iter(objects)).data
+        self.assertTrue(all(poly.use_smooth for poly in mesh.polygons))
+
     def test_capture_import(self):
         objects, lights, cameras, message = import_with_direct_backend(
             self.context, str(CAPTURE), True, True, LEGACY_DEFAULT_SCENE_SCALE

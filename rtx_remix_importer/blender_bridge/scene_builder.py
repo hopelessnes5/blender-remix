@@ -100,7 +100,7 @@ class _MeshRegistry:
         return None, None
 
 
-def _build_prototypes(stage: Usd.Stage, registry: _MeshRegistry) -> int:
+def _build_prototypes(stage: Usd.Stage, registry: _MeshRegistry, normal_mode: str = "LEGACY") -> int:
     """Create one Blender mesh datablock per ``/RootNode/meshes/mesh_<HASH>``."""
     meshes_root = stage.GetPrimAtPath(constants.ROOTNODE_MESHES)
     if not meshes_root or not meshes_root.IsValid():
@@ -124,7 +124,7 @@ def _build_prototypes(stage: Usd.Stage, registry: _MeshRegistry) -> int:
             if mesh_data is None:
                 print(f"  Warning: no usable geometry on {mesh_prim.GetPath()}")
                 continue
-            bl_mesh = create_mesh_datablock(mesh_data, f"{_blender_name(prototype_prim)}_data")
+            bl_mesh = create_mesh_datablock(mesh_data, f"{_blender_name(prototype_prim)}_data", normal_mode)
             registry.add(prototype_path, str(mesh_prim.GetPath()), bl_mesh)
             created += 1
         except Exception:
@@ -195,7 +195,7 @@ def import_with_direct_backend(
 
     try:
         registry = _MeshRegistry()
-        _build_prototypes(stage, registry)
+        _build_prototypes(stage, registry, "LEGACY")
 
         instances_root = stage.GetPrimAtPath(constants.ROOTNODE_INSTANCES)
         instance_count = 0
