@@ -1231,7 +1231,7 @@ def _export_material_impl(blender_material, sublayer_stage, project_root, sublay
 
 # --- Light Export Helper ---
 
-def export_light(operator, context, obj, sublayer_stage, project_root, target_sublayer_path):
+def export_light(operator, context, obj, sublayer_stage, project_root, target_sublayer_path, _texture_transaction=None):
     if not obj or obj.type != 'LIGHT' or not USD_AVAILABLE:
         return False
 
@@ -1416,7 +1416,8 @@ def export_light(operator, context, obj, sublayer_stage, project_root, target_su
 
     if obj.material_slots and obj.material_slots[0].material:
         bl_mat = obj.material_slots[0].material
-        material_path = export_material(bl_mat, sublayer_stage, project_root, target_sublayer_path, parent_mesh_path=None, obj=obj)
+        material_path = export_material(bl_mat, sublayer_stage, project_root, target_sublayer_path, parent_mesh_path=None, obj=obj,
+                                        _texture_transaction=_texture_transaction)
         if material_path:
             UsdShade.MaterialBindingAPI.Apply(light_prim)
             b_rel = light_prim.CreateRelationship("material:binding")
@@ -1453,35 +1454,90 @@ def _export_remix_objects(operator, context, target_filepath, selected_objects, 
 
     success_count = 0
     fail_count = 0
+    layer = stage.GetRootLayer()
+    write_guard.ensure_writable_layer(layer)
+    if stage.GetEditTarget().GetLayer() != layer:
+        operator.report({'ERROR'}, 'Export requires the root layer as edit target')
+        return False, 0, 0
+    initial_usd = layer.ExportToString()
+    transactions = []
+    object_states = []
 
-    for obj in selected_objects:
-        export_successful = False
-        
-        if material_replacement_mode:
-            if obj.type == 'MESH':
-                export_successful = export_material_replacement(operator, context, obj, stage, project_root_dir, target_filepath_abs)
-            else:
+    def snapshot_properties(obj):
+        return {key: (key in obj, obj.get(key)) for key in ('remix_material_path', 'usd_light_path')}
+
+    def restore_properties(obj, properties):
+        for key, (existed, value) in properties.items():
+            if existed:
+                obj[key] = value
+            elif key in obj:
+                del obj[key]
+
+    def restore_layer(snapshot):
+        if layer.ExportToString() != snapshot and not layer.ImportFromString(snapshot):
+            raise RuntimeError('Could not restore USD layer after failed export')
+
+    try:
+        for obj in selected_objects:
+            if obj.type not in ('MESH', 'LIGHT') or (material_replacement_mode and obj.type != 'MESH'):
                 continue
-        else:
-            if obj.type == 'MESH':
-                export_successful = operator.export_mesh(context, obj, stage, project_root_dir, target_filepath_abs)
-            elif obj.type == 'LIGHT':
-                export_successful = export_light(operator, context, obj, stage, project_root_dir, target_filepath_abs)
+            item_usd = layer.ExportToString()
+            properties = snapshot_properties(obj)
+            object_states.append((obj, properties))
+            tx = _MaterialTextureTransaction() if material_replacement_mode or obj.type == 'LIGHT' else None
+            if tx is not None:
+                transactions.append(tx)
+            export_successful = False
+            try:
+                if material_replacement_mode:
+                    export_successful = export_material_replacement(operator, context, obj, stage, project_root_dir, target_filepath_abs, _texture_transaction=tx)
+                elif obj.type == 'MESH':
+                    export_successful = operator.export_mesh(context, obj, stage, project_root_dir, target_filepath_abs)
+                else:
+                    export_successful = export_light(operator, context, obj, stage, project_root_dir, target_filepath_abs, _texture_transaction=tx)
+            except Exception as e:
+                operator.report({'ERROR'}, f"Error exporting {obj.name}: {e}")
+            if export_successful:
+                success_count += 1
             else:
-                continue
+                fail_count += 1
+                restore_layer(item_usd)
+                restore_properties(obj, properties)
+                object_states.pop()
+                if tx is not None:
+                    tx.rollback()
+                    tx.close()
+                    transactions.remove(tx)
 
-        if export_successful:
-            success_count += 1
-        else:
-            fail_count += 1
-
-    if stage.GetRootLayer().dirty:
+        if success_count:
+            for tx in transactions:
+                tx.publish()
+            if layer.dirty:
+                write_guard.ensure_writable_layer(layer)
+                if not layer.Save():
+                    raise RuntimeError('USD layer Save returned false')
+    except Exception as e:
+        rollback_errors = []
         try:
-            write_guard.ensure_writable_layer(stage.GetRootLayer())
-            stage.GetRootLayer().Save()
-        except Exception as e:
-            operator.report({'ERROR'}, f"Failed to save stage {target_filepath_abs}: {e}")
-            return False, success_count, fail_count
+            restore_layer(initial_usd)
+        except Exception as rollback_error:
+            rollback_errors.append(str(rollback_error))
+        for tx in reversed(transactions):
+            try:
+                tx.rollback()
+            except Exception as rollback_error:
+                rollback_errors.append(str(rollback_error))
+        for obj, properties in object_states:
+            try:
+                restore_properties(obj, properties)
+            except Exception as rollback_error:
+                rollback_errors.append(str(rollback_error))
+        detail = f"; rollback errors: {'; '.join(rollback_errors)}" if rollback_errors else ''
+        operator.report({'ERROR'}, f"Failed to export or save stage {target_filepath_abs}: {e}{detail}")
+        return False, 0, 0
+    finally:
+        for tx in transactions:
+            tx.close()
 
     print(f"--- Export Finished: {success_count} succeeded, {fail_count} failed ---")
     return True, success_count, fail_count
@@ -1914,7 +1970,7 @@ def captured_material_path(obj, material, context):
     return None
 
 
-def export_material_replacement(operator, context, obj, sublayer_stage, project_root, target_sublayer_path):
+def export_material_replacement(operator, context, obj, sublayer_stage, project_root, target_sublayer_path, _texture_transaction=None):
     """Exports material replacement for an existing mesh object."""
     if not obj or obj.type != 'MESH':
         return False
@@ -1942,7 +1998,7 @@ def export_material_replacement(operator, context, obj, sublayer_stage, project_
             operator.report({'ERROR'}, f"Cannot find the original captured material hash for '{obj.name}'.")
             return False
         material_path = export_material(bl_mat, sublayer_stage, project_root, target_sublayer_path, obj=obj,
-                                        override_material_path=material_target)
+                                        override_material_path=material_target, _texture_transaction=_texture_transaction)
         if material_path:
             print(f"  Successfully updated captured material {material_path} for {obj.name}")
             obj["remix_material_path"] = str(material_path)

@@ -20,14 +20,18 @@ def _require_blender_main_thread():
         raise RuntimeError('Blender image operations require the main thread')
 
 
-def _progress_on_loop(loop, callback):
+def _progress_on_loop(loop, callback, gates=None):
     """Forward worker progress to the event loop that started the operation."""
     if callback is None:
         return None
 
+    def deliver(message):
+        if gates is None or any(not gate.is_cancelled() for gate in gates):
+            callback(message)
+
     def forward(message):
         try:
-            loop.call_soon_threadsafe(callback, message)
+            loop.call_soon_threadsafe(deliver, message)
         except RuntimeError:
             # The caller closed its loop while the worker was still running.
             pass
@@ -69,10 +73,15 @@ def cleanup_thread_pool():
     """Cleanup the global thread pool and texture queue."""
     global _thread_pool, _texture_queue
     if _texture_queue is not None:
+        _texture_queue.cancel_tasks(list(_texture_queue.active_tasks), 'Addon shutdown')
+        for task in _texture_queue.active_tasks.values():
+            task.progress_callback = None
         _texture_queue.shutdown()
         _texture_queue = None
     if _thread_pool is not None:
-        _thread_pool.shutdown(wait=True)
+        # Let queued workers run their finally blocks to remove prepared files.
+        # Publication gates are already cancelled, so they must not publish.
+        _thread_pool.shutdown(wait=False, cancel_futures=False)
         _thread_pool = None
 
 # --- Path Utilities ---
@@ -209,6 +218,46 @@ def get_stage_manager():
 
 # --- Async Texture Processing Queue ---
 
+import weakref
+
+_publication_gates = weakref.WeakSet()
+_publication_gates_lock = threading.Lock()
+
+
+def cancel_all_publications():
+    """Block all in-flight publications before unloading the add-on."""
+    with _publication_gates_lock:
+        gates = list(_publication_gates)
+    for gate in gates:
+        gate.cancel()
+
+
+class _PublicationGate:
+    """Serialize cancellation with the final filesystem publication."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._cancelled = False
+        with _publication_gates_lock:
+            _publication_gates.add(self)
+
+    def cancel(self):
+        with self._lock:
+            self._cancelled = True
+
+    def is_cancelled(self):
+        with self._lock:
+            return self._cancelled
+
+    def publish(self, source, destination):
+        with self._lock:
+            if self._cancelled:
+                return False
+            if source != destination:
+                os.replace(source, destination)
+            return True
+
+
 class TextureTask:
     """Represents a texture processing task."""
     
@@ -221,6 +270,7 @@ class TextureTask:
         self.texture_type = texture_type
         self.dds_format = dds_format
         self.progress_callback = progress_callback
+        self.publication_gate = _PublicationGate()
         self.future = None
         self.status = "pending"  # pending, processing, completed, failed
         self.result = None
@@ -266,6 +316,7 @@ class TextureProcessingQueue:
     async def stop(self):
         """Stop the queue processing workers."""
         self.is_running = False
+        self.cancel_tasks(list(self.active_tasks), 'Queue stopped')
         
         # Cancel batch timer if running
         if self._batch_timer:
@@ -394,10 +445,15 @@ class TextureProcessingQueue:
         start_time = asyncio.get_event_loop().time()
         
         while task_id in self.active_tasks:
-            if timeout and (asyncio.get_event_loop().time() - start_time) > timeout:
+            if timeout is not None and (asyncio.get_event_loop().time() - start_time) >= timeout:
+                self.cancel_tasks([task_id], 'Texture conversion timed out')
                 return False
             
-            await asyncio.sleep(0.1)
+            try:
+                await asyncio.sleep(0.1)
+            except asyncio.CancelledError:
+                self.cancel_tasks([task_id])
+                raise
         
         task = self.completed_tasks.get(task_id)
         return bool(task and task.status == 'completed' and task.result is True)
@@ -413,7 +469,8 @@ class TextureProcessingQueue:
             if not remaining_tasks:
                 break
             
-            if timeout and (asyncio.get_event_loop().time() - start_time) > timeout:
+            if timeout is not None and (asyncio.get_event_loop().time() - start_time) >= timeout:
+                self.cancel_tasks(remaining_tasks, 'Texture conversion timed out')
                 if progress_callback:
                     progress_callback(f"Timeout waiting for {len(remaining_tasks)} tasks")
                 return False
@@ -422,7 +479,11 @@ class TextureProcessingQueue:
                 completed = len(task_ids) - len(remaining_tasks)
                 progress_callback(f"Completed {completed}/{len(task_ids)} texture tasks")
             
-            await asyncio.sleep(0.5)
+            try:
+                await asyncio.sleep(0.5)
+            except asyncio.CancelledError:
+                self.cancel_tasks(task_ids)
+                raise
         
         success = all(
             task_id in self.completed_tasks
@@ -436,6 +497,16 @@ class TextureProcessingQueue:
             else:
                 progress_callback("One or more texture tasks failed, were cancelled, or were not found")
         return success
+
+    def cancel_tasks(self, task_ids, reason='Texture conversion cancelled'):
+        """Prevent later publication for the specified still-active tasks."""
+        for task_id in task_ids:
+            task = self.active_tasks.get(task_id)
+            if task is not None:
+                task.publication_gate.cancel()
+                task.status = 'cancelled'
+                task.result = False
+                task.error = reason
     
     def get_task_status(self, task_id: str) -> Optional[Dict[str, Any]]:
         """Get the status of a specific task."""
@@ -492,23 +563,30 @@ class TextureProcessingQueue:
                     
                     # Update all tasks in batch to processing status
                     for task in batch:
-                        task.status = "processing"
-                        self._report_task_progress(task, f"[{worker_name}] Processing batch with {task.bl_image.name}")
+                        if not task.publication_gate.is_cancelled():
+                            task.status = "processing"
+                            self._report_task_progress(task, f"[{worker_name}] Processing batch with {task.bl_image.name}")
                     
                     try:
                         # Prepare batch data for texconv
+                        processing = [task for task in batch if not task.publication_gate.is_cancelled()]
                         batch_data = []
-                        for task in batch:
+                        for task in processing:
                             batch_data.append((task.bl_image, task.output_path, task.texture_type, task.dds_format))
                         
                         # Process entire batch with single texconv call
                         batch_results = await texture_processor.convert_texture_batch_async(
                             batch_data,
-                            progress_callback=lambda msg: self._batch_progress_callback(batch, msg)
-                        )
+                            progress_callback=lambda msg: self._batch_progress_callback(processing, msg),
+                            publication_gates=[task.publication_gate for task in processing],
+                        ) if processing else []
                         
                         # Update individual task results
-                        for i, task in enumerate(batch):
+                        for i, task in enumerate(processing):
+                            if task.publication_gate.is_cancelled():
+                                task.status = 'cancelled'
+                                task.result = False
+                                continue
                             if i < len(batch_results):
                                 task.result = batch_results[i]
                                 task.status = "completed" if batch_results[i] else "failed"
@@ -521,9 +599,10 @@ class TextureProcessingQueue:
                         
                     except asyncio.CancelledError:
                         for task in batch:
+                            task.publication_gate.cancel()
                             task.status = 'cancelled'
                             task.result = False
-                            task.error = 'Cancelled; a running conversion may still finish in the background'
+                            task.error = 'Cancelled; publication blocked'
                         raise
                     except Exception as e:
                         # Mark all tasks in batch as failed
@@ -557,7 +636,8 @@ class TextureProcessingQueue:
     def _batch_progress_callback(self, batch: List[TextureTask], message: str):
         """Forward progress messages to all tasks in a batch."""
         for task in batch:
-            self._report_task_progress(task, message)
+            if not task.publication_gate.is_cancelled():
+                self._report_task_progress(task, message)
 
     @staticmethod
     def _report_task_progress(task: TextureTask, message: str):
@@ -796,7 +876,8 @@ class TextureProcessor:
     async def convert_texture_batch_async(
         self,
         texture_batch: List[Tuple[bpy.types.Image, str, str, Optional[str]]],
-        progress_callback: Optional[Callable[[str], None]] = None
+        progress_callback: Optional[Callable[[str], None]] = None,
+        publication_gates=None,
     ) -> List[bool]:
         """Convert a batch of textures using a single texconv process.
 
@@ -821,11 +902,17 @@ class TextureProcessor:
             return results
         
         loop = asyncio.get_event_loop()
-        worker_progress = _progress_on_loop(loop, progress_callback)
-        return await loop.run_in_executor(
-            get_thread_pool(),
-            lambda: self._run_texconv_batch(results, groups, worker_progress)
-        )
+        gates = publication_gates or [_PublicationGate() for _ in texture_batch]
+        worker_progress = _progress_on_loop(loop, progress_callback, gates)
+        try:
+            return await asyncio.shield(loop.run_in_executor(
+                get_thread_pool(),
+                lambda: self._run_texconv_batch(results, groups, worker_progress, gates)
+            ))
+        except asyncio.CancelledError:
+            for gate in gates:
+                gate.cancel()
+            raise
     
     def _prepare_conversion_batch(
         self,
@@ -901,7 +988,7 @@ class TextureProcessor:
                 except OSError:
                     pass
 
-    def _run_texconv_batch(self, results, groups, progress_callback: Optional[Callable[[str], None]] = None) -> List[bool]:
+    def _run_texconv_batch(self, results, groups, progress_callback: Optional[Callable[[str], None]] = None, publication_gates=None) -> List[bool]:
         """Run one texconv invocation per group of prepared input files.
 
         Blender data is never touched here, so this may run in any thread
@@ -909,8 +996,11 @@ class TextureProcessor:
         ``os.replace``, and every prepared PNG is removed in ``finally``.
         """
         prepared_pngs = [item[1] for items in groups.values() for item in items]
+        temporary_outputs = []
         try:
             for (output_dir, texconv_format), group_items in groups.items():
+                if publication_gates and all(publication_gates[i].is_cancelled() for i, _, _ in group_items):
+                    continue
                 if progress_callback:
                     progress_callback(f"Converting {len(group_items)} textures with format {texconv_format}...")
                 
@@ -921,6 +1011,8 @@ class TextureProcessor:
                     temp_base = os.path.splitext(os.path.basename(temp_input_path))[0]
                     temp_output_path = os.path.join(output_dir, f"{temp_base}.dds")
                     temp_to_final_mapping[temp_output_path] = (i, output_path)
+                    if temp_output_path != output_path:
+                        temporary_outputs.append(temp_output_path)
                 
                 try:
                     os.makedirs(output_dir, exist_ok=True)
@@ -968,10 +1060,14 @@ class TextureProcessor:
                 for temp_output_path, (batch_index, final_output_path) in temp_to_final_mapping.items():
                     if os.path.exists(temp_output_path):
                         try:
-                            if temp_output_path != final_output_path:
-                                os.replace(temp_output_path, final_output_path)
-                            results[batch_index] = True
-                            if progress_callback:
+                            gate = publication_gates[batch_index] if publication_gates else None
+                            if gate is not None:
+                                results[batch_index] = gate.publish(temp_output_path, final_output_path)
+                            else:
+                                if temp_output_path != final_output_path:
+                                    os.replace(temp_output_path, final_output_path)
+                                results[batch_index] = True
+                            if progress_callback and results[batch_index]:
                                 progress_callback(f"Converted: {os.path.basename(final_output_path)}")
                         except Exception as e:
                             if progress_callback:
@@ -987,6 +1083,12 @@ class TextureProcessor:
         finally:
             # Cleanup temporary files
             for temp_file in prepared_pngs:
+                try:
+                    if os.path.exists(temp_file):
+                        os.remove(temp_file)
+                except OSError:
+                    pass
+            for temp_file in temporary_outputs:
                 try:
                     if os.path.exists(temp_file):
                         os.remove(temp_file)
@@ -1091,7 +1193,11 @@ class TextureProcessor:
         task_ids = await self.queue_batch_conversion(textures, progress_callback)
         
         # Wait for completion
-        success = await self.wait_for_conversions(task_ids, timeout, progress_callback)
+        try:
+            success = await self.wait_for_conversions(task_ids, timeout, progress_callback)
+        except asyncio.CancelledError:
+            get_texture_queue().cancel_tasks(task_ids)
+            raise
         
         # Collect results
         results = {}
@@ -1150,11 +1256,16 @@ class TextureProcessor:
         try:
             temp_input_path = self._prepare_png_source(bl_image, progress_callback)
             loop = asyncio.get_event_loop()
-            worker_progress = _progress_on_loop(loop, progress_callback)
-            return await loop.run_in_executor(
-                get_thread_pool(),
-                lambda: self._run_png_to_dds(temp_input_path, output_path, dds_format, worker_progress)
-            )
+            gate = _PublicationGate()
+            worker_progress = _progress_on_loop(loop, progress_callback, [gate])
+            try:
+                return await asyncio.shield(loop.run_in_executor(
+                    get_thread_pool(),
+                    lambda: self._run_png_to_dds(temp_input_path, output_path, dds_format, worker_progress, gate)
+                ))
+            except asyncio.CancelledError:
+                gate.cancel()
+                raise
         except Exception as e:
             import traceback
             error_msg = f"Error: {e}\n{traceback.format_exc()}"
@@ -1211,14 +1322,18 @@ class TextureProcessor:
         temp_input_path: str,
         output_path: str,
         dds_format: str,
-        progress_callback: Optional[Callable[[str], None]] = None
+        progress_callback: Optional[Callable[[str], None]] = None,
+        publication_gate=None,
     ) -> bool:
         """Convert a prepared PNG into a DDS at *output_path* via texconv.
 
         No Blender data access here, so this may run in any thread (audit
         A03).  The prepared input file is removed in ``finally``.
         """
+        temp_dds_path = None
         try:
+            if publication_gate and publication_gate.is_cancelled():
+                return False
             # Create output directory
             output_dir = os.path.dirname(output_path)
             os.makedirs(output_dir, exist_ok=True)
@@ -1273,7 +1388,10 @@ class TextureProcessor:
                 return False
 
             # Rename to final output path
-            if temp_dds_path != output_path:
+            if publication_gate:
+                if not publication_gate.publish(temp_dds_path, output_path):
+                    return False
+            elif temp_dds_path != output_path:
                 os.replace(temp_dds_path, output_path)
 
             if progress_callback:
@@ -1282,6 +1400,11 @@ class TextureProcessor:
             return True
 
         finally:
+            if temp_dds_path and temp_dds_path != output_path and os.path.exists(temp_dds_path):
+                try:
+                    os.remove(temp_dds_path)
+                except OSError:
+                    pass
             # Cleanup temporary file
             if os.path.exists(temp_input_path):
                 try:
@@ -1431,12 +1554,25 @@ class TextureProcessor:
             return False
 
         loop = asyncio.get_event_loop()
-        worker_progress = _progress_on_loop(loop, progress_callback)
+        gate = _PublicationGate()
+        worker_progress = _progress_on_loop(loop, progress_callback, [gate])
 
         def _convert():
-            return self.convert_dds_to_png_sync(dds_path, output_path, worker_progress)
+            if gate.is_cancelled():
+                return False
+            output_dir = os.path.dirname(os.path.abspath(output_path))
+            os.makedirs(output_dir, exist_ok=True)
+            with tempfile.TemporaryDirectory(prefix='remix_dds_', dir=output_dir) as temp_dir:
+                staged = os.path.join(temp_dir, os.path.basename(output_path))
+                if not self.convert_dds_to_png_sync(dds_path, staged, worker_progress):
+                    return False
+                return gate.publish(staged, output_path)
 
-        return await loop.run_in_executor(get_thread_pool(), _convert)
+        try:
+            return await asyncio.shield(loop.run_in_executor(get_thread_pool(), _convert))
+        except asyncio.CancelledError:
+            gate.cancel()
+            raise
 
     def batch_convert_dds_to_png(
         self,
@@ -1517,11 +1653,6 @@ class ProgressTracker:
 
 # --- Cleanup Functions ---
 
-def cleanup_addon_resources():
-    """Cleanup all addon resources."""
-    cleanup_thread_pool()
-    get_stage_manager().cleanup_all()
-
 # Global background processing state
 _background_processor = None
 
@@ -1556,6 +1687,7 @@ class BackgroundTextureProcessor:
             'results': [],
             'prepared_results': [],
             'prepared_groups': {},
+            'publication_gate': _PublicationGate(),
             'thread': None,
             'start_time': time.time()
         }
@@ -1619,7 +1751,8 @@ class BackgroundTextureProcessor:
                 texture_processor._run_texconv_batch(
                     results,
                     {group_key: group_items},
-                    progress_callback=lambda msg: self._update_progress(job_id, msg)
+                    progress_callback=lambda msg: self._update_progress(job_id, msg),
+                    publication_gates=[job_info['publication_gate']] * len(results),
                 )
                 job_info['progress'] = sum(1 for ok in results if ok)
 
@@ -1629,7 +1762,9 @@ class BackgroundTextureProcessor:
             groups.clear()
             job_info['results'] = results
 
-            if all(results):
+            if job_info.get('cancelled', False):
+                job_info['status'] = 'cancelled'
+            elif all(results):
                 job_info['status'] = 'completed'
             else:
                 # A texture error must never read as success (audit A04).
@@ -1715,10 +1850,24 @@ class BackgroundTextureProcessor:
     def cancel_job(self, job_id):
         """Cancel a background job."""
         if job_id in self.active_jobs:
-            self.active_jobs[job_id]['cancelled'] = True
+            job = self.active_jobs[job_id]
+            job['publication_gate'].cancel()
+            job['cancelled'] = True
             return True
         return False
     
+    def shutdown(self):
+        """Detach UI callbacks and cancel jobs without waiting for texconv."""
+        for job_id, info in list(self.active_jobs.items()):
+            self.cancel_job(job_id)
+            info['progress_callback'] = None
+            info['completion_callback'] = None
+            info.pop('last_message', None)
+        if bpy.app.timers.is_registered(self._timer_callback):
+            bpy.app.timers.unregister(self._timer_callback)
+        self.timer_registered = False
+        self.completed_jobs.clear()
+
     def cleanup_completed_jobs(self):
         """Clean up old completed jobs."""
         self.completed_jobs.clear()
@@ -1745,7 +1894,19 @@ def get_thumbnail_preview(capture_full_path):
     return None
 
 def cleanup_addon_resources():
-    """Cleans up temporary files created by the addon."""
+    """Release callbacks and caches when disabling or opening another file."""
+    global _background_processor
+    cancel_all_publications()
+    if _background_processor is not None:
+        _background_processor.shutdown()
+        _background_processor = None
+    cleanup_thread_pool()
+    if _stage_manager is not None:
+        _stage_manager.cleanup_all()
+    from .material_utils import clear_material_cache
+    from .mod_apply_utils import clear_mod_apply_caches
+    clear_material_cache()
+    clear_mod_apply_caches()
 
 
 # Blender version compatibility functions

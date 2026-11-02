@@ -9,9 +9,16 @@ bl_info = {
 }
 
 import bpy
+from bpy.app.handlers import persistent
 from . import ui
 from . import operators
 from .core_utils import get_blender_version, is_blender_4_1_or_newer
+
+
+@persistent
+def _cleanup_before_load(_unused):
+    from .core_utils import cleanup_addon_resources
+    cleanup_addon_resources()
 
 def register():
     # Check Blender version and show compatibility info
@@ -23,7 +30,13 @@ def register():
     
     operators.register()
     ui.register()
+    if _cleanup_before_load not in bpy.app.handlers.load_pre:
+        bpy.app.handlers.load_pre.append(_cleanup_before_load)
 
 def unregister():
+    if _cleanup_before_load in bpy.app.handlers.load_pre:
+        bpy.app.handlers.load_pre.remove(_cleanup_before_load)
+    from .core_utils import cleanup_addon_resources
+    cleanup_addon_resources()
     ui.unregister()
     operators.unregister()

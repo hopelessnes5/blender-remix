@@ -81,5 +81,5 @@ class TestTextureQueueStatus(unittest.TestCase):
                 for task_id in ids:
                     self.assertEqual(queue.get_task_status(task_id)['status'], 'cancelled')
                     self.assertFalse(await queue.wait_for_task(task_id))
-                self.assertIn('may still finish', queue.get_task_status(ids[0])['error'])
+                self.assertIn('publication blocked', queue.get_task_status(ids[0])['error'])
         asyncio.run(check())
