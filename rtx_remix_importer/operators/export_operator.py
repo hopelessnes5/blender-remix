@@ -761,6 +761,31 @@ def _clear_stale_local_input(shader, name, value_type, replacement, stale_value)
     shader.CreateAttribute('inputs:' + name, value_type).Set(replacement)
 
 
+def _mask_absent_input(shader, name, value_type, neutral_value, stale_local):
+    """Author a neutral opinion for an input this export did not write.
+
+    A local stale spec is overwritten; an input that only weaker layers author
+    gets a fresh local opinion, so the exported graph wins over the capture.
+    Connected or animated inputs stay untouched, and a weak value that already
+    equals the neutral value is left as is.
+    """
+    layer = shader.GetStage().GetEditTarget().GetLayer()
+    path = shader.GetPath().AppendProperty('inputs:' + name)
+    if layer.GetAttributeAtPath(path):
+        _clear_stale_local_input(shader, name, value_type, neutral_value, stale_local)
+        return
+    attribute = shader.GetAttribute('inputs:' + name)
+    if not attribute or not attribute.HasValue():
+        return
+    if attribute.GetConnections() or any(
+            item.layer.ListTimeSamplesForPath(item.path)
+            for item in attribute.GetPropertyStack()):
+        return
+    if attribute.Get() == neutral_value:
+        return
+    shader.CreateAttribute('inputs:' + name, value_type).Set(neutral_value)
+
+
 class _MaterialTextureTransaction:
     """Stage DDS files next to their destinations and restore partial publication."""
 
@@ -1195,6 +1220,28 @@ def _export_material_impl(blender_material, sublayer_stage, project_root, sublay
         material_api.CreateDisplacementOutput("mdl").ConnectToSource(shader_output)
         material_api.CreateVolumeOutput("mdl").ConnectToSource(shader_output)
 
+    # The MDL ident trio belongs to every authored or replaced shader. A
+    # replacement only reauthors it when the composed (weaker) family differs
+    # from the exported graph (audit A07): equal families keep the weaker ident
+    # untouched, a family switch rebinds the shader and dead-family inputs.
+    dead_family = None
+    if override_material_path is not None:
+        composed_shader = sublayer_stage.GetPrimAtPath(str(shader_path))
+        composed_ident = None
+        if composed_shader:
+            ident_attr = composed_shader.GetAttribute('info:mdl:sourceAsset:subIdentifier')
+            if ident_attr:
+                composed_ident = ident_attr.Get(Usd.TimeCode.Default())
+        if composed_ident is not None and composed_ident != material_type:
+            shader_prim.CreateAttribute("info:implementationSource", Sdf.ValueTypeNames.Token).Set("sourceAsset")
+            shader_prim.CreateAttribute("info:mdl:sourceAsset", Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(f"{material_type}.mdl"))
+            shader_prim.CreateAttribute("info:mdl:sourceAsset:subIdentifier", Sdf.ValueTypeNames.Token).Set(material_type)
+            if composed_ident is not None:
+                # The new family's MDL files must ship with the replacement.
+                ensure_mdl_files(project_root)
+                dead_family = composed_ident
+
+    if override_material_path is None:
         shader_prim.CreateAttribute("info:implementationSource", Sdf.ValueTypeNames.Token).Set("sourceAsset")
         shader_prim.CreateAttribute("info:mdl:sourceAsset", Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(f"{material_type}.mdl"))
         shader_prim.CreateAttribute("info:mdl:sourceAsset:subIdentifier", Sdf.ValueTypeNames.Token).Set(material_type)
@@ -1317,9 +1364,10 @@ def _export_material_impl(blender_material, sublayer_stage, project_root, sublay
             if specular_socket and specular_socket.default_value != 0.5:
                 shader_prim.CreateAttribute("inputs:specular_constant", Sdf.ValueTypeNames.Float).Set(float(specular_socket.default_value))
 
-    # Reconcile only locally authored managed defaults. Empty asset paths and
-    # false flags mask older values in weaker capture layers; merely removing
-    # these properties would make those values visible again.
+    # Reconcile managed inputs this export did not write. Empty asset paths and
+    # false flags mask older local values and values that solely weaker layers
+    # authored (audit A07); merely removing these properties would make those
+    # values visible again.
     absent_textures = {
         'normalmap_texture': not normal_rel_path,
         'height_texture': not displacement_record,
@@ -1337,20 +1385,38 @@ def _export_material_impl(blender_material, sublayer_stage, project_root, sublay
         })
     for input_name, absent in absent_textures.items():
         if absent:
-            _clear_stale_local_input(shader_prim, input_name, Sdf.ValueTypeNames.Asset,
-                                     Sdf.AssetPath(), lambda value: isinstance(value, Sdf.AssetPath) and bool(value.path))
+            _mask_absent_input(shader_prim, input_name, Sdf.ValueTypeNames.Asset,
+                               Sdf.AssetPath(), lambda value: isinstance(value, Sdf.AssetPath) and bool(value.path))
     if not enable_emission:
-        _clear_stale_local_input(shader_prim, 'enable_emission', Sdf.ValueTypeNames.Bool,
-                                 False, lambda value: value is True)
+        _mask_absent_input(shader_prim, 'enable_emission', Sdf.ValueTypeNames.Bool,
+                           False, lambda value: value is True)
     if material_type != 'AperturePBR_Translucent' and not has_alpha:
         for input_name in ('enable_opacity', 'blend_enabled'):
-            _clear_stale_local_input(shader_prim, input_name, Sdf.ValueTypeNames.Bool,
-                                     False, lambda value: value is True)
+            _mask_absent_input(shader_prim, input_name, Sdf.ValueTypeNames.Bool,
+                               False, lambda value: value is True)
+
+    # A family switch leaves dedicated inputs of the old family behind (A07);
+    # mask them so the new MDL graph stays clean. Shared inputs are kept: the
+    # new family still uses them.
+    if dead_family is not None:
+        from ..material_defaults import (dead_family_inputs, FLAG_INPUTS,
+                                         TEXTURE_INPUTS)
+        for input_name in sorted(dead_family_inputs(dead_family, material_type)):
+            if input_name in TEXTURE_INPUTS[dead_family]:
+                _mask_absent_input(shader_prim, input_name, Sdf.ValueTypeNames.Asset,
+                                   Sdf.AssetPath(),
+                                   lambda value: isinstance(value, Sdf.AssetPath) and bool(value.path))
+            elif input_name in FLAG_INPUTS[dead_family]:
+                _mask_absent_input(shader_prim, input_name, Sdf.ValueTypeNames.Bool,
+                                   False, lambda value: value is True)
 
     # A replacement target may be opened on its own, without the weaker
-    # capture. Keep authored defaults: they may be needed to override it.
-    from ..material_defaults import remove_default_inputs
-    remove_default_inputs(shader_prim, material_type, preserve_authored=override_material_path is not None)
+    # capture. Defaults may only be omitted when some weaker layer shows the
+    # composed prim; otherwise they must stay to mask an unseen value (A06).
+    from ..material_defaults import remove_default_inputs, weaker_layer_authors_prim
+    remove_default_inputs(shader_prim, material_type,
+                          preserve_authored=(override_material_path is not None
+                                             and not weaker_layer_authors_prim(sublayer_stage, str(shader_path))))
     return mat_path
 
 # --- Light Export Helper ---

@@ -629,8 +629,12 @@ class MaterialExporter:
                     shader_prim.CreateAttribute(usd_attr, Sdf.ValueTypeNames.Float).Set(float(value))
 
 
-        from .material_defaults import remove_default_inputs
-        remove_default_inputs(shader_prim, material_type)
+        from .material_defaults import remove_default_inputs, weaker_layer_authors_prim
+        # Omitting a default only stands when no weaker layer hides behind the
+        # freshly defined prim; a capture material at the same composed path
+        # must keep the explicit values to stay masked (audit A06).
+        remove_default_inputs(shader_prim, material_type, preserve_authored=weaker_layer_authors_prim(
+            shader_prim.GetStage(), shader_prim.GetPath()))
 
     def export_material_sync(
         self,

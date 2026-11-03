@@ -1,7 +1,11 @@
 """Only redundant MDL inputs may be removed from authored shader specs."""
 import unittest
 from pxr import Gf, Sdf, Usd
-from rtx_remix_importer.material_defaults import remove_default_inputs
+from rtx_remix_importer.material_defaults import (
+    dead_family_inputs,
+    remove_default_inputs,
+    weaker_layer_authors_prim,
+)
 
 
 class TestMaterialDefaults(unittest.TestCase):
@@ -42,3 +46,30 @@ class TestMaterialDefaults(unittest.TestCase):
         remove_default_inputs(shader, 'AperturePBR_Translucent')
         self.assertFalse(shader.GetAttribute('inputs:ior_constant'))
         self.assertTrue(shader.GetAttribute('inputs:thin_walled').Get())
+
+    def test_weaker_layer_authors_prim_sees_weak_specs_only(self):
+        root = Sdf.Layer.CreateAnonymous('root.usda')
+        weak = Sdf.Layer.CreateAnonymous('weak.usda')
+        root.subLayerPaths.append(weak.identifier)
+        stage = Usd.Stage.Open(root)
+        self.assertFalse(weaker_layer_authors_prim(stage, '/Shader'))
+        stage.SetEditTarget(weak)
+        stage.DefinePrim('/Shader', 'Shader')
+        self.assertFalse(weaker_layer_authors_prim(stage, '/Shader'))
+        stage.SetEditTarget(root)
+        stage.DefinePrim('/Shader', 'Shader')
+        self.assertTrue(weaker_layer_authors_prim(stage, '/Shader'))
+        # A prim authored only in the edit target still counts as weak-free.
+        self.assertFalse(weaker_layer_authors_prim(stage, '/Other'))
+
+    def test_dead_family_inputs_exclude_shared_inputs(self):
+        self.assertEqual(
+            dead_family_inputs('AperturePBR_Opacity', 'AperturePBR_Translucent'),
+            {'diffuse_texture', 'metallic_texture', 'reflectionroughness_texture',
+             'opacity_texture', 'specular_texture', 'height_texture',
+             'enable_opacity', 'blend_enabled'})
+        self.assertEqual(
+            dead_family_inputs('AperturePBR_Translucent', 'AperturePBR_Opacity'),
+            {'transmittance_texture', 'thin_walled', 'use_diffuse_layer'})
+        self.assertFalse(dead_family_inputs('AperturePBR_Opacity', 'AperturePBR_Opacity'))
+        self.assertFalse(dead_family_inputs('Unknown', 'AperturePBR_Opacity'))

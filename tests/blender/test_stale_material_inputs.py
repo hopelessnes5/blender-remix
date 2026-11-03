@@ -72,13 +72,12 @@ class StaleMaterialInputs(unittest.TestCase):
             self.assertEqual(self.shader.GetAttribute('inputs:' + name).Get(), False)
         self.assertTrue(self.weak.GetAttributeAtPath(self.shaderpath + '.inputs:enable_opacity').default)
 
-    def test_weaker_only_input_and_local_animated_input_are_preserved(self):
+    def test_local_animated_input_is_preserved(self):
         normal = self.shader.CreateAttribute('inputs:normalmap_texture', Sdf.ValueTypeNames.Asset)
         normal.Set(Sdf.AssetPath('animated.dds'), 1)
         normal.Set(Sdf.AssetPath('local.dds'))
         self.run_export()
         self.assertEqual(normal.Get(), Sdf.AssetPath('local.dds'))
-        self.assertEqual(self.shader.GetAttribute('inputs:height_texture').Get(), Sdf.AssetPath('weaker.dds'))
 
     def test_connected_managed_input_is_preserved(self):
         normal = self.shader.CreateAttribute('inputs:normalmap_texture', Sdf.ValueTypeNames.Asset)

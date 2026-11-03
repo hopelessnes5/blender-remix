@@ -56,7 +56,7 @@ The official Toolkit is a Kit-based application (`lightspeed.trex.*` extensions)
 | Feature | Official Toolkit component | Status | Notes in this add-on |
 |---|---|:--:|---|
 | Author `AperturePBR_Opacity` / `AperturePBR_Translucent` materials (texture slots + constants) | `lightspeed.tool.material.core` | ✅ | diffuse, metallic, roughness, normal, emissive, opacity, specular; transmittance, IOR, thin-walled. Principled BSDF inputs plus an active Material Output → Displacement → image chain; opaque height maps export as BC4 with displace_in/out |
-| Replace the material of a captured mesh | `lightspeed.tool.material.core` | 🟡 | authors an `over` on the original `mat_<HASH>` and its shader; all instances using that material are affected |
+| Replace the material of a captured mesh | `lightspeed.tool.material.core` | 🟡 | authors an `over` on the original `mat_<HASH>` and its shader; a capture-declared MDL family switch (opaque ↔ translucent) rebinds the ident trio and masks the dead family's inputs; all instances using that material are affected; the composed game runtime is not verified |
 | Correct material binding strength (`bindMaterialAs` as relationship metadata) | USD material binding | ✅ | authored through `MaterialBindingAPI`, not as an attribute |
 | Blender-side Aperture node groups (`Aperture Opaque` / `Aperture Translucent`) + Principled ⇄ Aperture conversion operators | — (Blender-side authoring) | ⛔ | deliberately removed: materials are authored natively as standard Principled BSDF; node groups written by old releases remain readable for re-export |
 | Copy / transfer material overrides between prims | `transfer_property_spec_to_layer`, `transfer_reference_spec_to_layer` | ⛔ | |
@@ -213,7 +213,13 @@ authored on the mesh prototype, the capture file hash is unchanged and no
 `assets/` output appears. Tests exercise multiple instances and restoration;
 standard USD can still compose instance geometry from capture-layer references. `tests/blender/test_principled_materials.py` checks
 Principled constants, opacity gating, transmission type detection and selected
-USD export values on real Blender nodes. `tests/unit/test_material_defaults.py` checks omission of MDL defaults and preservation of stronger opinions over weaker layers. `tests/blender/test_capture_thumbnails.py`
+USD export values on real Blender nodes. `tests/unit/test_material_defaults.py` checks omission of MDL defaults and preservation of stronger opinions over weaker layers. `tests/blender/test_material_weak_composition.py`
+checks the replacement write against a composed capture: MDL defaults are omitted only
+when the weaker layers agree; explicit values mask disagreeing capture values; an
+undeclared family is not invented; weak-only inputs the user turned off are masked
+(empty asset paths, `False` flags) and a declared family switch rebinds the
+`info:mdl` ident trio while masking the dead family's inputs.
+`tests/blender/test_capture_thumbnails.py`
 checks direct DDS thumbnail lookup, decoding, refresh and missing files without
 a converted-file cache. `tests/blender/test_write_guard.py` checks the shared
 write guard behind every layer-save entry point: capture and locked layers and
@@ -224,7 +230,7 @@ checks the texture source guard: height and normal exports refuse hard-link
 and symlink aliases and the recorded pre-decode source path before texconv
 availability is even checked, and a distinct target still exports.
 
-**Executed result:** 305 tests pass on both Blender 4.5.5 LTS (bundled OpenUSD
+**Executed result:** 316 tests pass on both Blender 4.5.5 LTS (bundled OpenUSD
 25.02) and Blender 5.1.2 (bundled OpenUSD 25.08) on Windows, exit code `0`.
 `register()` / `unregister()` are exercised by the suite through the
 UI-operator tests. The package-install smoke check — a freshly built
