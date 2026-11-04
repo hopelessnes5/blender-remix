@@ -5,6 +5,8 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
+import math
+
 from pxr import Gf, Sdf, Usd, UsdGeom
 
 from rtx_remix_importer.nvidia_core import geometry
@@ -113,6 +115,32 @@ class TestMatrixConversion(unittest.TestCase):
         self.assertEqual(converted[1][3], 2.0)
         self.assertEqual(converted[2][3], 3.0)
         self.assertEqual(converted[3][3], 1.0)
+
+    def test_is_trs_representable_accepts_straight_chains(self):
+        import mathutils
+
+        rot = mathutils.Euler((0, 0, 0.3)).to_matrix().to_4x4()
+        uniform = rot @ mathutils.Matrix.Scale(2.0, 4)
+        self.assertTrue(geometry.is_trs_representable(uniform))
+        stretched = mathutils.Matrix.Diagonal((1.0, 2.0, 3.0, 1.0))
+        self.assertTrue(geometry.is_trs_representable(stretched))
+        tilted = mathutils.Euler((0.4, 0, 0)).to_matrix().to_4x4() @ uniform
+        self.assertTrue(geometry.is_trs_representable(tilted))
+
+    def test_is_trs_representable_rejects_shear_and_singular(self):
+        import mathutils
+
+        parent_rot = mathutils.Euler((0, 0, math.radians(45))).to_matrix().to_4x4()
+        parent_scale = mathutils.Matrix.Diagonal((1.0, 2.0, 1.0, 1.0))
+        child_rot = mathutils.Euler((math.radians(30), 0, 0)).to_matrix().to_4x4()
+        sheared = parent_rot @ parent_scale @ child_rot
+        self.assertFalse(geometry.is_trs_representable(sheared))
+
+        reflected = parent_rot @ mathutils.Matrix.Diagonal((-1.0, 1.0, 1.0, 1.0))
+        self.assertTrue(geometry.is_trs_representable(reflected))
+
+        singular = mathutils.Matrix.Diagonal((1.0, 0.0, 1.0, 1.0))
+        self.assertFalse(geometry.is_trs_representable(singular))
 
 
 class TestGeometryRegressions(unittest.TestCase):

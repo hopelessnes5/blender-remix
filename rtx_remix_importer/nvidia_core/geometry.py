@@ -335,3 +335,33 @@ def matrix_usd_to_blender(matrix: Gf.Matrix4d):
         (matrix[0][2], matrix[1][2], matrix[2][2], matrix[3][2]),
         (matrix[0][3], matrix[1][3], matrix[2][3], matrix[3][3]),
     )
+
+
+def is_trs_representable(matrix, tolerance: float = 1e-3) -> bool:
+    """Check whether a 4x4 world matrix decomposes into translate/rotate/scale.
+
+    Works on any indexable 4x4 in ``[i][j]`` layout (mathutils, Gf, tuples);
+    only the linear 3x3 block is inspected. A matrix from a rotated child under
+    a non-uniformly scaled parent contains shear, which translate/rotate/scale
+    transforms cannot recreate and representations that work on decomposed
+    triples would silently misplace. Singular matrices (zero-length basis
+    vectors) also qualify as not representable. Reflections are representable
+    translate/rotate/scale chains (a negative scale axis) and are accepted.
+    """
+    linear = tuple(
+        tuple(float(matrix[i][j]) for j in range(3)) for i in range(3)
+    )
+    columns = [[linear[i][j] for i in range(3)] for j in range(3)]
+    lengths = [
+        math.sqrt(c[0] * c[0] + c[1] * c[1] + c[2] * c[2]) for c in columns
+    ]
+    if any(length < 1e-9 for length in lengths):
+        return False
+    unit = [tuple(c[i] / length for i in range(3))
+            for c, length in zip(columns, lengths)]
+    for first in range(3):
+        for second in range(first + 1, 3):
+            dot = sum(unit[first][k] * unit[second][k] for k in range(3))
+            if abs(dot) > tolerance:
+                return False
+    return True

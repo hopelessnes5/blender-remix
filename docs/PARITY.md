@@ -226,6 +226,14 @@ standalone prototype is placed on the full container chain, an instance is
 placed on its mapped subtree and keeps USD reference semantics (the
 prototype container's transform is not folded into the instance placement),
 and the plain capture layout keeps importing as before.
+`tests/blender/test_light_camera_roundtrip.py` pins the light/camera unit
+and basis conversions, including parent chains: a rigid parent chain
+(translate, rotate, uniform scale) roundtrips through the light export,
+a sheared parent chain refuses the light export with an explicit error
+instead of silently misplacing it, sheared USD chains import with a
+warning (exact position, approximated orientation), a parented camera
+keeps its composed world matrix, and the CylinderLight/ELLIPSE to
+Rectangle/DiskLight approximations are stated instead of assumed.
 `tests/blender/test_capture_thumbnails.py`
 checks direct DDS thumbnail lookup, decoding, refresh and missing files without
 a converted-file cache. `tests/blender/test_write_guard.py` checks the shared
@@ -237,7 +245,7 @@ checks the texture source guard: height and normal exports refuse hard-link
 and symlink aliases and the recorded pre-decode source path before texconv
 availability is even checked, and a distinct target still exports.
 
-**Executed result:** 321 tests pass on both Blender 4.5.5 LTS (bundled OpenUSD
+**Executed result:** 328 tests pass on both Blender 4.5.5 LTS (bundled OpenUSD
 25.02) and Blender 5.1.2 (bundled OpenUSD 25.08) on Windows, exit code `0`.
 `register()` / `unregister()` are exercised by the suite through the
 UI-operator tests. The package-install smoke check — a freshly built

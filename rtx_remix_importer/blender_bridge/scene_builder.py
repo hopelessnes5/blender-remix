@@ -193,7 +193,14 @@ def _create_camera(
         bl_cam_data.clip_end = clipping_range[1] * unit_scale
 
     bl_cam_obj = bpy.data.objects.new(name, bl_cam_data)
-    bl_cam_obj.matrix_world = _object_matrix(composition, cam_prim, unit_scale)
+    world_matrix = _object_matrix(composition, cam_prim, unit_scale)
+    # Blender objects hold translate/rotate/scale only; a sheared parent chain
+    # (non-uniform parents) loses the shear on matrix_world assignment. Point
+    # it out instead of silently tilting the camera.
+    if not geometry.is_trs_representable(world_matrix):
+        print(f"  Warning: camera {name} world transform contains shear; "
+              "position is exact, orientation is approximated")
+    bl_cam_obj.matrix_world = world_matrix
     bl_cam_obj.data["is_remix_camera"] = True
     bl_cam_obj.data["remix_capture_source"] = os.path.basename(composition.path)
     return bl_cam_obj

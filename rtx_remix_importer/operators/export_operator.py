@@ -21,6 +21,7 @@ except ImportError:
 
 from .. import constants
 from .. import write_guard
+from ..nvidia_core.geometry import is_trs_representable
 from ..core_utils import (
     calc_normals_split_compatible,
     get_corner_normals_compatible,
@@ -1471,6 +1472,13 @@ def export_light(operator, context, obj, sublayer_stage, project_root, target_su
             extent = Vt.Vec3fArray([Gf.Vec3f(-half_w, -half_h, 0), Gf.Vec3f(half_w, half_h, 0)])
         elif bl_light.shape in ['DISK', 'ELLIPSE']:
             usd_light_type = "DiskLight"
+            if bl_light.shape == 'ELLIPSE' and abs(bl_light.size_y - bl_light.size) > 1e-6:
+                # USD has no elliptical disk light; record the approximation
+                # instead of dropping the y extent silently.
+                operator.report(
+                    {'WARNING'},
+                    f"{obj.name}: ELLIPSE area light is exported as a circular "
+                    f"DiskLight; the y diameter {bl_light.size_y:.4g} is dropped")
             light_attrs["inputs:radius"] = float(bl_light.size * 0.5 / remix_export_scale)
             r = light_attrs["inputs:radius"]
             extent = Vt.Vec3fArray([Gf.Vec3f(-r, -r, 0), Gf.Vec3f(r, r, 0)])
@@ -1509,7 +1517,28 @@ def export_light(operator, context, obj, sublayer_stage, project_root, target_su
             except Exception as e:
                 operator.report({'WARNING'}, f"Invalid anchor path '{anchor_path_str}': {e}. Using default path.")
                 parent_prim_path = None
-    
+
+    # Blender parents feed obj.matrix_world; a rotated child under a
+    # non-uniformly scaled parent carries shear that translate/rotate/scale
+    # exports cannot recreate. Validate before authoring anything so a
+    # non-representable light fails closed instead of being misplaced.
+    anchor_matrix_error = None
+    placement_matrix = obj.matrix_world
+    if anchor_obj:
+        try:
+            inv_anchor = get_safe_matrix_inverse(anchor_obj.matrix_world)
+            placement_matrix = inv_anchor @ obj.matrix_world
+        except Exception as e:
+            anchor_matrix_error = e
+    if anchor_matrix_error is not None or not is_trs_representable(placement_matrix):
+        if anchor_matrix_error is not None:
+            reason = f"anchor '{anchor_obj.name}' has a singular world matrix"
+        else:
+            reason = ("parent chain contains shear or a reflection; apply parent "
+                      "transforms into the object before export")
+        operator.report({'ERROR'}, f"Cannot export light {obj.name}: {reason}")
+        return False
+
     if not parent_prim_path:
         remix_assets_path = Sdf.Path("/RootNode/remix_assets")
         sublayer_stage.DefinePrim(remix_assets_path, "Xform")
@@ -1560,25 +1589,17 @@ def export_light(operator, context, obj, sublayer_stage, project_root, target_su
             print(f"    ERROR setting extent: {e}")
 
     if anchor_obj:
-        try:
-            inv_anchor = get_safe_matrix_inverse(anchor_obj.matrix_world)
-            relative_matrix = inv_anchor @ obj.matrix_world
-            loc, rot, scale_vec = relative_matrix.decompose()
-            # Imported anchors include the capture unit scale in their world
-            # matrix, while imported light object matrices do not. Remove that
-            # factor before translating Blender units back into USD units.
-            if anchor_obj.get('usd_instance_path') or anchor_obj.get('usd_prim_path'):
-                import_scale = float(context.scene.get('remix_import_unit_scale', 1.0))
-                if import_scale > 0:
-                    loc *= import_scale
-                    scale_vec *= import_scale
-        except Exception as e:
-            print(f"  WARNING: Relative light transform fallback: {e}")
-            loc = obj.location - anchor_obj.location
-            rot = obj.rotation_quaternion if obj.rotation_mode == 'QUATERNION' else obj.rotation_euler.to_quaternion()
-            scale_vec = obj.scale
+        loc, rot, scale_vec = placement_matrix.decompose()
+        # Imported anchors include the capture unit scale in their world
+        # matrix, while imported light object matrices do not. Remove that
+        # factor before translating Blender units back into USD units.
+        if anchor_obj.get('usd_instance_path') or anchor_obj.get('usd_prim_path'):
+            import_scale = float(context.scene.get('remix_import_unit_scale', 1.0))
+            if import_scale > 0:
+                loc *= import_scale
+                scale_vec *= import_scale
     else:
-        loc, rot, scale_vec = obj.matrix_world.decompose()
+        loc, rot, scale_vec = placement_matrix.decompose()
 
         # World-space lights need the inverse of the import's Y-up basis.
         game_stage = get_game_stage(context)

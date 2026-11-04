@@ -8,6 +8,9 @@ try:
 except ImportError:
     USD_AVAILABLE = False
 
+if USD_AVAILABLE:
+    from .nvidia_core.geometry import is_trs_representable
+
 def create_light_from_usd(light_prim, stage, scene_scale=1.0, up_axis=None):
     """
     Create a Blender light from a USD light prim.
@@ -34,23 +37,45 @@ def create_light_from_usd(light_prim, stage, scene_scale=1.0, up_axis=None):
         # Note: Blender typically uses Z-up, USD can be Y-up or Z-up.
         # We need to handle potential axis conversion.
         world_transform = xformable.ComputeLocalToWorldTransform(Usd.TimeCode.Default())
+        # Capture chains with non-uniformly scaled (or reflected) parents can
+        # shear the composed transform. Blender objects hold translate/rotate/
+        # scale only, so placement stays exact but the orientation becomes the
+        # closest approximation; say so instead of misplacing silently.
+        if not is_trs_representable(world_transform):
+            print(f"  Warning: light {light_name} world transform contains shear; "
+                  "position is exact, orientation is approximated")
         translate = world_transform.ExtractTranslation()
+        # ExtractRotationQuat misbehaves when the parent chain carries scale,
+        # so derive the pure rotation by normalizing the basis vectors of the
+        # composed transform (Gf stores them column-wise in the linear block).
+        columns = [
+            tuple(world_transform[i][j] for i in range(3))
+            for j in range(3)
+        ]
+        lengths = [math.sqrt(c[0] * c[0] + c[1] * c[1] + c[2] * c[2])
+                   for c in columns]
+        if min(lengths) > 1e-9:
+            rotation_matrix = mathutils.Matrix(tuple(
+                tuple(c / length for c in column)
+                for column, length in zip(columns, lengths)
+            ))
+        else:
+            rotation_matrix = mathutils.Matrix.Identity(3)
         # Rotation extraction is complex (quaternion -> euler)
-        rotation_quat = world_transform.ExtractRotationQuat()
-        # Scale requires decomposing the matrix, often lights aren't scaled directly in transform
+        rotation_quat = rotation_matrix.to_quaternion()
         # Scale components affect Area light size properties instead.
 
         # Handle potential axis conversion (assuming Blender is Z-up)
         up_axis = up_axis or UsdGeom.GetStageUpAxis(stage)
         blender_location = (translate[0], translate[1], translate[2])
-        blender_rotation_quat = (rotation_quat.GetReal(), *rotation_quat.GetImaginary())
+        blender_rotation_quat = rotation_quat
 
         if up_axis == UsdGeom.Tokens.y:
             # Convert Y-up USD to Z-up Blender
             # Swap Y and Z, negate new Y for position
             blender_location = (translate[0], -translate[2], translate[1])
             basis = mathutils.Quaternion((1, 0, 0), math.pi / 2)
-            blender_rotation_quat = basis @ mathutils.Quaternion(blender_rotation_quat)
+            blender_rotation_quat = basis @ blender_rotation_quat
 
         # Apply scene scale to location
         blender_location = (
