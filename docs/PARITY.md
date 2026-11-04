@@ -42,7 +42,7 @@ The official Toolkit is a Kit-based application (`lightspeed.trex.*` extensions)
 |---|---|:--:|---|
 | Replace a captured mesh: `over "mesh_<HASH>" ( references = None )` + child `def Xform "ref_<uuid>"` with `prepend references` and `custom bool IsRemixRef = 1` | `lightspeed.trex.asset_replacements.core.shared`, `lightspeed.trex.properties_pane.mesh.widget` | ✅ | `Export Selected Meshes/Lights`; holder prim is reused on repeated exports, duplicates and stale overrides are cleaned up |
 | Hide a captured mesh without exporting geometry | `Setup.remove_reference` (cross-layer branch) | 🟡 | `Hide Selected Meshes` writes `references = None` on `mesh_<HASH>` in the mod layer; instances and capture layers are not modified. Game runtime behavior remains unverified |
-| Ingested mesh asset layout: `/ReferenceTarget` → `/XForms` → `Mesh`, `MaterialBindingAPI`, `subdivisionScheme`, `extent`, face-varying UVs and normals | `lightspeed.trex.asset_pipeline.core` (`meta` step), IngestCraft | ✅ | same structure the official ingest pipeline writes, including `defaultPrim` |
+| Ingested mesh asset layout: `/ReferenceTarget` → `/XForms` → `Mesh`, `MaterialBindingAPI`, `subdivisionScheme`, `extent`, face-varying UVs and normals | `lightspeed.trex.asset_pipeline.core` (`meta` step), IngestCraft | ✅ | same structure the official ingest pipeline writes, including `defaultPrim`; the direct import composes it back — the nested `ref_`/`XForms` Mesh is found several levels below the prototype and placed on the full transform chain (instance placement keeps USD reference semantics) |
 | Unit normalisation of the asset | ingest `ApplyUnitScale` | 🟡 | geometry is converted with `Export Scale` instead of `metersPerUnit` |
 | Add a brand-new instanced mesh | ingest + add reference | ✅ | creates `mesh_<HASH>` + `inst_<HASH>_0` when no target mesh is selected |
 | Add an *extra* reference to a mesh prim (combine assets) | mesh pane "add reference" | ⛔ | only single replace |
@@ -219,6 +219,13 @@ when the weaker layers agree; explicit values mask disagreeing capture values; a
 undeclared family is not invented; weak-only inputs the user turned off are masked
 (empty asset paths, `False` flags) and a declared family switch rebinds the
 `info:mdl` ident trio while masking the dead family's inputs.
+`tests/blender/test_nested_prototype_roundtrip.py` makes the add-on's own
+mod re-import with its geometry: a deeply nested ingested-asset Mesh
+(`mesh_<HASH>/ref_x/XForms/<name>`) is found under the prototype, a
+standalone prototype is placed on the full container chain, an instance is
+placed on its mapped subtree and keeps USD reference semantics (the
+prototype container's transform is not folded into the instance placement),
+and the plain capture layout keeps importing as before.
 `tests/blender/test_capture_thumbnails.py`
 checks direct DDS thumbnail lookup, decoding, refresh and missing files without
 a converted-file cache. `tests/blender/test_write_guard.py` checks the shared
@@ -230,7 +237,7 @@ checks the texture source guard: height and normal exports refuse hard-link
 and symlink aliases and the recorded pre-decode source path before texconv
 availability is even checked, and a distinct target still exports.
 
-**Executed result:** 316 tests pass on both Blender 4.5.5 LTS (bundled OpenUSD
+**Executed result:** 321 tests pass on both Blender 4.5.5 LTS (bundled OpenUSD
 25.02) and Blender 5.1.2 (bundled OpenUSD 25.08) on Windows, exit code `0`.
 `register()` / `unregister()` are exercised by the suite through the
 UI-operator tests. The package-install smoke check — a freshly built

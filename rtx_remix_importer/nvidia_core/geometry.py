@@ -220,17 +220,17 @@ def _read_subsets(prim: Usd.Prim, time_code: Usd.TimeCode) -> tuple[SubsetData, 
 def find_mesh_prim(child_prim: Usd.Prim) -> Usd.Prim | None:
     """Find the actual ``UsdGeom.Mesh`` prim within a prototype container.
 
-    Port of the legacy helper, with ``IsA`` checks kept explicit so a container
-    whose reference is missing is reported as empty instead of crashing.
+    Walks the whole composed subtree. Capture layouts keep the Mesh close to
+    the prototype, while ingested asset references resolve the
+    ``ReferenceTarget/XForms/<name>`` mesh several levels deeper (audit A16);
+    a container whose reference is missing is reported as empty instead of
+    crashing.
     """
     if not child_prim:
         return None
-    if child_prim.IsA(UsdGeom.Mesh):
-        return child_prim
-    if child_prim.IsA(UsdGeom.Xformable):
-        for grandchild in child_prim.GetChildren():
-            if grandchild.IsA(UsdGeom.Mesh):
-                return grandchild
+    for prim in Usd.PrimRange(child_prim):
+        if prim.IsA(UsdGeom.Mesh):
+            return prim
     return None
 
 

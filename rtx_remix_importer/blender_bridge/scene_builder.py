@@ -60,6 +60,29 @@ def _object_matrix(composition: ProjectComposition, prim: Usd.Prim, unit_scale: 
     return matrix
 
 
+def _instance_object_matrix(
+    composition: ProjectComposition, instance_prim: Usd.Prim, unit_scale: float,
+    prototype_prim: Usd.Prim | None, mesh_prim: Usd.Prim | None,
+) -> mathutils.Matrix:
+    """Object matrix for a mesh instance, including nested prototype transforms.
+
+    The mapped children of an instance compose the prototype subtree, so when
+    the Mesh sits deeper inside the prototype the chain is evaluated at the
+    mapped mesh path (audit A16). The prototype container's own transform is
+    *not* folded into the instance placement: USD composes it as a reference
+    opinion on the same xformOpOrder that the instance placement overrides. A
+    missing mapped subtree falls back to the plain instance matrix.
+    """
+    if mesh_prim is not None and prototype_prim is not None and prototype_prim != mesh_prim:
+        prototype_path = str(prototype_prim.GetPath())
+        mesh_path = str(mesh_prim.GetPath())
+        if mesh_path.startswith(prototype_path + "/"):
+            mapped = instance_prim.GetStage().GetPrimAtPath(str(instance_prim.GetPath()) + mesh_path[len(prototype_path):])
+            if mapped and mapped.IsValid():
+                return _object_matrix(composition, mapped, unit_scale)
+    return _object_matrix(composition, instance_prim, unit_scale)
+
+
 def _blender_name(prim: Usd.Prim) -> str:
     return bpy.path.clean_name(prim.GetName()) or "remix_prim"
 
@@ -78,27 +101,35 @@ class _MeshRegistry:
     def __init__(self):
         self._by_path: dict[str, bpy.types.Mesh] = {}
         self._by_hash: dict[str, bpy.types.Mesh] = {}
+        self._mesh_prim_by_path: dict[str, Usd.Prim] = {}
 
-    def add(self, prototype_path: str, mesh_prim_path: str, bl_mesh: bpy.types.Mesh) -> None:
+    def add(self, prototype_path: str, mesh_prim_path: str, bl_mesh: bpy.types.Mesh,
+            mesh_prim: Usd.Prim | None = None) -> None:
         self._by_path[prototype_path] = bl_mesh
         if mesh_prim_path != prototype_path:
             self._by_path[mesh_prim_path] = bl_mesh
         mesh_hash = _hash_from_path(prototype_path)
         if mesh_hash:
             self._by_hash.setdefault(mesh_hash, bl_mesh)
+        if mesh_prim is not None and mesh_prim.IsValid():
+            self._mesh_prim_by_path[prototype_path] = mesh_prim
+            if mesh_prim_path != prototype_path:
+                self._mesh_prim_by_path[mesh_prim_path] = mesh_prim
 
-    def find(self, prototype_prim: Usd.Prim | None, instance_path: str) -> tuple[bpy.types.Mesh | None, str | None]:
+    def find(self, prototype_prim: Usd.Prim | None, instance_path: str
+             ) -> tuple[bpy.types.Mesh | None, str | None, Usd.Prim | None]:
+        """Return ``(bl_mesh, resolved_path, mesh_prim)`` for an instance path."""
         if prototype_prim is not None and prototype_prim.IsValid():
             path = str(prototype_prim.GetPath())
             mesh = self._by_path.get(path)
             if mesh is not None:
-                return mesh, path
+                return mesh, path, self._mesh_prim_by_path.get(path)
         mesh_hash = _hash_from_path(instance_path)
         if mesh_hash:
             mesh = self._by_hash.get(mesh_hash)
             if mesh is not None:
-                return mesh, mesh_hash
-        return None, None
+                return mesh, mesh_hash, None
+        return None, None, None
 
 
 def _build_prototypes(stage: Usd.Stage, registry: _MeshRegistry, normal_mode: str = "LEGACY") -> int:
@@ -129,7 +160,7 @@ def _build_prototypes(stage: Usd.Stage, registry: _MeshRegistry, normal_mode: st
                 print(f"  Warning: no usable geometry on {mesh_prim.GetPath()}")
                 continue
             bl_mesh = create_mesh_datablock(mesh_data, f"{_blender_name(prototype_prim)}_data", normal_mode)
-            registry.add(prototype_path, str(mesh_prim.GetPath()), bl_mesh)
+            registry.add(prototype_path, str(mesh_prim.GetPath()), bl_mesh, mesh_prim)
             created += 1
         except geometry.InvalidTopologyError:
             raise
@@ -211,7 +242,7 @@ def import_with_direct_backend(
                     continue
                 instance_path = str(instance_prim.GetPath())
                 prototype_prim = prim_utils.get_prototype(instance_prim)
-                bl_mesh, resolved_path = registry.find(prototype_prim, instance_path)
+                bl_mesh, resolved_path, mesh_prim = registry.find(prototype_prim, instance_path)
                 if bl_mesh is None:
                     print(f"  Warning: no prototype mesh for instance {instance_path}")
                     continue
@@ -224,7 +255,8 @@ def import_with_direct_backend(
                 bl_object[constants.PROP_USD_INSTANCE_PATH] = instance_path
                 if prototype_prim is not None and prototype_prim.IsValid():
                     bl_object[constants.PROP_USD_PROTOTYPE_PATH] = str(prototype_prim.GetPath())
-                bl_object.matrix_world = _object_matrix(composition, instance_prim, unit_scale)
+                bl_object.matrix_world = _instance_object_matrix(
+                    composition, instance_prim, unit_scale, prototype_prim, mesh_prim)
                 collections["meshes"].objects.link(bl_object)
                 created_objects.add(bl_object)
                 instance_count += 1
@@ -250,12 +282,14 @@ def import_with_direct_backend(
             meshes_root = stage.GetPrimAtPath(constants.ROOTNODE_MESHES)
             for prototype_prim in meshes_root.GetChildren() if meshes_root else ():
                 prototype_path = str(prototype_prim.GetPath())
-                bl_mesh, resolved_path = registry.find(prototype_prim, prototype_path)
+                bl_mesh, resolved_path, mesh_prim = registry.find(prototype_prim, prototype_path)
                 if bl_mesh is None:
                     continue
                 bl_object = bpy.data.objects.new(_blender_name(prototype_prim), bl_mesh)
                 bl_object[constants.PROP_USD_PRIM_PATH] = resolved_path or prototype_path
-                bl_object.matrix_world = _object_matrix(composition, prototype_prim, unit_scale)
+                # The standalone prototype matrix already contains the transform
+                # chain down to the composed Mesh prim (audit A16).
+                bl_object.matrix_world = _object_matrix(composition, mesh_prim or prototype_prim, unit_scale)
                 collections["meshes"].objects.link(bl_object)
                 created_objects.add(bl_object)
                 if import_materials:

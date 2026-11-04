@@ -154,6 +154,24 @@ class TestFindMeshPrim(unittest.TestCase):
         self.assertEqual(geometry.find_mesh_prim(container), mesh.GetPrim())
         self.assertEqual(geometry.find_mesh_prim(mesh.GetPrim()), mesh.GetPrim())
 
+    def test_mesh_deep_under_prototype(self):
+        """The composed ingested-asset layout keeps the Mesh several levels deep."""
+        stage = Usd.Stage.Open(Sdf.Layer.CreateAnonymous("deep_find.usda"))
+        container = stage.DefinePrim("/RootNode/meshes/mesh_0123456789ABCDEF", "Xform")
+        stage.DefinePrim(container.GetPath().AppendChild("ref_01"), "Xform")
+        stage.DefinePrim(container.GetPath().AppendPath("ref_01/XForms"), "Xform")
+        mesh = UsdGeom.Mesh.Define(stage, container.GetPath().AppendPath("ref_01/XForms/PartA"))
+        self.assertEqual(geometry.find_mesh_prim(container), mesh.GetPrim())
+        self.assertEqual(geometry.find_mesh_prim(mesh.GetPrim()), mesh.GetPrim())
+
+    def test_mesh_deep_prefers_the_first_found(self):
+        stage = Usd.Stage.Open(Sdf.Layer.CreateAnonymous("deep_two.usda"))
+        container = stage.DefinePrim("/RootNode/meshes/mesh_0123456789ABCDEF", "Xform")
+        first = UsdGeom.Mesh.Define(stage, container.GetPath().AppendPath("ref_01/PartOne"))
+        second = UsdGeom.Mesh.Define(stage, container.GetPath().AppendPath("ref_02/PartTwo"))
+        found = geometry.find_mesh_prim(container)
+        self.assertIn(found, (first.GetPrim(), second.GetPrim()))
+
     def test_missing_mesh(self):
         stage = Usd.Stage.Open(Sdf.Layer.CreateAnonymous("find.usda"))
         container = stage.DefinePrim("/RootNode/meshes/mesh_0123456789ABCDEF", "Xform")
