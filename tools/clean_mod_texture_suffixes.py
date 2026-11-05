@@ -5,6 +5,7 @@ Run with Blender's Python (for its bundled pxr):
   blender --background --python tools/clean_mod_texture_suffixes.py -- MOD_DIR --apply
 
 Only matching DDS names and their references in text USD layers are changed.
+Name collisions are skipped; their files and references stay unchanged.
 Capture layers are never modified. Binary USD layers block changes because
 they could contain references that cannot safely be updated as text.
 """
@@ -46,7 +47,7 @@ def resolve_reference(layer_path, value, root):
     return candidate
 
 
-def build_plan(folder):
+def build_plan(folder, skipped=None):
     base = Path(folder)
     root = base.resolve(strict=True)
     if not root.is_dir():
@@ -72,17 +73,29 @@ def build_plan(folder):
             files.append(path)
     candidates = {}
     occupied = {str(p).casefold(): p for p in files}
+    # Collect destinations first: when several textures map to the same name,
+    # skip *all* of them instead of arbitrarily choosing the first one.
     destinations = {}
     for path in files:
         name = cleaned_name(path.name)
         if path.suffix.lower() != '.dds' or name == path.name:
             continue
         dest = path.with_name(name)
-        key = str(dest).casefold()
-        if key in occupied or key in destinations:
-            raise ValueError(f'Name collision: {path} -> {dest}')
-        candidates[path] = dest
-        destinations[key] = path
+        destinations.setdefault(str(dest).casefold(), []).append((path, dest))
+
+    collisions = []
+    for key, sources in destinations.items():
+        if key in occupied:
+            for path, dest in sources:
+                collisions.append((path, dest, 'target already exists'))
+        elif len(sources) > 1:
+            for path, dest in sources:
+                collisions.append((path, dest, 'multiple textures have the same target'))
+        else:
+            path, dest = sources[0]
+            candidates[path] = dest
+    if skipped is not None:
+        skipped.extend(sorted(collisions, key=lambda item: str(item[0]).casefold()))
 
     layers = []
     for path in files:
@@ -178,7 +191,10 @@ def main(argv=None):
     parser.add_argument('--apply', action='store_true', help='Create a backup and apply the plan')
     args = parser.parse_args(argv)
     try:
-        root, renames, edits = build_plan(args.mod_dir)
+        skipped = []
+        root, renames, edits = build_plan(args.mod_dir, skipped=skipped)
+        for src, dst, reason in skipped:
+            print(f'SKIP ({reason}) {src.relative_to(root)} -> {dst.relative_to(root)}')
         for src, dst in renames.items():
             print(f'RENAME {src.relative_to(root)} -> {dst.relative_to(root)}')
         for path in edits:
@@ -188,6 +204,7 @@ def main(argv=None):
             for line in difflib.unified_diff(old, new, fromfile=str(path.relative_to(root)), tofile=str(path.relative_to(root)), lineterm=''):
                 print(line)
         print(f'{len(renames)} texture(s), {len(edits)} layer(s)')
+        print(f'{len(skipped)} skipped collision(s)')
         if args.apply:
             backup = apply_plan(root, renames, edits)
             print(f'Backup: {backup}' if backup else 'Nothing to change')
