@@ -547,5 +547,87 @@ class TestModApplyChangedPrims(unittest.TestCase):
 
 
 
+    @staticmethod
+    def _give_uv(mesh):
+        uv_layer = mesh.uv_layers.new(name='st')
+        uv_layer.data.foreach_set('uv', (0.0, 0.0, 1.0, 0.0, 0.0, 1.0))
+        return uv_layer
+
+    def test_light_only_prototype_does_not_hide_mesh_or_drop_uv(self):
+        """A ref reset with only added lights isn't a request to erase Mesh."""
+        loader = self._wire_loader()
+        self._give_uv(self.sky_obj.data)
+        original_data = self.sky_obj.data
+        self.stage.SetEditTarget(Usd.EditTarget(self.repl))
+        proto = self.stage.OverridePrim(Sdf.Path(SKY_MESH_PATH))
+        proto.GetReferences().SetReferences([])
+        light = UsdLux.SphereLight.Define(self.stage, Sdf.Path(SKY_MESH_PATH + '/Lamp'))
+        light.GetIntensityAttr().Set(24.0)
+        layers = loader._get_layers_with_changes()
+        changed, _ = loader._get_changed_prims(layers)
+        for path in sorted(changed):
+            prim = self.stage.GetPrimAtPath(Sdf.Path(path))
+            if prim and prim.IsValid():
+                loader._process_prim(prim)
+        self.assertIs(self.sky_obj.data, original_data)
+        self.assertFalse(self.sky_obj.hide_viewport)
+        self.assertFalse(self.sky_obj.hide_render)
+        self.assertEqual(len(self.sky_obj.data.uv_layers), 1)
+        self.assertEqual(tuple(self.sky_obj.data.uv_layers[0].data[1].uv), (1.0, 0.0))
+
+    def _author_sky_replacement_without_uv(self, points, faces):
+        self.stage.SetEditTarget(Usd.EditTarget(self.repl))
+        proto = self.stage.OverridePrim(Sdf.Path(SKY_MESH_PATH))
+        proto.GetReferences().SetReferences([])
+        mesh = UsdGeom.Mesh.Define(self.stage, Sdf.Path(SKY_MESH_PATH + '/part'))
+        mesh.GetPointsAttr().Set(points)
+        mesh.GetFaceVertexCountsAttr().Set([len(face) for face in faces])
+        mesh.GetFaceVertexIndicesAttr().Set([i for face in faces for i in face])
+        return proto
+
+    def test_replacement_preserves_original_uv_on_matching_topology(self):
+        loader = self._wire_loader()
+        self._give_uv(self.sky_obj.data)
+        original = self.sky_obj.data
+        proto = self._author_sky_replacement_without_uv(
+            [(0, 0, 0), (2, 0, 0), (0, 2, 0)], [(0, 1, 2)])
+        loader._get_changed_prims(loader._get_layers_with_changes())
+        loader._replace_prototype_hash({SKY_HASH}, proto)
+        self.assertIsNot(self.sky_obj.data, original)
+        self.assertEqual(len(self.sky_obj.data.uv_layers), 1)
+        self.assertEqual(tuple(self.sky_obj.data.uv_layers[0].data[1].uv), (1.0, 0.0))
+        self.assertFalse(self.sky_obj.hide_viewport)
+
+    def test_replacement_with_different_topology_and_no_uv_is_skipped(self):
+        loader = self._wire_loader()
+        self._give_uv(self.sky_obj.data)
+        original = self.sky_obj.data
+        proto = self._author_sky_replacement_without_uv(
+            [(0, 0, 0), (2, 0, 0), (2, 2, 0), (0, 2, 0)], [(0, 1, 2, 3)])
+        loader._get_changed_prims(loader._get_layers_with_changes())
+        loader._replace_prototype_hash({SKY_HASH}, proto)
+        self.assertIs(self.sky_obj.data, original)
+        self.assertEqual(len(self.sky_obj.data.uv_layers), 1)
+        self.assertFalse(self.sky_obj.hide_viewport)
+
+    def test_mod_ngon_keeps_corner_indices_for_uv(self):
+        """The generic mod mesh extractor must not fan-triangulate a pentagon."""
+        from rtx_remix_importer import mod_apply_utils
+        self.stage.SetEditTarget(Usd.EditTarget(self.repl))
+        mesh = UsdGeom.Mesh.Define(self.stage, Sdf.Path('/Ngon'))
+        mesh.GetPointsAttr().Set([
+            (0, 0, 0), (1, 0, 0), (2, 1, 0), (1, 2, 0), (0, 1, 0)])
+        mesh.GetFaceVertexCountsAttr().Set([5])
+        mesh.GetFaceVertexIndicesAttr().Set([0, 1, 2, 3, 4])
+        uv = UsdGeom.PrimvarsAPI(mesh).CreatePrimvar(
+            'st', Sdf.ValueTypeNames.TexCoord2fArray, UsdGeom.Tokens.faceVarying)
+        uv.Set([(0, 0), (1, 0), (1, 1), (0.5, 1), (0, 1)])
+        extracted = mod_apply_utils.get_mesh_data_from_mod(
+            mesh.GetPrim(), Usd.TimeCode.Default(), False, lambda *_: None)
+        self.assertEqual(len(extracted[1]), 1)
+        self.assertEqual(len(extracted[1][0]), 5)
+        self.assertEqual(len(extracted[2][0]), 5)
+
+
 if __name__ == '__main__':
     unittest.main()

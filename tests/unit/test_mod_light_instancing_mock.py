@@ -93,6 +93,7 @@ class Stage:
 
 class Const:
     PROP_USD_PROTOTYPE_PATH = 'usd_prototype_path'
+    PROP_USD_INSTANCE_PATH = 'usd_instance_path'
 
 
 class Scene:
@@ -177,6 +178,25 @@ class TestLinkBehaviour(unittest.TestCase):
         lights = self.get_lights()
         self.assertEqual(len(lights), 2)
         self.assertIsNot(lights[0].data, lights[1].data)
+
+    def test_sky_distant_light_without_inst_has_single_sun(self):
+        # Blender's sky_ mesh has no inst_<HASH> placement/anchor.
+        # DistantLight must still appear globally and survive repeated Apply.
+        self.loader._instance_anchor_objects = lambda _proto: {}
+        self.loader._unanchored_distant_light_instances = lambda _light, _proto: {'': None}
+        self.loader._unanchored_light_matrix = lambda _light: Matrix()
+        self.source = Prim(self.src, energy=7, typ='DistantLight')
+        self.loader._get_light_stage = lambda: Stage({self.src: self.source})
+        self.loader._sync_prototype_light(self.source, self.prototype)
+        lights = self.get_lights()
+        self.assertEqual(len(lights), 1)
+        self.assertEqual(lights[0].data.type, 'SUN')
+        self.assertTrue(lights[0].get('usd_light_unanchored'))
+        self.assertIsNone(lights[0].parent)
+        self.assertEqual(lights[0].get('usd_light_instance_path'), '')
+        self.loader._routed_light_instances.clear()
+        self.loader._sync_prototype_light(self.source, self.prototype)
+        self.assertEqual(len(self.get_lights()), 1)
 
     def test_existing_point_light_is_retyped_to_spot(self):
         self.loader._sync_prototype_light(self.source, self.prototype)

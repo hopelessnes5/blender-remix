@@ -12,6 +12,9 @@ import re
 import math
 from typing import Dict, List, Optional, Set, Tuple
 from ... import mod_apply_utils
+from ...mesh_uv_preservation import (
+    copy_uv_layers_if_compatible, same_uv_layout,
+)
 from ...core_utils import (
     calc_normals_split_compatible,
     set_mesh_auto_smooth_compatible,
@@ -43,6 +46,44 @@ def _hash_tokens(text) -> Set[str]:
         token for token in re.findall(r'[A-F0-9]{16}', str(text))
         if any(char.isdigit() for char in token)
     }
+
+
+_SKY_MESH_NAME = re.compile(r'^sky_([0-9a-fA-F]{16})(?=$|[_.])', re.IGNORECASE)
+_PROTOTYPE_PATH = re.compile(
+    r'^/RootNode/(?:meshes|sky|skies)/(?:mesh|sky)_[0-9A-Fa-f]{16}(?:_[0-9]+)?$'
+)
+
+
+def _sky_object_hashes(obj) -> Set[str]:
+    """Capture sky objects are often named ``sky_<HASH>``, not ``inst_<HASH>``.
+
+    These names are an explicit fallback for old capture imports lacking USD
+    instance/prototype tags. Only MESH objects with a strict sky-prefix/hash
+    are accepted; arbitrary 16-hex strings in user object names are ignored.
+    """
+    if getattr(obj, 'type', None) != 'MESH':
+        return set()
+    result = set()
+    for datablock in (obj, getattr(obj, 'data', None)):
+        match = _SKY_MESH_NAME.match(str(getattr(datablock, 'name', '') or ''))
+        if match:
+            result.add(match.group(1).upper())
+    return result
+
+
+def _prototype_container_path(path: str) -> bool:
+    """Toolkit mesh prototypes, plus captured sky-prefixed mesh containers."""
+    return bool(_PROTOTYPE_PATH.fullmatch(str(path)))
+
+
+def _ancestor_prototype_path(path: str) -> Optional[str]:
+    """Prototype path enclosing a USD child, without treating arbitrary assets as prototypes."""
+    components = str(path).split('/')
+    for length in range(len(components), 3, -1):
+        candidate = '/'.join(components[:length])
+        if _prototype_container_path(candidate):
+            return candidate
+    return None
 
 
 class ModFileLoader:
@@ -563,6 +604,16 @@ class ModFileLoader:
         # or authored ``references`` opinions) vs over-only attribute edits on
         # capture-owned records: only the former may swap scene geometry.
         self._mod_authored_prototype_paths = layers_defined | reference_authored
+        # Official Remix replacements are often ``over mesh_<HASH>`` with a
+        # newly defined ``ref_<UUID>`` child. The container has no own def or
+        # references opinion, yet its referenced mesh AND lights must be routed.
+        # Do not promote arbitrary over-only material/visibility children.
+        for authored_path in layers_defined | reference_authored:
+            container = _ancestor_prototype_path(authored_path)
+            if container and authored_path != container:
+                remainder = authored_path[len(container):].lstrip('/')
+                if remainder.split('/', 1)[0].startswith('ref_'):
+                    self._mod_authored_prototype_paths.add(container)
         for prim_path in layers_defined | reference_authored:
             if prim_path in capture_defined and prim_path not in reference_authored:
                 continue  # pure def on captured content: handled by the scans above
@@ -590,7 +641,7 @@ class ModFileLoader:
             if prototype is not None:
                 self._sync_prototype_light(prim, prototype)
                 return
-        if re.fullmatch(constants.REGEX_MESH_PATH, leaf):
+        if _prototype_container_path(prim_path):
             if prim_path in self._mod_authored_prototype_paths:
                 self._route_mesh_prototype_addition(prim)
             else:
@@ -755,6 +806,7 @@ class ModFileLoader:
         )
         hashes: Set[str] = set()
         for obj in bpy.data.objects:
+            hashes |= _sky_object_hashes(obj)
             for holder in filter(None, (obj, getattr(obj, 'data', None))):
                 for prop in props:
                     tokens = _hash_tokens(str(holder.get(prop, '')))
@@ -781,6 +833,10 @@ class ModFileLoader:
         seen = set()
         for obj in bpy.data.objects:
             if obj.name in seen:
+                continue
+            if _sky_object_hashes(obj) & hash_tokens:
+                targets.append(obj)
+                seen.add(obj.name)
                 continue
             for holder in filter(None, (obj, getattr(obj, 'data', None))):
                 for prop in props:
@@ -843,13 +899,11 @@ class ModFileLoader:
 
     @staticmethod
     def _light_prototype_container(prim: Usd.Prim):
-        """Nearest mesh_<HASH> ancestor of a mod light, if present."""
+        """Nearest captured mesh/sky prototype containing a mod light."""
         parent = prim.GetParent()
         while parent and str(parent.GetPath()) != '/':
             path = str(parent.GetPath())
-            if path.startswith(constants.ROOTNODE_MESHES + '/') and re.fullmatch(
-                constants.REGEX_MESH_PATH, path.rsplit('/', 1)[-1]
-            ):
+            if _prototype_container_path(path):
                 return parent
             parent = parent.GetParent()
         return None
@@ -991,6 +1045,57 @@ class ModFileLoader:
                 return anchor_world.inverted_safe() @ root_world @ proto_to_light
         return proto_to_light
 
+    def _unanchored_distant_light_instances(self, light_prim, prototype_prim) -> dict:
+        """Composed USD placements for a sky/directional light without Blender MESH anchors.
+
+        Sky meshes are sometimes absent from the captured Blender viewport. A
+        DistantLight nevertheless needs to appear as a SUN. Prefer instance
+        paths in the composed USD stage so any instance-local rotation or
+        light-property opinion is respected. When the capture defines no
+        corresponding instance, display the authored prototype light once.
+        Never create geometry or an artificial mesh anchor just for the sun.
+        """
+        prototype_path = str(prototype_prim.GetPath())
+        source_path = str(light_prim.GetPath())
+        stage = self._get_light_stage()
+        instances = {}
+        root = stage.GetPrimAtPath(constants.ROOTNODE_INSTANCES) if stage else None
+        hash_values = _hash_tokens(prototype_path.rsplit('/', 1)[-1])
+        if root and root.IsValid() and hash_values:
+            for candidate in root.GetChildren():
+                instance_path = str(candidate.GetPath())
+                leaf = instance_path.rsplit('/', 1)[-1]
+                if not re.fullmatch(constants.REGEX_INSTANCE_PATH, leaf):
+                    continue
+                if not (_hash_tokens(leaf) & hash_values):
+                    continue
+                mapped = stage.GetPrimAtPath(instance_path + source_path[len(prototype_path):])
+                if mapped and mapped.IsValid() and mapped.GetTypeName() == 'DistantLight':
+                    instances[instance_path] = None  # no Blender mesh parent
+        return instances if instances else {'': None}
+
+    def _unanchored_light_matrix(self, prim):
+        """Blender world matrix for a standalone light from a composed USD prim.
+
+        Unlike mesh-relative prototype placement, SUN orientation is computed
+        directly from the composed prim, including Y-Up to Z-Up conversion.
+        The scene's capture unit scale applies to location only, not rotation.
+        """
+        stage = prim.GetStage()
+        cache = self._light_xform_cache if stage == self._get_light_stage() else self.xform_cache
+        if cache is None:
+            cache = UsdGeom.XformCache(self.time_code)
+        y_up = UsdGeom.GetStageUpAxis(stage) == UsdGeom.Tokens.y
+        matrix = mod_apply_utils.get_blender_transform_matrix_from_mod(
+            prim, cache, y_up, self.report
+        )
+        scene = self.context.scene
+        scale = scene.get('remix_import_unit_scale')
+        if scale is None:
+            scale = getattr(scene, 'remix_export_scale', 1.0)
+        matrix.translation *= float(scale)
+        return matrix
+
     @staticmethod
     def _light_data_identity(data):
         return data.as_pointer() if hasattr(data, 'as_pointer') else id(data)
@@ -1020,6 +1125,11 @@ class ModFileLoader:
         source_path = str(light_prim.GetPath())
         prototype_path = str(prototype_prim.GetPath())
         anchors = self._instance_anchor_objects(prototype_path)
+        if not anchors and light_prim.GetTypeName() == 'DistantLight':
+            # Sky meshes may have no Blender MESH object and sometimes no
+            # inst_<HASH> in the capture. A directional light is scene-wide:
+            # materialize it directly instead of silently dropping the sun.
+            anchors = self._unanchored_distant_light_instances(light_prim, prototype_prim)
         if not anchors:
             self.report({'WARNING'}, f'No capture instance for prototype light {source_path}; skipping')
             return
@@ -1028,6 +1138,13 @@ class ModFileLoader:
             for obj in self.context.scene.objects
             if obj.type == 'LIGHT' and obj.get('usd_light_instance_path')
         }
+        # Standalone sky suns have no capture instance path. Reuse a previous
+        # result from this addon rather than accumulating a new SUN on Apply.
+        for obj in self.context.scene.objects:
+            if (obj.type == 'LIGHT' and obj.get('usd_light_unanchored')
+                    and obj.get('usd_light_path') == source_path
+                    and not obj.get('usd_light_instance_path')):
+                existing[(source_path, '')] = obj
         canonical_by_signature = {}
         claimed_data = set()
         created_any = False
@@ -1040,13 +1157,17 @@ class ModFileLoader:
             previous_data = None
             provisional = None
             try:
-                relative = self._prototype_light_relative_matrix(
-                    light_prim, prototype_prim, instance_path, anchor
-                )
-                mapped_path = instance_path + source_path[len(prototype_path):]
+                mapped_path = (instance_path + source_path[len(prototype_path):]
+                               if instance_path else source_path)
                 mapped_light = self._get_light_stage().GetPrimAtPath(mapped_path)
                 applied_light = (mapped_light if mapped_light and mapped_light.IsValid()
                                  else light_prim)
+                if anchor is None:
+                    world_matrix = self._unanchored_light_matrix(applied_light)
+                else:
+                    relative = self._prototype_light_relative_matrix(
+                        light_prim, prototype_prim, instance_path, anchor
+                    )
                 signature = light_parameter_signature(applied_light, self.time_code)
                 group = (source_path, signature)
                 canonical = canonical_by_signature.get(group)
@@ -1082,9 +1203,17 @@ class ModFileLoader:
                 bl_light['usd_light_instance_path'] = instance_path
                 bl_light[constants.PROP_USD_PROTOTYPE_PATH] = prototype_path
                 bl_light['usd_light_source_path'] = source_path
-                bl_light.parent = anchor
-                bl_light.matrix_parent_inverse = mathutils.Matrix.Identity(4)
-                bl_light.matrix_world = anchor.matrix_world @ relative
+                if anchor is None:
+                    bl_light['usd_light_unanchored'] = True
+                    bl_light.parent = None
+                    bl_light.matrix_parent_inverse = mathutils.Matrix.Identity(4)
+                    bl_light.matrix_world = world_matrix
+                else:
+                    if 'usd_light_unanchored' in bl_light:
+                        del bl_light['usd_light_unanchored']
+                    bl_light.parent = anchor
+                    bl_light.matrix_parent_inverse = mathutils.Matrix.Identity(4)
+                    bl_light.matrix_world = anchor.matrix_world @ relative
                 self._apply_visibility(applied_light, bl_light)
                 canonical_by_signature[group] = canonical
                 self._routed_light_instances.add(key)
@@ -1168,7 +1297,7 @@ class ModFileLoader:
         leaf = prim_path.rsplit('/', 1)[-1]
         if re.fullmatch(constants.REGEX_INSTANCE_PATH, leaf):
             self._route_instance_addition(prim)
-        elif re.fullmatch(constants.REGEX_MESH_PATH, leaf):
+        elif _prototype_container_path(prim_path):
             self._route_mesh_prototype_addition(prim)
         elif prim.IsA(UsdGeom.Mesh):
             # Meshes under prototype containers are already covered by the
@@ -1291,9 +1420,18 @@ class ModFileLoader:
             return
         hash_tokens = _hash_tokens(container_path.rsplit('/', 1)[-1])
         if not self._scene_objects_for_hashes(hash_tokens):
-            # A prototype nothing in the scene references stays library
-            # content and must not enter the scene.
-            self.report({'INFO'}, f"Prototype {container_path.rsplit('/', 1)[-1]} is unrelated to this scene; skipping")
+            # A sky prototype can be relevant to the capture without having
+            # a visible Blender mesh or inst_<HASH> anchor. Only directional
+            # lights are safe to display globally; never materialize unknown
+            # library geometry or unrelated local lights here.
+            capture = self._get_capture_light_stage()
+            capture_prototype = capture.GetPrimAtPath(container_path) if capture else None
+            if capture_prototype and capture_prototype.IsValid():
+                for descendant in Usd.PrimRange(prim):
+                    if descendant != prim and descendant.GetTypeName() == 'DistantLight':
+                        self._sync_prototype_light(descendant, prim)
+            else:
+                self.report({'INFO'}, f"Prototype {container_path.rsplit('/', 1)[-1]} is unrelated to this scene; skipping")
             return
         for hash_value in hash_tokens:
             self._replace_prototype_hash({hash_value}, prim)
@@ -1319,7 +1457,7 @@ class ModFileLoader:
                 if ancestor_path not in self._routed_container_paths:
                     self._route_instance_addition(ancestor)
                 return True
-            if re.fullmatch(constants.REGEX_MESH_PATH, leaf):
+            if _prototype_container_path(ancestor_path):
                 if ancestor_path not in self._routed_container_paths:
                     self._route_mesh_prototype_addition(ancestor)
                 return True
@@ -1401,6 +1539,57 @@ class ModFileLoader:
             self.report({'WARNING'}, f"No UsdGeom.Mesh composes under added placement {instance_path}; skipping")
         return created
 
+    def _prototype_explicitly_resets_references(self, container_prim) -> bool:
+        """Whether a mod layer authors ``references = None`` on this prim.
+
+        A reference to an unavailable file is not a deletion: treating every
+        reference opinion as an empty reset used to hide unrelated meshes.
+        """
+        path = container_prim.GetPath()
+        for layer in self._get_layers_with_changes():
+            spec = layer.GetPrimAtPath(path)
+            if not spec or not self._prim_spec_authors_references(spec):
+                continue
+            operation = getattr(spec, 'referenceList', None)
+            if operation is not None and getattr(operation, 'isExplicit', False):
+                if not any((getattr(operation, name, ()) or ()) for name in (
+                        'explicitItems', 'addedItems', 'prependedItems', 'appendedItems')):
+                    return True
+        return False
+
+    def _prototype_has_authored_geometry(self, container_prim, mesh_parts) -> bool:
+        """Do the mod layers actually author replacement *geometry*?
+
+        Geometry inside a mod-authored ref_* is new. Capture-inherited Mesh
+        prims are not new merely because an unrelated light was added to the
+        same prototype. Direct Mesh topology edits and container reference
+        replacements also count.
+        """
+        container_path = str(container_prim.GetPath())
+        edit_layers = self._get_layers_with_changes()
+        if self._prototype_explicitly_resets_references(container_prim):
+            return True
+        topology_attrs = {'points', 'faceVertexIndices', 'faceVertexCounts'}
+        for part in mesh_parts:
+            part_path = str(part.GetPath())
+            relative = part_path[len(container_path):].strip('/').split('/')
+            path = container_path
+            for component in relative[:-1]:
+                path += '/' + component
+                if component.startswith('ref_') and path in self._mod_authored_prototype_paths:
+                    return True
+            for layer in edit_layers:
+                spec = layer.GetPrimAtPath(part.GetPath())
+                if not spec:
+                    continue
+                if (spec.specifier == Sdf.SpecifierDef and
+                        str(getattr(spec, 'typeName', '')) == 'Mesh'):
+                    return True
+                if any(str(getattr(attr, 'name', attr)) in topology_attrs
+                       for attr in spec.attributes):
+                    return True
+        return False
+
     def _replace_prototype_hash(self, hash_tokens: Set[str], container_prim: Usd.Prim) -> None:
         """Swap scene objects of *hash_tokens* onto the mod's prototype content.
 
@@ -1432,10 +1621,42 @@ class ModFileLoader:
 
         parts = [p for p in Usd.PrimRange(container_prim) if p.IsA(UsdGeom.Mesh)]
         if not parts:
+            # A light-only replacement is NOT a deleted mesh. A mod may add
+            # SphereLight/RectLight descendants or a ref_* containing only
+            # lights while the geometry is defined in the capture. The mod-only
+            # stage often cannot see that capture geometry. Never hide the mesh
+            # just because no Mesh composes in this stage.
+            descendants = [p for p in Usd.PrimRange(container_prim) if p != container_prim]
+            if descendants:
+                for obj in targets:
+                    if obj.get('remix_hidden_by_empty_prototype'):
+                        obj.hide_viewport = False
+                        obj.hide_render = False
+                        del obj['remix_hidden_by_empty_prototype']
+                self.report({'INFO'},
+                    f"Prototype {container_prim.GetPath()} has no composed geometry "
+                    "but contains additions/overrides; preserving capture meshes")
+                return
+            # A *bare*, explicit reference reset still hides the prototype,
+            # preserving existing Toolkit empty-reset semantics. Tag the
+            # change so a later mod can restore only addon-owned hiding.
+            if not self._prototype_explicitly_resets_references(container_prim):
+                return
             for obj in targets:
+                if not (obj.hide_viewport or obj.hide_render):
+                    obj['remix_hidden_by_empty_prototype'] = True
                 obj.hide_viewport = True
                 obj.hide_render = True
-                self.report({'INFO'}, f"Prototype reset is empty; hid '{obj.name}'")
+                self.report({'INFO'}, f"Empty prototype reset: hid '{obj.name}'")
+            return
+
+        # References and attributes may add lights to a capture-owned mesh
+        # without changing its geometry. Rebuilding that Mesh from the mod-only
+        # stage strips UV sets and can overwrite a shared source datablock.
+        if not self._prototype_has_authored_geometry(container_prim, parts):
+            self.report({'INFO'},
+                f"Prototype {container_prim.GetPath()} adds no mesh geometry; "
+                "leaving capture Mesh datablocks and UVs intact")
             return
 
         try:
@@ -1470,19 +1691,18 @@ class ModFileLoader:
             for vert in verts:
                 joined_verts.append(tuple(part_bake @ mathutils.Vector((vert[0], vert[1], vert[2]))))
             joined_faces.extend(tuple((index + vertex_offset) for index in face) for face in faces)
+            # Save the starting vertex offset, not the already incremented end.
+            part_vertex_start = vertex_offset
             vertex_offset += len(verts)
-
+            part_loop_count = sum(len(face) for face in faces)
+            part_loop_end = loop_start + part_loop_count
+            uvs_parts.append((uvs_data, loop_start, part_vertex_start, part_loop_end))
+            normals_parts.append((normals_data, loop_start, part_vertex_start, part_loop_end))
             if uvs_data is None:
                 all_parts_have_uvs = False
-            else:
-                uvs_parts.append((uvs_data, loop_start, vertex_offset))
             if normals_data is None:
                 all_parts_have_normals = False
-            else:
-                normals_parts.append((normals_data, loop_start, vertex_offset))
-
-            part_loop_count = sum(len(face) for face in faces)
-            loop_start += part_loop_count
+            loop_start = part_loop_end
 
             binding = UsdShade.MaterialBindingAPI(part_prim).GetDirectBindingRel()
             material_path = str(binding.GetTargets()[0]) if (binding and binding.GetTargets()) else None
@@ -1519,7 +1739,31 @@ class ModFileLoader:
         if all_parts_have_normals and normals_parts:
             self._apply_joined_mesh_normals(replaced_mesh, normals_parts)
 
+        # Never silently erase the scene's UV maps when the replacement asset
+        # has no valid st data. On identical topology, restore ALL UV layers
+        # from the original source; otherwise keep the old geometry and warn.
+        if not len(replaced_mesh.uv_layers):
+            old_sources = [obj.data for obj in targets
+                           if obj.data is not None and len(obj.data.uv_layers)]
+            if old_sources:
+                source = old_sources[0]
+                if (all(same_uv_layout(source, old) for old in old_sources[1:])
+                        and copy_uv_layers_if_compatible(source, replaced_mesh)):
+                    self.report({'INFO'},
+                        f"Restored {len(replaced_mesh.uv_layers)} original UV layers "
+                        f"on replacement {container_label} (identical topology)")
+                else:
+                    self.report({'WARNING'},
+                        f"Skipped replacement of {container_label}: missing or invalid "
+                        "UV data and incompatible original topology; preserving originals")
+                    bpy.data.meshes.remove(replaced_mesh)
+                    return
+
         for obj in targets:
+            if obj.get('remix_hidden_by_empty_prototype'):
+                obj.hide_viewport = False
+                obj.hide_render = False
+                del obj['remix_hidden_by_empty_prototype']
             old_data = obj.data
             if old_data:
                 for key in list(old_data.keys()):
@@ -1549,43 +1793,75 @@ class ModFileLoader:
                 return part_index
         return 0
 
-    def _apply_joined_mesh_uvs(self, bl_mesh: bpy.types.Mesh, uvs_parts: list) -> None:
-        """Fill one UV layer for a joined datablock from per-part UV data.
+    def _apply_joined_mesh_uvs(self, bl_mesh: bpy.types.Mesh, uvs_parts: list) -> bool:
+        """Read per-part USD UVs into joined Blender loops without shifting them.
 
-        *uvs_parts* holds ``(uvs_data_tuple, loop_start)`` per part in join
-        order (part loop ranges are contiguous, matching the face join). A UV
-        layer is only built when every met part authored UVs; vertex-mapped
-        parts re-index through their own vertex range.
+        A layer is authored only when every loop can be mapped. In particular,
+        do not create a zero-filled ``st`` layer when source indices are wrong;
+        callers can then safely reuse compatible original UVs instead.
         """
-        uv_layer = bl_mesh.uv_layers.new(name="st")
-        loop_uvs = [(0.0, 0.0)] * len(bl_mesh.loops)
-        interpolated_any = False
-        for part_index, (uvs_data, loop_start, _) in enumerate(uvs_parts):
+        loop_uvs = [None] * len(bl_mesh.loops)
+        for uvs_data, loop_start, vertex_start, loop_end in uvs_parts:
+            if not uvs_data:
+                return False
             values, indices, interp = uvs_data
-            if not values:
-                continue
-            part_end = uvs_parts[part_index + 1][1] if part_index + 1 < len(uvs_parts) else len(bl_mesh.loops)
-            part_loops = bl_mesh.loops[loop_start:part_end]
+            if values is None or not len(values):
+                return False
+            loops = bl_mesh.loops[loop_start:loop_end]
             if interp == UsdGeom.Tokens.faceVarying:
-                if indices and len(indices) == len(part_loops):
-                    for offset, uv_index in enumerate(indices):
-                        if 0 <= uv_index < len(values):
-                            u, v = values[uv_index]
-                            loop_uvs[loop_start + offset] = (u, 1.0 - v)
-                elif len(values) == len(part_loops):
-                    for offset, (u, v) in enumerate(values):
-                        loop_uvs[loop_start + offset] = (u, 1.0 - v)
-                interpolated_any = True
-            elif interp == UsdGeom.Tokens.vertex:
-                vertex_offset = uvs_parts[part_index][2]
-                for loop in part_loops:
-                    local_index = loop.vertex_index - vertex_offset
-                    if 0 <= local_index < len(values):
-                        u, v = values[local_index]
-                        loop_uvs[loop.index] = (u, 1.0 - v)
-                interpolated_any = True
-        flattened = [coord for pair in loop_uvs for coord in pair]
-        uv_layer.data.foreach_set("uv", flattened)
+                if indices is not None and len(indices):
+                    if len(indices) != len(loops):
+                        return False
+                    uv_indices = list(indices)
+                elif len(values) == len(loops):
+                    uv_indices = list(range(len(loops)))
+                else:
+                    return False
+                for offset, idx in enumerate(uv_indices):
+                    if idx < 0 or idx >= len(values):
+                        return False
+                    u, v = values[idx]
+                    loop_uvs[loop_start + offset] = (u, 1.0 - v)
+            elif interp in (UsdGeom.Tokens.vertex, UsdGeom.Tokens.varying):
+                for loop in loops:
+                    idx = loop.vertex_index - vertex_start
+                    if idx < 0:
+                        return False
+                    if indices is not None and len(indices):
+                        if idx >= len(indices):
+                            return False
+                        idx = indices[idx]
+                    if idx < 0 or idx >= len(values):
+                        return False
+                    u, v = values[idx]
+                    loop_uvs[loop.index] = (u, 1.0 - v)
+            elif interp == UsdGeom.Tokens.uniform:
+                polygons = [poly for poly in bl_mesh.polygons
+                            if poly.loop_start >= loop_start and
+                            poly.loop_start + poly.loop_total <= loop_end]
+                if indices is not None and len(indices) and len(indices) != len(polygons):
+                    return False
+                if not len(indices or ()) and len(values) != len(polygons):
+                    return False
+                for poly_index, poly in enumerate(polygons):
+                    idx = indices[poly_index] if indices is not None and len(indices) else poly_index
+                    if idx < 0 or idx >= len(values):
+                        return False
+                    u, v = values[idx]
+                    for li in range(poly.loop_start, poly.loop_start + poly.loop_total):
+                        loop_uvs[li] = (u, 1.0 - v)
+            elif interp == UsdGeom.Tokens.constant:
+                u, v = values[0]
+                for loop in loops:
+                    loop_uvs[loop.index] = (u, 1.0 - v)
+            else:
+                # Unknown interpolation: do not fabricate a UV map.
+                return False
+        if any(coords is None for coords in loop_uvs):
+            return False
+        uv_layer = bl_mesh.uv_layers.new(name="st")
+        uv_layer.data.foreach_set("uv", [coord for pair in loop_uvs for coord in pair])
+        return True
 
     def _apply_joined_mesh_normals(self, bl_mesh: bpy.types.Mesh, normals_parts: list) -> None:
         """Fill custom normals for a joined datablock from per-part data.
@@ -1596,12 +1872,13 @@ class ModFileLoader:
         """
         loop_normals = [(0.0, 0.0, 1.0)] * len(bl_mesh.loops)
         interpolated_any = False
-        for part_index, (normals_data, loop_start, _) in enumerate(normals_parts):
+        for part_index, (normals_data, loop_start, vertex_start, loop_end) in enumerate(normals_parts):
+            if normals_data is None:
+                continue
             values, indices, interp = normals_data
             if not values:
                 continue
-            part_end = normals_parts[part_index + 1][1] if part_index + 1 < len(normals_parts) else len(bl_mesh.loops)
-            part_loops = bl_mesh.loops[loop_start:part_end]
+            part_loops = bl_mesh.loops[loop_start:loop_end]
             if interp == UsdGeom.Tokens.faceVarying:
                 if indices and len(indices) == len(part_loops):
                     for offset, norm_index in enumerate(indices):
@@ -1612,9 +1889,8 @@ class ModFileLoader:
                         loop_normals[loop_start + offset] = tuple(normal)
                 interpolated_any = True
             elif interp == UsdGeom.Tokens.vertex:
-                vertex_offset = normals_parts[part_index][2]
                 for loop in part_loops:
-                    local_index = loop.vertex_index - vertex_offset
+                    local_index = loop.vertex_index - vertex_start
                     if 0 <= local_index < len(values):
                         loop_normals[loop.index] = tuple(values[local_index])
                 interpolated_any = True

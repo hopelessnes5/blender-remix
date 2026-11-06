@@ -47,15 +47,27 @@ def get_mesh_data_from_mod(usd_mesh_prim_param, current_time_code, is_mod_y_up, 
         indices = indices_attr.Get(current_time_code)
         if not counts or not indices: return None
 
+        # Blender from_pydata supports n-gons directly. Do not fan-triangulate:
+        # USD faceVarying primvars index ORIGINAL face corners, and splitting
+        # faces here without remapping their indices destroys UVs and normals.
         faces = []
         current_idx = 0
         for count_val in counts:
-            if count_val < 3: current_idx += count_val; continue
-            face_indices = tuple(indices[current_idx : current_idx + count_val])
-            if count_val == 3 or count_val == 4: faces.append(face_indices)
-            else: # Triangulate N-gons
-                for i in range(1, count_val - 1): faces.append((face_indices[0], face_indices[i], face_indices[i+1]))
+            if count_val < 3:
+                # Reject malformed topology rather than silently shifting the
+                # remaining face-varying corner indices.
+                report_fn({'WARNING'}, f"Mesh <{usd_mesh_prim_param.GetPath()}> has "
+                          f"face with {count_val} vertices; skipping unsafe mesh")
+                return None
+            face_indices = tuple(indices[current_idx:current_idx + count_val])
+            if len(face_indices) != count_val or any(index < 0 or index >= len(verts) for index in face_indices):
+                report_fn({'WARNING'}, f"Mesh <{usd_mesh_prim_param.GetPath()}> has invalid face indices")
+                return None
+            faces.append(face_indices)
             current_idx += count_val
+        if current_idx != len(indices):
+            report_fn({'WARNING'}, f"Mesh <{usd_mesh_prim_param.GetPath()}> has inconsistent face-corner counts")
+            return None
 
         uvs_data_tuple, normals_data_tuple = None, None
         primvars_api = UsdGeom.PrimvarsAPI(mesh_api.GetPrim())
@@ -404,15 +416,9 @@ def _get_mod_value(shader, name):
 
 
 def _shader_prim_is_translucent(shader_prim_instance):
-    """Detect a translucent mod shader from its own authored inputs (the
-    AperturePBR_Translucent-specific set), independent of the Blender node."""
-    for name in ("inputs:transmittance_color", "transmittance_color",
-                 "inputs:transmittance_texture", "transmittance_texture",
-                 "inputs:thin_walled", "thin_walled"):
-        val, _attr = get_mod_input_value_util(shader_prim_instance, name)
-        if val is not None:
-            return True
-    return False
+    """Respect exact RTX MDL identity and translucent-only input names."""
+    from .material_family import detect_nvidia_shader_family
+    return detect_nvidia_shader_family(shader_prim_instance) == 'translucent'
 
 
 # Principled-only attributes that have no direct socket counterpart on the
@@ -628,32 +634,23 @@ def create_mod_material_nodes_util(material_usd_path_str, current_mod_stage,
 
     mat_name = bpy.path.clean_name(mat_prim.GetName() or os.path.basename(material_usd_path_str))
 
-    # Detect if this is a translucent material by checking for translucent-specific inputs
-    is_translucent = False
-    has_explicit_type = False
-    if mat_prim or has_shader_child:
-        test_shader = None
-        if has_shader_child:
-            test_shader = mat_prim.GetChild("Shader")
-        elif is_material:
-            surf_out = UsdShade.Material(mat_prim).GetSurfaceOutput()
-            if surf_out and surf_out.HasConnectedSource():
-                test_shader = surf_out.GetConnectedSource()[0].GetPrim()
+    # Distinguish the actual Translucent MDL from opaque subsurface-scattering
+    # inputs.  Substring matching on 'transmittance' falsely classified
+    # inputs:subsurface_transmittance_texture as Glass BSDF.
+    from .material_family import detect_nvidia_shader_family
+    test_shader = None
+    if has_shader_child:
+        test_shader = mat_prim.GetChild("Shader")
+    elif is_material:
+        surf_out = UsdShade.Material(mat_prim).GetSurfaceOutput()
+        if surf_out and surf_out.HasConnectedSource():
+            test_shader = surf_out.GetConnectedSource()[0].GetPrim()
 
-        if test_shader and test_shader.IsValid():
-            mdl = test_shader.GetAttribute('info:mdl:sourceAsset')
-            mdl_value = mdl.Get() if mdl and mdl.HasValue() else None
-            if mdl_value:
-                has_explicit_type = True
-                is_translucent = 'AperturePBR_Translucent' in str(mdl_value)
-            # Check for translucent-specific attributes
-            for attr in test_shader.GetAuthoredAttributes():
-                attr_name = attr.GetName()
-                if 'transmittance' in attr_name.lower() or 'thin_walled' in attr_name.lower():
-                    is_translucent = True
-                    has_explicit_type = True
-                    report_fn({'INFO'}, f"  Detected translucent material: {mat_name}")
-                    break
+    shader_family = detect_nvidia_shader_family(test_shader)
+    has_explicit_type = shader_family is not None
+    is_translucent = shader_family == 'translucent'
+    if has_explicit_type:
+        report_fn({'INFO'}, f"  RTX Remix material family for {mat_name}: {shader_family}")
 
     # An override containing only roughness or a normal map must retain the
     # type and existing node graph of the material it patches.
@@ -715,11 +712,17 @@ def create_mod_material_nodes_util(material_usd_path_str, current_mod_stage,
                 if main_node is None:
                     main_node = reset_glass_nodes(existing_mat)
             else:
-                nodes, links = existing_mat.node_tree.nodes, existing_mat.node_tree.links
-                nodes.clear()
-                output = nodes.new(type='ShaderNodeOutputMaterial')
-                main_node = nodes.new(type='ShaderNodeBsdfPrincipled')
-                links.new(main_node.outputs['BSDF'], output.inputs['Surface'])
+                # Correct an already-imported Glass from the old substring
+                # classifier IN PLACE.  Keep maps/other input nodes and all
+                # objects' references to the same material datablock.
+                from .glass_nodes import restore_opaque_principled
+                main_node = restore_opaque_principled(existing_mat)
+                if main_node is None:
+                    nodes, links = existing_mat.node_tree.nodes, existing_mat.node_tree.links
+                    nodes.clear()
+                    output = nodes.new(type='ShaderNodeOutputMaterial')
+                    main_node = nodes.new(type='ShaderNodeBsdfPrincipled')
+                    links.new(main_node.outputs['BSDF'], output.inputs['Surface'])
             bl_mat = existing_mat
             report_fn({'INFO'}, f"  Upgraded existing material '{existing_mat.name}' in place to the new shader type")
 
@@ -741,11 +744,21 @@ def create_mod_material_nodes_util(material_usd_path_str, current_mod_stage,
                         socket = old_node.inputs.get('Transmission Weight') or old_node.inputs.get('Transmission')
                         legacy_translucent = bool(socket and not socket.is_linked and socket.default_value >= 0.5)
                         break
-            if base_node is not None or legacy_translucent:
+            # Old versions wrongly created Glass for opaque subsurface USD.
+            # In a fresh override, preserve its node/texture graph while fixing
+            # the copied shader family, instead of discarding the whole base.
+            incorrect_base_glass = bool(
+                has_explicit_type and not is_translucent
+                and any(node.type == 'BSDF_GLASS' for node in existing_bl_material_param.node_tree.nodes)
+            )
+            if base_node is not None or legacy_translucent or incorrect_base_glass:
                 bl_mat = existing_bl_material_param.copy()
                 bl_mat.name = target_mat_name
                 main_node = None
-                if legacy_translucent:
+                if incorrect_base_glass:
+                    from .glass_nodes import restore_opaque_principled
+                    main_node = restore_opaque_principled(bl_mat)
+                elif legacy_translucent:
                     from .glass_nodes import upgrade_legacy_translucent
                     main_node = upgrade_legacy_translucent(bl_mat)
                 else:

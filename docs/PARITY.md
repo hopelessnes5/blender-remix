@@ -290,3 +290,21 @@ pass.
 - Light import delegates to the existing `light_utils.py`, which still warns
   about Y-up rotation.
 - Non-ASCII Windows paths and Linux/Wine were not tested.
+
+<!-- BEGIN 2026-11-06 PATCH STATUS -->
+## Local patch status — 6 November 2026
+
+**Post-snapshot changes, not a verified release.** Local patches cover RG normal-map nodes (Separate Color → Combine Color, B=1 → Normal Map; user confirmed the node works), instance-aware placement and sharing of prototype lights/meshes, `SphereLight` cone-to-SPOT detection, Glass BSDF for genuine `AperturePBR_Translucent`, Principled BSDF for opaque `subsurface_*` materials, and mesh viewport visibility/UV preservation during mod application.
+
+**Confirmed deployment dependency issue:** `mod_apply_utils.py` requires `rtx_remix_importer/material_family.py`. An incremental patch updated its import site but omitted the new module, causing `ModuleNotFoundError` in `Apply Mod File Changes`. The missing file was packaged separately as `Blender_Remix_Missing_Material_Family_Fix.zip`. The classifier's seven standalone unit tests pass; Blender runtime, complete capture+mod workflows, and game output after these patches have **not** been rerun here. Earlier test badges/counts reflect prior snapshots only. The `bl_info` version remains 0.5.0.
+
+See [6 November work status and verification plan](PROGRESS_2026-11-06.ru.md) before packaging a release.
+<!-- END 2026-11-06 PATCH STATUS -->
+
+<!-- BEGIN 2026-11-06 SKY-SUN PATCH -->
+## 6 November 2026: SKY/SUN import patch (local, unverified in Blender)
+
+`Blender_Remix_Sky_Sun_Import_Fix.zip` addresses `No capture instance for prototype light ...; skipping` when Blender sky geometry is named `sky_<16-hex HASH>` but the mod's light remains under `/RootNode/meshes/mesh_<HASH>`. The Blender object may have no `usd_instance_path`. The patched `mod_loader.py` recognizes sky meshes by strict name/hash matching and materializes `DistantLight` as `SUN` without a capture instance, including lights nested in `ref_*` assets. It aims to preserve the sky mesh and UV layers and avoid duplicate SUN objects on repeated Apply. No independent proof of actual Blender behavior is available.
+
+**Verification:** 8/8 standalone unit tests passed when executed with the existing `light_sharing.py`; the `bpy + pxr` integration test has not been run. Verify both `light_17d87578` and `light_bf922cef`, their directions, SUN type, sky UV/visibility, duplicate prevention, and unchanged USD files. See [the current progress](PROGRESS_2026-11-06.ru.md).
+<!-- END 2026-11-06 SKY-SUN PATCH -->
