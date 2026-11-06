@@ -12,11 +12,11 @@ Not affiliated with NVIDIA. RTX Remix, the RTX Remix Toolkit and AperturePBR mat
 
 ## Status
 
-[![Toolkit parity: 38%](docs/badge-parity.svg)](docs/PARITY.md) [![Tests: 328/328](docs/badge-tests.svg)](docs/PARITY.md#tests)
+[![Toolkit parity: 38%](docs/badge-parity.svg)](docs/PARITY.md) [![Tests: 330/330](docs/badge-tests.svg)](docs/PARITY.md#tests)
 
 [![Feature parity progress map](docs/progress.svg)](docs/PARITY.md)
 
-17 of 45 tracked Toolkit features are fully implemented, 13 are partial. Snapshot: 4 November 2026. Tested on Blender 4.5.5 LTS and 5.1.2, 328/328 tests. Full tables and unverified items: [docs/PARITY.md](docs/PARITY.md).
+17 of 45 tracked Toolkit features are fully implemented, 13 are partial. Snapshot: 4 November 2026. Tested on Blender 4.5.5 LTS and 5.1.2, 330/330 tests. Full tables and unverified items: [docs/PARITY.md](docs/PARITY.md).
 
 ## How it works
 

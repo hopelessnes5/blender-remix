@@ -71,8 +71,8 @@ class TestPrincipledMaterials(unittest.TestCase):
         result, node = mod_apply_utils.create_mod_material_nodes_util(
             '/Material', self.stage, '', '', lambda *args: None, self.material)
         try:
-            self.assertAlmostEqual(material_utils.get_principled_transmission(node).default_value, 1.0)
-            self.assertAlmostEqual(node.inputs['Base Color'].default_value[0], .2)
+            self.assertEqual(node.type, 'BSDF_GLASS')
+            self.assertAlmostEqual(node.inputs['Color'].default_value[0], .2)
             self.assertAlmostEqual(node.inputs['Roughness'].default_value, .3)
         finally:
             bpy.data.materials.remove(result, do_unlink=True)

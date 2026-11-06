@@ -430,24 +430,37 @@ class ApplyRemixModChanges(bpy.types.Operator):
                                 bl_light_data.energy = new_energy_val
                                 changed_props.append("energy (intensity/exposure)")
 
+                        # Native Blender light temperature: the light keeps
+                        # the USD color as a tint,
+                        # ``use_temperature``/``temperature`` carry the
+                        # Kelvin value.
                         enable_temp_attr = light_api.GetEnableColorTemperatureAttr()
                         color_temp_attr = light_api.GetColorTemperatureAttr()
-                        if enable_temp_attr.IsDefined() and enable_temp_attr.IsAuthored():
-                            use_temp = enable_temp_attr.Get(time_code)
-                            if bl_light_data.use_custom_color_temp != use_temp:
-                                bl_light_data.use_custom_color_temp = use_temp
-                                changed_props.append("use_color_temp")
-                            if use_temp and color_temp_attr.IsDefined() and color_temp_attr.IsAuthored():
-                                new_temp = color_temp_attr.Get(time_code)
-                                if bl_light_data.color_temperature != new_temp:
-                                    bl_light_data.color_temperature = new_temp
-                                    changed_props.append("color_temperature")
-                        elif color_temp_attr.IsDefined() and color_temp_attr.IsAuthored() and bl_light_data.use_custom_color_temp:
-                            # Only enable_temp not authored, but temp is, and blender light uses temp
-                            new_temp = color_temp_attr.Get(time_code)
-                            if bl_light_data.color_temperature != new_temp:
-                                bl_light_data.color_temperature = new_temp
-                                changed_props.append("color_temperature (assuming enabled)")
+                        enable_authored = enable_temp_attr.IsDefined() and enable_temp_attr.IsAuthored()
+                        temp_authored = color_temp_attr.IsDefined() and color_temp_attr.IsAuthored()
+                        if enable_authored or temp_authored:
+                            use_temp = (
+                                enable_temp_attr.Get(time_code)
+                                if enable_authored
+                                else bl_light_data.get('usd_color_temperature') is not None
+                            )
+                            kelvin = None
+                            if use_temp:
+                                kelvin = (
+                                    color_temp_attr.Get(time_code) if temp_authored
+                                    else bl_light_data.get('usd_color_temperature')
+                                )
+                            base_color = (
+                                tuple(light_api.GetColorAttr().Get(time_code))
+                                if light_api.GetColorAttr().IsDefined()
+                                else bl_light_data.get('usd_base_color')
+                            )
+                            temp_color = mod_apply_utils.mod_light_color_with_temperature(
+                                bl_light_data, base_color, kelvin
+                            )
+                            if tuple(bl_light_data.color) != tuple(temp_color):
+                                bl_light_data.color = temp_color
+                                changed_props.append('color (color temperature)')
 
                         # Type-specific properties (only if type matches)
                         if self._is_specific_light_type(prim, 'SphereLight') and bl_light_data.type == 'POINT':

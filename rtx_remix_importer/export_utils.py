@@ -148,6 +148,8 @@ class ShaderSetup:
             return "AperturePBR_Opacity"
 
         active = NodeAnalyzer.find_surface_shader(blender_material)
+        if active and active.type == 'BSDF_GLASS':
+            return 'AperturePBR_Translucent'
         if active and active.type == 'GROUP' and active.node_tree:
             if "Aperture Translucent" in active.node_tree.name:
                 return "AperturePBR_Translucent"
@@ -333,7 +335,14 @@ class NodeAnalyzer:
             if node.type == 'REROUTE':
                 socket = node.inputs[0]
                 continue
-            if node.type == 'BSDF_PRINCIPLED' or (node.type == 'GROUP' and node.node_tree and any(
+            if node.type == 'ADD_SHADER':
+                from .glass_nodes import glass_node
+                glass = glass_node(material)
+                if glass is not None and any(link.from_node == glass
+                                             for input_socket in node.inputs for link in input_socket.links):
+                    return glass
+                raise ValueError('Add Shader has no supported Glass BSDF input')
+            if node.type in ('BSDF_PRINCIPLED', 'BSDF_GLASS') or (node.type == 'GROUP' and node.node_tree and any(
                 key in node.node_tree.name.lower() for key in ('aperture', 'pbr', 'remix')
             )):
                 return node
@@ -428,9 +437,7 @@ class MaterialExporter:
 
         # Find the main shading node: standard Principled BSDF first, falling
         # back to a legacy Aperture node group for pre-port materials.
-        main_node = self.node_analyzer.find_principled_bsdf(blender_material)
-        if not main_node:
-            main_node = self.node_analyzer.find_aperture_node_group(blender_material)
+        main_node = self.node_analyzer.find_surface_shader(blender_material)
 
         if not main_node:
             progress.step("No shader node found, using defaults")
@@ -454,8 +461,20 @@ class MaterialExporter:
         print(f"DEBUG: _export_material_textures called with material_type: {material_type}")
 
         def find_socket(*names):
-            """Polymorphic socket lookup: standard Principled names first, legacy
-            Aperture-group names afterwards (pre-port materials)."""
+            """Resolve Glass/Emission, Principled or legacy Aperture sockets."""
+            if shader_node.type == 'BSDF_GLASS':
+                from .glass_nodes import emission_node
+                for name in names:
+                    if name in ('Base Color', 'Transmittance/Diffuse Albedo'):
+                        return 'Color', shader_node.inputs.get('Color')
+                    if name in ('Emission Color', 'Emissive Color'):
+                        emission = emission_node(material)
+                        if emission:
+                            return 'Color', emission.inputs.get('Color')
+                    if name in ('Emission Strength', 'Emissive Intensity'):
+                        emission = emission_node(material)
+                        if emission:
+                            return 'Strength', emission.inputs.get('Strength')
             for name in names:
                 socket = shader_node.inputs.get(name)
                 if socket is not None:
@@ -482,6 +501,7 @@ class MaterialExporter:
             texture_mappings = [
                 (('Base Color', 'Transmittance/Diffuse Albedo'), 'inputs:transmittance_texture', 'inputs:transmittance_color', 'base color'),
                 (('Normal', 'Normal Map'), 'inputs:normalmap_texture', None, 'normal'),
+                (('Emission Color', 'Emissive Color'), 'inputs:emissive_mask_texture', 'inputs:emissive_color', 'emission'),
             ]
 
             # Also handle constant values for translucent materials
@@ -549,8 +569,8 @@ class MaterialExporter:
             if not socket:
                 continue
 
-            # Emission texture/constants are only authored when emission is on
-            if texture_type == 'emission' and not socket_is_lit(socket_name, socket):
+            # Emission texture/constants are only authored when emission is on.
+            if texture_type == 'emission' and not emission_enabled:
                 continue
 
             scalar_channel = None
@@ -615,6 +635,8 @@ class MaterialExporter:
                     if prop in bl_mat:
                         value = bl_mat[prop]
                 if value is None:
+                    continue
+                if ('emissive_color' in usd_attr or 'emissive_intensity' in usd_attr) and not emission_enabled:
                     continue
 
                 if value_kind == 'bool':
@@ -717,11 +739,8 @@ class LightExporter:
             usd_light_type = "SphereLight"
             radius = bl_light.shadow_soft_size if bl_light.shadow_soft_size > 0 else 1.0
             light_attrs["inputs:radius"] = float(radius)
-            shaping_attrs.update({
-                "shaping:cone:angle": 180.0,
-                "shaping:cone:softness": 0.0,
-                "shaping:focus": 0.0
-            })
+            # A POINT is an unshaped SphereLight. Authoring a 180-degree
+            # cone would make it look like a spot to Remix's capture readers.
             default_extent = 5.0
             extent = Vt.Vec3fArray([Gf.Vec3f(-default_extent), Gf.Vec3f(default_extent)])
 

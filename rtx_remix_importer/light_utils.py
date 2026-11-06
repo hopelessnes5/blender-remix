@@ -1,7 +1,13 @@
 import bpy
 import math
 import os
+import re
 import mathutils
+
+from .light_sharing import (
+    cone_spot_size, is_prototype_light_path, light_parameter_signature,
+    prototype_light_path, sphere_cone_parameters,
+)
 try:
     from pxr import Usd, UsdGeom, Sdf, Gf
     USD_AVAILABLE = True
@@ -95,8 +101,6 @@ def create_light_from_usd(light_prim, stage, scene_scale=1.0, up_axis=None):
         radius = get_attr_value(light_prim, "radius", 0.1) # Default small radius
         length = get_attr_value(light_prim, "length", 1.0) # For Cylinder/Rect lights
         width = get_attr_value(light_prim, "width", 1.0) # For Rect lights
-        angle = get_attr_value(light_prim, "shaping:cone:angle", 180.0) # For spot lights (if we add them)
-        softness = get_attr_value(light_prim, "shaping:cone:softness", 0.0) # For spot lights
 
 
         # Calculate combined intensity (Blender uses 'energy')
@@ -117,40 +121,18 @@ def create_light_from_usd(light_prim, stage, scene_scale=1.0, up_axis=None):
             effective_light_power *= (scene_scale * scene_scale)
 
         if prim_type == "SphereLight":
-            # Check for spotlight shaping attributes
-            # USD "shaping:cone:angle" is full angle, Blender "spot_size" is full angle
-            # USD "shaping:cone:softness" (0-1) maps to Blender "spot_blend" (0-1)
-            is_spotlight = False
-            usd_cone_angle = get_attr_value(light_prim, "shaping:cone:angle", 360.0) # Default to wide angle if not specified
-            usd_cone_softness = get_attr_value(light_prim, "shaping:cone:softness", 0.0)
-
-            schemas = light_prim.GetAppliedSchemas()
-            has_shaping_api = "ShapingAPI" in schemas
-
-            # A SphereLight is treated as a SPOT if ShapingAPI is applied
-            # AND its cone angle is meaningfully less than a full sphere (e.g., < 179 degrees).
-            # An angle of 179 degrees or wider, even with ShapingAPI, is treated as a point light.
-            if has_shaping_api and usd_cone_angle < 179.0:
-                is_spotlight = True
-
-            if is_spotlight:
-                bl_light_type = 'SPOT'
-                light_data = bpy.data.lights.new(name=light_name, type=bl_light_type)
-                light_data.energy = effective_light_power * blender_energy_scale
-                light_data.shadow_soft_size = radius * scene_scale # Spotlights also have a radius for shadow softness
-                
-                # Convert USD cone angle (degrees) to Blender spot_size (radians)
-                # USD cone angle is measured from the axis; Blender uses the
-                # full opening angle, in radians.
-                light_data.spot_size = min(math.pi, math.radians(2 * usd_cone_angle))
-                light_data.spot_blend = usd_cone_softness # This is a 0-1 value, similar to Blender's
-                print(f"  Info: Creating SPOT light for {light_name} (angle: {usd_cone_angle}, softness: {usd_cone_softness})")
-            else:
-                bl_light_type = 'POINT'
-                light_data = bpy.data.lights.new(name=light_name, type=bl_light_type)
-                light_data.energy = effective_light_power * blender_energy_scale
-                light_data.shadow_soft_size = radius * scene_scale
-                print(f"  Info: Creating POINT light for {light_name} (default SphereLight)")
+            # Remix-authored shaping attributes may exist without formally
+            # applying ShapingAPI. Do not depend on GetAppliedSchemas() or on
+            # a magic 179-degree cut-off; inspect the actual authored values.
+            is_spot, cone_angle, cone_softness = sphere_cone_parameters(light_prim, Usd.TimeCode.Default())
+            bl_light_type = 'SPOT' if is_spot else 'POINT'
+            light_data = bpy.data.lights.new(name=light_name, type=bl_light_type)
+            light_data.energy = effective_light_power * blender_energy_scale
+            light_data.shadow_soft_size = radius * scene_scale
+            if is_spot:
+                light_data.spot_size = cone_spot_size(cone_angle)
+                light_data.spot_blend = max(0.0, min(1.0, cone_softness))
+                print(f"  Info: SPOT SphereLight {light_name}: half-angle={cone_angle}, softness={cone_softness}")
 
         elif prim_type == "DiskLight":
             bl_light_type = 'AREA'
@@ -297,32 +279,55 @@ def import_lights_from_usd(stage, collection, scene_scale=1.0, up_axis=None):
         return []
 
     created_lights = []
-    # Define known USD light prim types
-    # Exclude geometry lights like DomeLight for now unless specifically handled
-    light_types = [
-        "SphereLight", "DiskLight", "CylinderLight", "RectLight",
-        "DistantLight"
-        # "DomeLight", "PortalLight" # Need specific handling
-    ]
+    light_types = {"SphereLight", "DiskLight", "CylinderLight", "RectLight", "DistantLight"}
+    candidates = [prim for prim in stage.TraverseAll() if prim.GetTypeName() in light_types]
 
-    print("Searching for lights in stage...")
-    # Iterate through all prims in the stage
-    for prim in stage.TraverseAll(): # Use TraverseAll to include inactive prims if needed
-        prim_type_name = prim.GetTypeName()
-        if prim_type_name in light_types:
-            print(f"Found light prim: {prim.GetPath()} of type {prim_type_name}")
-            light_obj = create_light_from_usd(prim, stage, scene_scale, up_axis)
-            if light_obj:
-                try:
-                    # Link the light object to the specified collection
-                    collection.objects.link(light_obj)
-                    created_lights.append(light_obj)
-                except Exception as e:
-                    print(f"Error linking light '{light_obj.name}' to collection: {e}")
-                    # Clean up orphaned light object and data if linking failed
-                    if light_obj.data and light_obj.data.users == 1: # Only used by this object
-                        bpy.data.lights.remove(light_obj.data)
-                    bpy.data.objects.remove(light_obj)
+    # A prototype light is not a placed light if it is composed into one or
+    # more /RootNode/instances. Display the mapped instances instead of also
+    # creating a ghost light at the prototype origin.
+    composed_instance_sources = {
+        prototype_light_path(prim)
+        for prim in candidates
+        if str(prim.GetPath()).startswith('/RootNode/instances/')
+    }
+    data_by_source_and_parameters = {}
+    for prim in candidates:
+        usd_path = str(prim.GetPath())
+        source_path = prototype_light_path(prim)
+        if is_prototype_light_path(usd_path) and usd_path in composed_instance_sources:
+            continue
+        light_obj = create_light_from_usd(prim, stage, scene_scale, up_axis)
+        if light_obj is None:
+            continue
+        # Two instance prims can have different USD-authored light parameters.
+        # Only link their Blender Light IDs when the composed data agrees.
+        key = (source_path, light_parameter_signature(prim, Usd.TimeCode.Default()))
+        canonical_data = data_by_source_and_parameters.get(key)
+        if canonical_data is None:
+            data_by_source_and_parameters[key] = light_obj.data
+        else:
+            duplicate_data = light_obj.data
+            light_obj.data = canonical_data
+            if duplicate_data.users == 0:
+                bpy.data.lights.remove(duplicate_data)
+        light_obj['usd_light_source_path'] = source_path
+        if source_path != usd_path:
+            # Match the mod-loader's prototype + instance provenance so an
+            # Apply Mod updates this captured light rather than duplicating it.
+            match = re.match(r'^(/RootNode/instances/inst_[0-9A-Fa-f]{16}_\d+)(?:/|$)', usd_path)
+            if match:
+                light_obj['usd_light_path'] = source_path
+                light_obj['usd_light_instance_path'] = match.group(1)
+                light_obj['usd_prototype_path'] = '/'.join(source_path.split('/')[:4])
+        try:
+            collection.objects.link(light_obj)
+            created_lights.append(light_obj)
+        except Exception as e:
+            print(f"Error linking light '{light_obj.name}' to collection: {e}")
+            unused_data = light_obj.data
+            bpy.data.objects.remove(light_obj, do_unlink=True)
+            if unused_data.users == 0:
+                bpy.data.lights.remove(unused_data)
 
     print(f"Imported {len(created_lights)} lights.")
     

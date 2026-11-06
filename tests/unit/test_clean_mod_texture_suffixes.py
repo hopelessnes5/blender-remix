@@ -41,13 +41,31 @@ class TestModSuffixCleanup(unittest.TestCase):
             self.assertEqual(archive.read('textures/' + texture.name), b'dds data')
         self.assertEqual(cleaner.build_plan(self.root)[1:], ({}, {}))
 
-    def test_collision_rejected_before_changes(self):
+    def test_collision_skipped_without_changes(self):
         old = self.root / 'textures' / 'wood.a.rtex.dds'
         old.write_bytes(b'old')
         (old.parent / 'wood.dds').write_bytes(b'existing')
-        with self.assertRaisesRegex(ValueError, 'collision'):
-            cleaner.build_plan(self.root)
+        skipped = []
+        cleaner.build_plan(self.root, skipped)
+        self.assertEqual([skipped[0][2]], ['target already exists'])
+        # Nothing moved or overwritten: both files keep their content.
         self.assertEqual(old.read_bytes(), b'old')
+        self.assertEqual((old.parent / 'wood.dds').read_bytes(), b'existing')
+
+    def test_same_target_group_skipped(self):
+        first = self.root / 'textures' / 'limb.a.rtex.dds'
+        first.write_bytes(b'first')
+        second = self.root / 'textures' / 'limb.m.rtex.dds'
+        second.write_bytes(b'second')
+        skipped = []
+        cleaner.build_plan(self.root, skipped)
+        # All textures of one ambiguous target are skipped together instead
+        # of arbitrarily choosing the first.
+        self.assertEqual(
+            [skipped_file[2] for skipped_file in skipped],
+            ['multiple textures have the same target'] * 2)
+        self.assertEqual(first.read_bytes(), b'first')
+        self.assertEqual(second.read_bytes(), b'second')
 
     def test_capture_reference_prevents_rename(self):
         texture = self.root / 'textures' / 'wood.a.rtex.dds'

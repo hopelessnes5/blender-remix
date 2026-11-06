@@ -166,7 +166,22 @@ class TestNormalImportEncoding(unittest.TestCase):
                         with patch('rtx_remix_importer.material_utils.load_texture', return_value=source):
                             process_pbr(shader, material, bsdf, os.path.join(tmp, 'capture.usda'))
                     normal = bsdf.inputs['Normal'].links[0].from_node
-                    imported = normal.inputs['Color'].links[0].from_node.image
+                    self.assertEqual(normal.type, 'NORMAL_MAP')
+                    combine = normal.inputs['Color'].links[0].from_node
+                    self.assertEqual(combine.type, 'COMBINE_COLOR')
+                    self.assertEqual(combine.mode, 'RGB')
+                    self.assertFalse(combine.inputs['Blue'].is_linked)
+                    self.assertEqual(combine.inputs['Blue'].default_value, 1.0)
+                    separate = combine.inputs['Red'].links[0].from_node
+                    self.assertEqual(separate.type, 'SEPARATE_COLOR')
+                    self.assertEqual(separate.mode, 'RGB')
+                    self.assertEqual(combine.inputs['Red'].links[0].from_socket.name, 'Red')
+                    self.assertEqual(combine.inputs['Green'].links[0].from_node, separate)
+                    self.assertEqual(combine.inputs['Green'].links[0].from_socket.name, 'Green')
+                    texture = separate.inputs['Color'].links[0].from_node
+                    self.assertEqual(texture.type, 'TEX_IMAGE')
+                    imported = texture.image
+                    self.assertEqual(imported.colorspace_settings.name, 'Non-Color')
                     self.assertAlmostEqual(imported.pixels[1], .8, places=5)
                     self.assertEqual(imported['remix_normal_original_encoding'], 2)
         finally:
@@ -176,6 +191,53 @@ class TestNormalImportEncoding(unittest.TestCase):
                         bpy.data.images.remove(node.image, do_unlink=True)
                 bpy.data.materials.remove(material, do_unlink=True)
             bpy.data.images.remove(source)
+
+    def test_mod_normal_graph_reload_and_legacy_upgrade(self):
+        from rtx_remix_importer.mod_apply_utils import process_mod_input_util
+        from rtx_remix_importer.normal_nodes import find_normal_texture_node
+
+        material = bpy.data.materials.new('NormalXYReload')
+        material.use_nodes = True
+        nodes = material.node_tree.nodes
+        links = material.node_tree.links
+        bsdf = next(node for node in nodes if node.type == 'BSDF_PRINCIPLED')
+        image_a = bpy.data.images.new('NormalXYA', width=1, height=1)
+        image_b = bpy.data.images.new('NormalXYB', width=1, height=1)
+        try:
+            for image in (image_a, image_b):
+                image.colorspace_settings.name = 'Non-Color'
+            with tempfile.TemporaryDirectory() as tmp:
+                path = os.path.join(tmp, 'normal.png')
+                with open(path, 'wb') as stream:
+                    stream.write(b'fixture')
+                mod_path = os.path.join(tmp, 'mod.usda')
+
+                # Existing materials may still have the old direct Texture -> NormalMap chain.
+                texture = nodes.new(type='ShaderNodeTexImage')
+                texture.image = image_a
+                normal = nodes.new(type='ShaderNodeNormalMap')
+                links.new(texture.outputs['Color'], normal.inputs['Color'])
+                links.new(normal.outputs['Normal'], bsdf.inputs['Normal'])
+
+                with patch('rtx_remix_importer.mod_apply_utils.load_mod_texture_util', return_value=image_a):
+                    process_mod_input_util(path, 'normalmap_texture', nodes, links, bsdf, 'Normal', tmp, mod_path, is_normal=True)
+                self.assertEqual(len([node for node in nodes if node.type == 'NORMAL_MAP']), 1)
+                self.assertEqual(len([node for node in nodes if node.type == 'SEPARATE_COLOR']), 1)
+                self.assertEqual(len([node for node in nodes if node.type == 'COMBINE_COLOR']), 1)
+                self.assertIs(find_normal_texture_node(normal), texture)
+                self.assertEqual(normal.inputs['Color'].links[0].from_node.inputs['Blue'].default_value, 1.0)
+
+                # Updating the same mod material reuses every node and changes only the image.
+                with patch('rtx_remix_importer.mod_apply_utils.load_mod_texture_util', return_value=image_b):
+                    process_mod_input_util(path, 'normalmap_texture', nodes, links, bsdf, 'Normal', tmp, mod_path, is_normal=True)
+                self.assertEqual(texture.image, image_b)
+                self.assertEqual(len([node for node in nodes if node.type == 'NORMAL_MAP']), 1)
+                self.assertEqual(len([node for node in nodes if node.type == 'SEPARATE_COLOR']), 1)
+                self.assertEqual(len([node for node in nodes if node.type == 'COMBINE_COLOR']), 1)
+        finally:
+            bpy.data.materials.remove(material, do_unlink=True)
+            for image in (image_a, image_b):
+                bpy.data.images.remove(image, do_unlink=True)
 
     def test_decoded_normal_survives_blend_reopen(self):
         with tempfile.TemporaryDirectory() as tmp:

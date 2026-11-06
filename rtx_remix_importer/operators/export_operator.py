@@ -975,7 +975,18 @@ def _export_material_impl(blender_material, sublayer_stage, project_root, sublay
     textures_dir = os.path.join(project_root, custom_texture_dir)
 
     def node_socket(node, *names):
-        """First existing input socket among *names* (Principled + legacy Aperture)."""
+        """First available socket, including Glass Color and additive emission."""
+        if node and node.type == 'BSDF_GLASS':
+            from ..glass_nodes import emission_node
+            for name in names:
+                if name in ('Base Color', 'Transmittance/Diffuse Albedo'):
+                    return node.inputs.get('Color')
+                if name in ('Emissive Color', 'Emission Color'):
+                    emitter = emission_node(blender_material)
+                    return emitter.inputs.get('Color') if emitter else None
+                if name in ('Emissive Intensity', 'Emission Strength'):
+                    emitter = emission_node(blender_material)
+                    return emitter.inputs.get('Strength') if emitter else None
         for name in names:
             socket = node.inputs.get(name)
             if socket is not None:
@@ -1013,7 +1024,15 @@ def _export_material_impl(blender_material, sublayer_stage, project_root, sublay
                 'Emissive Color': 'Emission Color',
                 'Emissive Intensity': 'Emission Strength',
             }
-            socket = principled_node.inputs.get(principled_name_mapping.get(socket_name, socket_name))
+            if principled_node.type == 'BSDF_GLASS' and socket_name in ('Emission Color', 'Emissive Color'):
+                from ..glass_nodes import emission_node
+                emitter = emission_node(blender_material)
+                socket = emitter.inputs.get('Color') if emitter else None
+            else:
+                if principled_node.type == 'BSDF_GLASS':
+                    principled_name_mapping['Transmittance/Diffuse Albedo'] = 'Color'
+                    principled_name_mapping['Base Color'] = 'Color'
+                socket = principled_node.inputs.get(principled_name_mapping.get(socket_name, socket_name))
             
         if not socket:
             return None, None
@@ -1043,7 +1062,7 @@ def _export_material_impl(blender_material, sublayer_stage, project_root, sublay
             texture_type = socket_name.lower()
             if texture_type in ['emissive color', 'emission']:
                 texture_type = 'emission'
-            elif texture_type in ['base color', 'albedo color']:
+            elif texture_type in ['base color', 'albedo color', 'transmittance/diffuse albedo']:
                 texture_type = 'base color'
             elif texture_type in ['normal', 'normal map']:
                 texture_type = 'normal'
@@ -1098,18 +1117,29 @@ def _export_material_impl(blender_material, sublayer_stage, project_root, sublay
         enable_emission = False
         emissive_image, emissive_rel_path = None, None
         emissive_socket_name = 'Emissive Color' if principled_node.type == 'GROUP' else 'Emission Color'
-        if emissive_socket_name not in [inp.name for inp in principled_node.inputs]:
+        if principled_node.type == 'BSDF_GLASS':
+            emissive_socket_name = 'Emissive Color'
+        elif emissive_socket_name not in [inp.name for inp in principled_node.inputs]:
             emissive_socket_name = 'Emission' if 'Emission' in [inp.name for inp in principled_node.inputs] else None
 
-        emissive_socket = principled_node.inputs.get(emissive_socket_name) if emissive_socket_name else None
+        if principled_node.type == 'BSDF_GLASS':
+            from ..glass_nodes import emission_node
+            emitter = emission_node(blender_material)
+            emissive_socket = emitter.inputs.get('Color') if emitter else None
+        else:
+            emissive_socket = principled_node.inputs.get(emissive_socket_name) if emissive_socket_name else None
 
         if principled_node.type == 'GROUP':
             enable_emission_socket = principled_node.inputs.get('Enable Emission')
             if enable_emission_socket and enable_emission_socket.default_value:
                 enable_emission = True
         else:
-            emission_strength_socket = principled_node.inputs.get('Emission Strength')
-            if emission_strength_socket and emission_strength_socket.default_value > 0.001:
+            if principled_node.type == 'BSDF_GLASS':
+                emission_strength_socket = emitter.inputs.get('Strength') if emitter else None
+            else:
+                emission_strength_socket = principled_node.inputs.get('Emission Strength')
+            if emission_strength_socket and (emission_strength_socket.is_linked
+                                            or emission_strength_socket.default_value > 0.001):
                 enable_emission = True
 
         if emissive_socket and emissive_socket.is_linked:
@@ -1261,7 +1291,7 @@ def _export_material_impl(blender_material, sublayer_stage, project_root, sublay
             shader_prim.CreateAttribute("inputs:transmittance_texture", Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(diffuse_rel_path))
             shader_prim.CreateAttribute("inputs:transmittance_color", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(1.0, 1.0, 1.0))
         else:
-            transmittance_socket = node_socket(principled_node, 'Base Color', 'Transmittance/Diffuse Albedo')
+            transmittance_socket = node_socket(principled_node, 'Base Color', 'Color', 'Transmittance/Diffuse Albedo')
             if transmittance_socket and hasattr(transmittance_socket.default_value, '__len__'):
                 tc = transmittance_socket.default_value
                 shader_prim.CreateAttribute("inputs:transmittance_color", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(tc[0], tc[1], tc[2]))
@@ -1446,9 +1476,8 @@ def export_light(operator, context, obj, sublayer_stage, project_root, target_su
         usd_light_type = "SphereLight"
         radius = bl_light.shadow_soft_size / remix_export_scale
         light_attrs["inputs:radius"] = float(radius)
-        shaping_attrs["inputs:shaping:cone:angle"] = 180.0
-        shaping_attrs["inputs:shaping:cone:softness"] = 0.0
-        shaping_attrs["inputs:shaping:focus"] = 0.0
+        # Do not author shaping:cone for a point SphereLight: its presence
+        # signifies a shaped/spot emission cone in Remix captures.
         default_extent = 5.0
         extent = Vt.Vec3fArray([Gf.Vec3f(-default_extent), Gf.Vec3f(default_extent)])
 
@@ -1554,8 +1583,13 @@ def export_light(operator, context, obj, sublayer_stage, project_root, target_su
         UsdGeom.Xform.Define(sublayer_stage, light_prim_path)
     light_prim.SetTypeName(usd_light_type)
 
-    if shaping_attrs or usd_light_type == "SphereLight":
+    if shaping_attrs:
         UsdLux.ShapingAPI.Apply(light_prim)
+    elif bl_light.type == 'POINT':
+        # Mask any weaker cone opinions when replacing an existing spotlight
+        # with an unshaped SphereLight in a stronger mod layer.
+        for name in ('inputs:shaping:cone:angle', 'inputs:shaping:cone:softness'):
+            light_prim.CreateAttribute(name, Sdf.ValueTypeNames.Float).Block()
 
     for attr_name, value in light_attrs.items():
         try:

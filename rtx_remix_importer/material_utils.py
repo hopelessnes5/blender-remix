@@ -134,8 +134,9 @@ def create_default_blender_material(name):
 
 
 def create_translucent_blender_material(name):
-    """Creates a Blender material with a transmission Principled BSDF setup."""
-    return _create_principled_material(name, is_translucent=True)
+    """Create AperturePBR_Translucent with a real Glass BSDF (not Principled)."""
+    from .glass_nodes import create_glass_material
+    return create_glass_material(name)
 
 
 def _is_translucent_shader(shader):
@@ -187,6 +188,13 @@ def create_material(usd_material_path, usd_stage, usd_file_path_context):
     if cache_key in _global_material_cache:
         cached_material = _global_material_cache[cache_key]
         if _cache_entry_alive(cached_material):
+            material_prim_cached = usd_stage.GetPrimAtPath(usd_material_path)
+            if material_prim_cached and material_prim_cached.IsA(UsdShade.Material):
+                shader_cached = get_shader_from_material(material_prim_cached)
+                if shader_cached and _is_translucent_shader(shader_cached):
+                    from .glass_nodes import upgrade_legacy_translucent, glass_node, reset_glass_nodes
+                    if glass_node(cached_material) is None and upgrade_legacy_translucent(cached_material) is None:
+                        reset_glass_nodes(cached_material)
             print(f"Reusing cached material: {cached_material.name} (key: {cache_key})")
             return cached_material
         else:
@@ -221,6 +229,11 @@ def create_material(usd_material_path, usd_stage, usd_file_path_context):
     if unique_material_name in bpy.data.materials:
         existing_material = bpy.data.materials[unique_material_name]
         print(f"Material '{unique_material_name}' already exists, reusing.")
+        from .glass_nodes import upgrade_legacy_translucent, glass_node, reset_glass_nodes
+        existing_shader = get_shader_from_material(material_prim)
+        if existing_shader and _is_translucent_shader(existing_shader) and glass_node(existing_material) is None:
+            if upgrade_legacy_translucent(existing_material) is None:
+                reset_glass_nodes(existing_material)
         _global_material_cache[cache_key] = existing_material
         return existing_material
 
@@ -240,7 +253,7 @@ def create_material(usd_material_path, usd_stage, usd_file_path_context):
     if is_translucent:
         print("Material identified as AperturePBR_Translucent")
 
-    # Create an appropriate standard Principled BSDF material
+    # Create a real Glass BSDF for translucent MDL, Principled for opaque MDL
     if is_translucent:
         bl_material, main_shader_node = create_translucent_blender_material(unique_material_name)
     else:
@@ -285,7 +298,6 @@ def process_input(usd_input_value, input_type, nodes, links, target_node, target
 
     created_node = None
     texture_node_x = target_node.location.x - 400 # X position for texture nodes
-    normal_map_node_x = target_node.location.x - 150 # X position for normal map node
 
     # Check if the value is a texture path
     # Relaxed check: assume string value starting with '../' or containing 'assets/' is a texture path
@@ -330,12 +342,11 @@ def process_input(usd_input_value, input_type, nodes, links, target_node, target
 
                 # Special handling for Normal Maps
                 if is_normal:
-                    normal_map_node = nodes.new(type='ShaderNodeNormalMap')
-                    normal_map_node.location = (normal_map_node_x, node_pos[1])
-                    # Connect Texture -> Normal Map Node -> Target Socket
-                    links.new(tex_node.outputs[output_socket_name], normal_map_node.inputs['Color'])
-                    links.new(normal_map_node.outputs['Normal'], target_socket)
-                    created_node = normal_map_node # Return the normal map node
+                    from .normal_nodes import connect_xy_normal
+                    created_node = connect_xy_normal(
+                        nodes, links, tex_node, target_socket,
+                        target_x=target_node.location.x, node_y=node_pos[1],
+                    )
                 elif is_non_color and target_socket.type == 'VALUE':
                     from .scalar_texture import connect_scalar_red
                     connect_scalar_red(nodes, links, tex_node, target_socket)
@@ -383,13 +394,7 @@ def process_input(usd_input_value, input_type, nodes, links, target_node, target
 
 # PBR Processor
 def process_pbr(shader, bl_material, shader_node, usd_file_path_context):
-    """Processes AperturePBR shader inputs onto a standard Principled BSDF node.
-
-    The material is represented either as an opaque Principled BSDF or a
-    transmission Principled BSDF (AperturePBR_Translucent): transmission
-    materials read their diffuse layer from transmittance inputs and drive
-    Principled's IOR directly.
-    """
+    """Apply USD AperturePBR values to opaque Principled or translucent Glass."""
     nodes = bl_material.node_tree.nodes
     links = bl_material.node_tree.links
     print(f"    Processing PBR inputs for shader: {shader.GetPath()} onto node: {shader_node.name}") # LOGGING
@@ -398,13 +403,10 @@ def process_pbr(shader, bl_material, shader_node, usd_file_path_context):
     is_translucent = _is_translucent_shader(shader)
     
     if is_translucent:
-        # Principled input map for AperturePBR_Translucent -> transmission BSDF
         input_map = {
-            "Base Color": ["inputs:transmittance_texture", "transmittance_texture", "inputs:transmittance_color", "transmittance_color"],
+            "Color": ["inputs:transmittance_texture", "transmittance_texture", "inputs:transmittance_color", "transmittance_color"],
             "IOR": ["inputs:ior_constant", "ior_constant"],
             "Normal": ["inputs:normalmap_texture", "normalmap_texture"],
-            "Emission Color": ["inputs:emissive_color", "emissive_color"],
-            "Emission Strength": ["inputs:emissive_intensity", "emissive_intensity"],
         }
     else:
         # Principled input map for AperturePBR (opaque family)
@@ -474,6 +476,30 @@ def process_pbr(shader, bl_material, shader_node, usd_file_path_context):
             if created_node:
                 y_pos_offset -= texture_node_spacing
 
+
+    if is_translucent and shader_node.type == 'BSDF_GLASS':
+        # Glass has no Alpha / Emission sockets. Add a separate emission shader
+        # when enabled, preserving the native Glass BSDF for refraction.
+        emission_enabled = get_input_value(shader, 'inputs:enable_emission') is True
+        if emission_enabled:
+            from .glass_nodes import ensure_emission
+            emission = ensure_emission(bl_material)
+            for socket, usd_names in (
+                ('Color', ('inputs:emissive_mask_texture', 'emissive_mask_texture',
+                           'inputs:emissive_color', 'emissive_color')),
+                ('Strength', ('inputs:emissive_intensity', 'emissive_intensity')),
+            ):
+                for name in usd_names:
+                    value = get_input_value(shader, name)
+                    if value is not None:
+                        from .normal_import import effective_encoding
+                        process_input(value, name, nodes, links, emission, socket,
+                                      usd_file_path_context, node_pos=(-450, -250),
+                                      is_normal=False, is_non_color=(socket == 'Strength'))
+                        break
+            explicit_intensity = get_input_value(shader, 'inputs:emissive_intensity')
+            if explicit_intensity is None and not emission.inputs['Strength'].is_linked:
+                emission.inputs['Strength'].default_value = 40.0  # MDL default
 
     # --- Opacity / Alpha Handling ---
     # UsdPreviewSurface-like 'inputs:opacity' / opacity textures also land on
@@ -562,7 +588,7 @@ def process_pbr(shader, bl_material, shader_node, usd_file_path_context):
                  print("  Set Emission Strength to 1.0 as Emission Color is present and emission is not explicitly disabled.")
 
     if is_translucent:
-        for name in ('thin_walled', 'thin_wall_thickness', 'transmittance_measurement_distance'):
+        for name in ('thin_walled', 'thin_wall_thickness', 'transmittance_measurement_distance', 'use_diffuse_layer'):
             value = get_input_value(shader, 'inputs:' + name)
             if isinstance(value, (bool, int, float)):
                 bl_material['rtx_' + name] = value
@@ -694,6 +720,10 @@ def _find_principled_node(bl_material):
     if not bl_material.node_tree:
         return None
 
+    from .glass_nodes import glass_node
+    glass = glass_node(bl_material)
+    if glass is not None:
+        return glass
     principled = None
     group = None
     for node in bl_material.node_tree.nodes:
@@ -726,6 +756,9 @@ def create_base_material_nodes(usd_material_path, usd_stage, usd_file_path_conte
     if not material_name:
         material_name = bpy.path.clean_name(os.path.basename(usd_material_path))
 
+    surface_shader = get_shader_from_material(material_prim)
+    translucent = bool(surface_shader and _is_translucent_shader(surface_shader))
+
     # Get existing or create new Blender material
     if material_name in bpy.data.materials:
         bl_material = bpy.data.materials[material_name]
@@ -733,24 +766,42 @@ def create_base_material_nodes(usd_material_path, usd_stage, usd_file_path_conte
         if not bl_material.use_nodes:
             bl_material.use_nodes = True
         if not bl_material.node_tree:
-            bl_material, shader_node = create_default_blender_material(material_name) # Rebuild if no tree
+            bl_material.use_nodes = True
+            bl_material.node_tree.nodes.clear()
+            shader_node = bl_material.node_tree.nodes.new(
+                type='ShaderNodeBsdfGlass' if translucent else 'ShaderNodeBsdfPrincipled')
+            output = bl_material.node_tree.nodes.new(type='ShaderNodeOutputMaterial')
+            bl_material.node_tree.links.new(shader_node.outputs['BSDF'], output.inputs['Surface'])
         else:
+            if translucent:
+                from .glass_nodes import upgrade_legacy_translucent, glass_node, reset_glass_nodes
+                if glass_node(bl_material) is None and upgrade_legacy_translucent(bl_material) is None:
+                    reset_glass_nodes(bl_material)
             shader_node = _find_principled_node(bl_material)
-            if not shader_node: # Still not found, create default setup
-                 bl_material, shader_node = create_default_blender_material(material_name)
+            if not shader_node:
+                # Reuse the datablock rather than create a .001 duplicate.
+                nodes, links = bl_material.node_tree.nodes, bl_material.node_tree.links
+                nodes.clear()
+                output = nodes.new(type='ShaderNodeOutputMaterial')
+                shader_node = nodes.new(type='ShaderNodeBsdfGlass' if translucent else 'ShaderNodeBsdfPrincipled')
+                if translucent:
+                    shader_node.inputs['IOR'].default_value = 1.3
+                    shader_node.inputs['Color'].default_value = (0.97, 0.97, 0.97, 1.0)
+                    shader_node.inputs['Roughness'].default_value = 0.0
+                links.new(shader_node.outputs['BSDF'], output.inputs['Surface'])
 
         print(f"    Reusing existing material: '{material_name}' with shader node '{shader_node.name if shader_node else 'None'}'")
 
     else:
         # Create new Blender material if it doesn't exist
-        bl_material, shader_node = create_default_blender_material(material_name)
+        bl_material, shader_node = (create_translucent_blender_material(material_name) if translucent
+                                    else create_default_blender_material(material_name))
         if not shader_node: # Should be guaranteed by create_default_blender_material
             print(f"    ERROR: Could not create main shader node in new material '{material_name}'.")
             return None
         print(f"    Created new material: '{material_name}' with shader node '{shader_node.name}'")
 
-    # Find the USD surface shader
-    surface_shader = get_shader_from_material(material_prim)
+    # Find the USD surface shader (already resolved before node creation).
     if not surface_shader:
         print(f"    WARNING: No surface shader found for material: {material_name}. Using default setup.")
         return bl_material, shader_node # Return default setup
@@ -782,6 +833,10 @@ def apply_metadata_overrides(metadata, bl_material, shader_node):
     # --- Alpha Blending --- #
     alpha_blend_enabled = metadata.get('alphaBlendEnabled', 0) == 1
     alpha_test_enabled = metadata.get('alphaTestEnabled', 0) == 1
+
+    if shader_node.type == 'BSDF_GLASS':
+        # Glass refraction is shader-driven and has no Alpha input.
+        return
 
     if alpha_blend_enabled:
         set_material_blend_method_compatible(bl_material, 'BLEND', 'HASHED')

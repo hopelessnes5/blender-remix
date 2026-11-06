@@ -6,15 +6,20 @@ by using USD's layer composition system properly and only processing authored ch
 """
 
 import bpy
+import mathutils
 import os
+import re
 import math
-from typing import Dict, Set, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 from ... import mod_apply_utils
 from ...core_utils import (
     calc_normals_split_compatible,
     set_mesh_auto_smooth_compatible,
     set_custom_normals_compatible
 )
+from ...nvidia_core import constants
+from ...light_sharing import (cone_spot_size, light_parameter_signature,
+                              sphere_cone_parameters, prototype_light_path)
 
 try:
     from pxr import Usd, Sdf, UsdGeom, UsdShade, Vt, UsdLux, Gf
@@ -22,6 +27,22 @@ try:
 except ImportError:
     USD_AVAILABLE = False
     Usd = Sdf = UsdGeom = UsdShade = Vt = UsdLux = Gf = None
+
+
+def _hash_tokens(text) -> Set[str]:
+    """16-character capture-hash tokens in *text* (RTX Remix game asset namespace).
+
+    Replacements, capture instances and asset files share this hash format
+    (``mesh_<16 HEX>``, ``inst_<16 HEX>[_N]``). Toolkit-authored names such as
+    ``ref_<32 lowercase hex>`` or ``mat_<32 lowercase hex>`` are a different
+    namespace and must not match.
+    """
+    if not text:
+        return set()
+    return {
+        token for token in re.findall(r'[A-F0-9]{16}', str(text))
+        if any(char.isdigit() for char in token)
+    }
 
 
 class ModFileLoader:
@@ -47,6 +68,30 @@ class ModFileLoader:
         self.blender_object_map: Dict[str, bpy.types.Object] = {}
         self.material_cache: Dict[str, bpy.types.Material] = {}
         self.base_material_node_cache: Dict[str, any] = {}
+
+        # Mod-relative linking state for one Apply run.
+        self.mod_collection: Optional[bpy.types.Collection] = None
+        self._routed_container_paths: Set[str] = set()
+        self._replaced_prototype_hashes: Set[str] = set()
+        # ``mesh_<HASH>``-paths the mod authored content on (defs or authored
+        # ``references`` opinions). Set in ``_get_changed_prims``.
+        self._mod_authored_prototype_paths: Set[str] = set()
+        self.scene_related_materials: Set[str] = set()
+        # Prim paths the material-binding scan pulled into the change set
+        # only because a bound material changed. Their processing is
+        # material-only: applying transforms there once collapsed bound
+        # placements to (0, 0, 0).
+        self._material_scan_prim_paths: Set[str] = set()
+        # Prototype lights are authored once but must be displayed for every
+        # captured inst_<HASH> placement. Keep this state local to an Apply run.
+        self._routed_light_instances: Set[Tuple[str, str]] = set()
+        self._light_stage = None
+        self._light_stage_root = None  # Keep anonymous composition layer alive.
+        self._light_xform_cache = None
+        self._capture_light_stage = None
+        # The same composed prototype Mesh is one Blender datablock even when
+        # the mod adds several placements for it.
+        self._new_placement_mesh_data = {}
         
         # Statistics
         self.stats = {
@@ -81,7 +126,13 @@ class ModFileLoader:
         
         # Store for later use
         self.mod_file_path = mod_file_path
-        
+        self._light_stage = None
+        self._light_stage_root = None
+        self._light_xform_cache = None
+        self._capture_light_stage = None
+        self._routed_light_instances = set()
+        self._new_placement_mesh_data = {}
+
         try:
             # Step 1: Open the mod file stage (USD loads all sublayers automatically)
             self.report({'INFO'}, f"Opening mod file: {os.path.basename(mod_file_path)}")
@@ -114,8 +165,9 @@ class ModFileLoader:
             changed_prims, changed_materials = self._get_changed_prims(authored_layers)
             self.report({'INFO'}, f"Found {len(changed_prims)} prim(s) with changes")
             
-            # Step 7: Pre-load texture data in parallel
-            texture_paths = self._collect_texture_paths(changed_materials)
+            # Step 7: Pre-load texture data for materials the scene actually
+            # uses (library materials of other areas are not warmed).
+            texture_paths = self._collect_texture_paths(self.scene_related_materials)
             if texture_paths:
                 self.report({'INFO'}, f"Pre-loading {len(texture_paths)} unique textures...")
                 self._preload_textures_parallel(texture_paths)
@@ -123,7 +175,7 @@ class ModFileLoader:
             self._disable_viewport_updates()
             
             try:
-                for prim_path in changed_prims:
+                for prim_path in sorted(changed_prims):
                     prim = self.stage.GetPrimAtPath(prim_path)
                     if prim and prim.IsValid():
                         self._process_prim(prim)
@@ -270,22 +322,59 @@ class ModFileLoader:
         elapsed = time.time() - start_time
         self.report({'INFO'}, f"Pre-loaded {len(loaded_images)}/{len(texture_paths)} textures in {elapsed:.2f}s")
     
+    def _capture_layers(self) -> list:
+        """Stack layers that only define captured game content.
+
+        The Toolkit records ``lightspeed_layer_type`` in ``customLayerData``:
+        captures are the pre-mod state, never the mod's changes.
+        """
+        excluded = (
+            constants.LAYER_TYPE_CAPTURE,
+            constants.LAYER_TYPE_CAPTURE_BAKER,
+            'data',
+        )
+        return [
+            layer for layer in self.stage.GetLayerStack(includeSessionLayers=False)
+            if layer.customLayerData.get(constants.LAYER_TYPE_KEY) in excluded
+        ]
+
     def _get_layers_with_changes(self) -> list:
+        """Get all edit layers in the mod file that have authored changes.
+
+        Captured content is excluded: scanning it re-applied every recorded
+        asset and material, and unmatched capture prims spilled into scene
+        creation (whole-capture reloads). Asset ``data`` layers define
+        prototypes that replacements reference, not scene placements.
         """
-        Get all layers in the mod file that have authored changes.
-        
-        USD's layer stack is automatically composed, we just need to get
-        the layers that actually have content (not just references).
-        """
+        capture = set(map(id, self._capture_layers()))
         layers = []
-        layer_stack = self.stage.GetLayerStack()
-        
-        for layer in layer_stack:
-            # Check if this layer has any prims (not just references)
-            if layer.rootPrims:
-                layers.append(layer)
-        
+        for layer in self.stage.GetLayerStack(includeSessionLayers=False):
+            if not layer.rootPrims:
+                continue
+            if id(layer) in capture:
+                continue
+            layers.append(layer)
         return layers
+
+    def _defined_prim_paths(self, layers) -> Set[str]:
+        """Absolute prim paths that *layers* define (``def`` specs).
+
+        Only definitions count as content a layer creates. ``over`` specs are
+        overrides on content defined elsewhere (the capture, or an asset file
+        pulled in by a reference) and are covered by the changed-prims scan.
+        """
+        defined_paths = set()
+
+        def visit(prim_spec):
+            if prim_spec.specifier == Sdf.SpecifierDef:
+                defined_paths.add(str(prim_spec.path))
+            for child_spec in prim_spec.nameChildren:
+                visit(child_spec)
+
+        for layer in layers:
+            for root_spec in layer.pseudoRoot.nameChildren:
+                visit(root_spec)
+        return defined_paths
     
     def _get_changed_prims(self, layers: list) -> Tuple[Set[str], Set[str]]:
         """
@@ -299,50 +388,73 @@ class ModFileLoader:
         """
         changed_prims = set()
         changed_materials = set()  # Track materials that have changes
-        
+
+        capture_layers = self._capture_layers()
+        capture_defined = self._defined_prim_paths(capture_layers)
+        related_hashes = set()
+        for layer in capture_layers:
+            related_hashes |= _hash_tokens(layer.identifier)
+            for prim_path in self._defined_prim_paths([layer]):
+                related_hashes |= _hash_tokens(prim_path)
+        related_hashes |= self._scene_relation_hashes()
+        self._routed_container_paths = set()
+        self._replaced_prototype_hashes = set()
+        self.scene_related_materials = set()
+        self._material_scan_prim_paths = set()
+        self._routed_light_instances = set()
+
         def traverse_layer_prims(layer: Sdf.Layer, current_path: str = '/'):
             """Recursively traverse prim specs in a layer."""
             prim_spec = layer.GetPrimAtPath(current_path)
             if not prim_spec:
                 return
             
-            # Check if this prim has any authored attributes/relationships
+            # Check if this prim has any authored attributes/relationships.
+            # Attribute edits on prims that no scene object or capture
+            # def knows about are library edits (other areas of the mod) and
+            # stay out of the change set; children keep being traversed
+            # because parent paths never carry a child's hash.
             if prim_spec.attributes or prim_spec.relationships:
-                changed_prims.add(current_path)
-                
-                # Check if this is a material or shader change
-                # Note: In override-only files (using 'over'), type info may be missing
-                # so we use both type checking AND path heuristics
-                prim = self.stage.GetPrimAtPath(current_path)
-                if prim.IsValid():
-                    prim_type = prim.GetTypeName()
-                    is_material = prim.IsA(UsdShade.Material)
-                    is_shader = prim.IsA(UsdShade.Shader)
-                    
-                    # Heuristic: paths like /RootNode/Looks/mat_XXX are materials
-                    # paths like /RootNode/Looks/mat_XXX/Shader are shaders
-                    path_looks_like_material = '/Looks/' in current_path and current_path.count('/') == 3
-                    path_looks_like_shader = '/Looks/' in current_path and current_path.endswith('/Shader')
-                    
-                    self.report({'INFO'}, f"Changed prim: {current_path} (type: {prim_type}, is_material: {is_material or path_looks_like_material}, is_shader: {is_shader or path_looks_like_shader})")
-                    
-                    if is_material or path_looks_like_material:
-                        changed_materials.add(current_path)
-                        self.report({'INFO'}, f"  → Added material: {current_path}")
-                    elif is_shader or path_looks_like_shader:
-                        # If a shader changed, mark its parent material
-                        parent_prim = prim.GetParent()
-                        parent_path = str(parent_prim.GetPath()) if parent_prim else None
-                        
-                        # Also use path heuristic for parent
-                        if parent_path and ('/Looks/' in parent_path):
-                            changed_materials.add(parent_path)
-                            self.report({'INFO'}, f"  → Added parent material: {parent_path}")
-                        elif parent_prim and parent_prim.IsA(UsdShade.Material):
-                            changed_materials.add(parent_path)
-                            self.report({'INFO'}, f"  → Added parent material: {parent_path}")
-                        else:
-                            self.report({'INFO'}, f"  → Could not identify parent material for shader: {current_path}")
+                # Look scopes hold the mod's own material records: their
+                # relation runs through scene bindings, not mesh hashes, so
+                # they bypass the hash gate below (the pairing scans after
+                # traversal bind Look changes to scene objects).
+                if '/Looks/' in current_path or _hash_tokens(current_path) & related_hashes:
+                    changed_prims.add(current_path)
+
+                    # Check if this is a material or shader change
+                    # Note: In override-only files (using 'over'), type info may be missing
+                    # so we use both type checking AND path heuristics
+                    prim = self.stage.GetPrimAtPath(current_path)
+                    if prim.IsValid():
+                        prim_type = prim.GetTypeName()
+                        is_material = prim.IsA(UsdShade.Material)
+                        is_shader = prim.IsA(UsdShade.Shader)
+
+                        # Heuristic: paths like /RootNode/Looks/mat_XXX are materials
+                        # paths like /RootNode/Looks/mat_XXX/Shader are shaders
+                        path_looks_like_material = '/Looks/' in current_path and current_path.count('/') == 3
+                        path_looks_like_shader = '/Looks/' in current_path and current_path.endswith('/Shader')
+
+                        self.report({'INFO'}, f"Changed prim: {current_path} (type: {prim_type}, is_material: {is_material or path_looks_like_material}, is_shader: {is_shader or path_looks_like_shader})")
+
+                        if is_material or path_looks_like_material:
+                            changed_materials.add(current_path)
+                            self.report({'INFO'}, f"  → Added material: {current_path}")
+                        elif is_shader or path_looks_like_shader:
+                            # If a shader changed, mark its parent material
+                            parent_prim = prim.GetParent()
+                            parent_path = str(parent_prim.GetPath()) if parent_prim else None
+
+                            # Also use path heuristic for parent
+                            if parent_path and ('/Looks/' in parent_path):
+                                changed_materials.add(parent_path)
+                                self.report({'INFO'}, f"  → Added parent material: {parent_path}")
+                            elif parent_prim and parent_prim.IsA(UsdShade.Material):
+                                changed_materials.add(parent_path)
+                                self.report({'INFO'}, f"  → Added parent material: {parent_path}")
+                            else:
+                                self.report({'INFO'}, f"  → Could not identify parent material for shader: {current_path}")
             
             # Recursively traverse children
             for child_spec in prim_spec.nameChildren:
@@ -370,7 +482,22 @@ class ModFileLoader:
                     if binding_api.GetDirectBindingRel().GetTargets():
                         material_path = str(binding_api.GetDirectBindingRel().GetTargets()[0])
                         if material_path in changed_materials:
-                            changed_prims.add(str(prim.GetPath()))
+                            prim_path = str(prim.GetPath())
+                            # Only stage prims that belong to the current scene
+                            # or capture count: library prototypes for other
+                            # areas must never enter scene creation, and prims
+                            # defined by the capture itself are candidates for
+                            # creation only when the scene already tracks them.
+                            if not (_hash_tokens(prim_path) & related_hashes):
+                                continue
+                            if prim_path in capture_defined and prim_path not in self.blender_object_map:
+                                continue
+                            if prim_path not in changed_prims:
+                                changed_prims.add(prim_path)
+                                # Scan-sourced: material-only processing
+                                # must not re-apply the composed transform.
+                                self._material_scan_prim_paths.add(prim_path)
+                            self.scene_related_materials.add(material_path)
                             meshes_with_changed_materials += 1
             
             # Also check existing Blender objects - match by material name
@@ -391,8 +518,13 @@ class ModFileLoader:
                                 # Check if Blender material name contains the USD material name
                                 if mat_base_name in mat_slot.name or changed_mat_path in mat_slot.get('usd_material_path', ''):
                                     self.report({'INFO'}, f"Object {bl_obj.name} uses changed material {changed_mat_path} (Blender mat: {mat_slot.name})")
+                                    self.scene_related_materials.add(changed_mat_path)
                                     if prim_path not in changed_prims:
                                         changed_prims.add(prim_path)
+                                        # Scan-sourced: material-only
+                                        # processing must not re-apply the
+                                        # composed transform.
+                                        self._material_scan_prim_paths.add(prim_path)
                                         meshes_with_changed_materials += 1
                                     break
             
@@ -408,6 +540,7 @@ class ModFileLoader:
                                 mat_base_name = changed_mat_path.split('/')[-1]
                                 if mat_base_name in mat_slot.name or changed_mat_path in mat_slot.get('usd_material_path', ''):
                                     self.report({'INFO'}, f"Object {bl_obj.name} uses changed material {changed_mat_path} (Blender mat: {mat_slot.name}) [no USD path]")
+                                    self.scene_related_materials.add(changed_mat_path)
                                     # Create a synthetic prim path for this object
                                     synthetic_path = f"/Unmapped/{bl_obj.name}"
                                     if synthetic_path not in changed_prims:
@@ -419,26 +552,64 @@ class ModFileLoader:
             
             self.report({'INFO'}, f"Found {meshes_with_changed_materials} mesh(es) using changed materials")
         
-        # Also get prims from the composed stage that might be new
-        for prim in self.stage.TraverseAll():
-            # If prim is defined (not abstract) and imageable, it could be new content
-            if prim.IsDefined() and prim.IsA(UsdGeom.Imageable):
-                prim_path = str(prim.GetPath())
-                # Only add if it's not already in our Blender scene
-                if prim_path not in self.blender_object_map:
-                    changed_prims.add(prim_path)
-        
+        # Content the mod ADDS, limited to the current scene and capture:
+        # prim paths defined or reference-reset in the edit layers whose own
+        # path (or a parent path for nested lights/overrides) carries a hash
+        # the scene objects or capture layers know about. Library prototypes
+        # for other game areas stay out of the set entirely, replacing the
+        # previous behavior that appended every defined stage prim.
+        layers_defined, reference_authored = self._layer_spec_paths(layers)
+        # Prototype containers whose content the mod defines itself (def specs
+        # or authored ``references`` opinions) vs over-only attribute edits on
+        # capture-owned records: only the former may swap scene geometry.
+        self._mod_authored_prototype_paths = layers_defined | reference_authored
+        for prim_path in layers_defined | reference_authored:
+            if prim_path in capture_defined and prim_path not in reference_authored:
+                continue  # pure def on captured content: handled by the scans above
+            if prim_path in self.blender_object_map:
+                continue
+            if not (_hash_tokens(prim_path) & related_hashes):
+                continue  # unrelated to this scene and capture
+            changed_prims.add(prim_path)
+
         return changed_prims, changed_materials
     
     def _process_prim(self, prim: Usd.Prim):
         """Process a single prim - update existing object or create new one."""
         prim_path = str(prim.GetPath())
         self.stats['prims_processed'] += 1
-        
+
+        # Toolkit replacement records live on ``mesh_<HASH>`` container paths
+        # and the object map shares scene objects with them through the
+        # ``usd_prim_path`` tag (the capture's prototype path), so a plain map
+        # lookup would run the update path with the container's own L2W and
+        # zero the placement transforms. Route the record instead.
+        leaf = prim_path.rsplit('/', 1)[-1]
+        if self._is_usd_light_prim(prim):
+            prototype = self._light_prototype_container(prim)
+            if prototype is not None:
+                self._sync_prototype_light(prim, prototype)
+                return
+        if re.fullmatch(constants.REGEX_MESH_PATH, leaf):
+            if prim_path in self._mod_authored_prototype_paths:
+                self._route_mesh_prototype_addition(prim)
+            else:
+                # ``over`` edits (prototype flags, rebinding deep inside the
+                # prototype reference) never own scene transforms, but their
+                # material edits still reach the objects of the same hash.
+                self._apply_material_to_hash_objects(prim)
+            return
+
         # Check if we have an existing Blender object for this prim
         bl_object = self.blender_object_map.get(prim_path)
-        
-        if bl_object:
+
+        if bl_object and prim_path in self._material_scan_prim_paths:
+            # The material-binding scan pulled this path in solely because a
+            # bound Look changed - no transform is authored here (the path may
+            # not even belong to a prim of the mod stage). Applying transforms
+            # for it once collapsed bound placements to (0, 0, 0).
+            self._update_material_only(prim_path, bl_object, self.scene_related_materials)
+        elif bl_object:
             # Update existing object
             self._update_existing_object(prim, bl_object)
         else:
@@ -518,50 +689,944 @@ class ModFileLoader:
             self.stats['materials_applied'] += 1
             self.report({'INFO'}, f"  Applied updated material {material_path} to {bl_object.name}")
     
-    def _create_new_object(self, prim: Usd.Prim):
-        """Create a new Blender object from USD prim."""
-        if not prim.IsA(UsdGeom.Imageable):
-            return None
-        
-        new_obj = None
-        prim_path = str(prim.GetPath())
-        
-        # Create mesh
-        if prim.IsA(UsdGeom.Mesh):
-            new_obj = self._create_mesh_object(prim)
-        
-        # Create light
-        elif self._is_usd_light_prim(prim):
-            new_obj = self._create_light_object(prim)
-        
-        if new_obj:
-            self.stats['objects_created'] += 1
-            
-            # Link to scene (defer depsgraph update)
+    # --- Applied-mod routing helpers ---
+
+    def _layer_spec_paths(self, layers: list) -> Tuple[Set[str], Set[str]]:
+        """Paths the edit layers define (``def`` specs) or author references on.
+
+        Reference authoring includes ``references = None`` resets: those are
+        still opinions the mod owns, and a reset with no new content means
+        "this prototype is gone" rather than "nothing was edited".
+        """
+        defined_paths: Set[str] = set()
+        reference_paths: Set[str] = set()
+
+        def visit(prim_spec):
+            if prim_spec.specifier == Sdf.SpecifierDef:
+                defined_paths.add(str(prim_spec.path))
+            if self._prim_spec_authors_references(prim_spec):
+                reference_paths.add(str(prim_spec.path))
+            for child_spec in prim_spec.nameChildren:
+                visit(child_spec)
+
+        for layer in layers:
+            for root_spec in layer.pseudoRoot.nameChildren:
+                visit(root_spec)
+        return defined_paths, reference_paths
+
+    @staticmethod
+    def _prim_spec_authors_references(prim_spec) -> bool:
+        """Whether a prim spec carries its own ``references`` field opinion.
+
+        Covers the ``references = None`` reset (an explicit empty list op) and
+        asset links; the Sdf prim-spec Python bindings differ between USD
+        builds, so detection falls back across ``hasReferences``, ``HasField``
+        and the layer's raw field.
+        """
+        try:
+            return bool(prim_spec.hasReferences)
+        except AttributeError:
+            pass
+        try:
+            if prim_spec.HasField("references"):
+                return True
+        except AttributeError:
+            pass
+        try:
+            field = prim_spec.GetField("references")
+        except Exception:
+            return False
+        return field is not None
+
+    def _scene_relation_hashes(self) -> Set[str]:
+        """Capture-hash tokens the current scene's objects belong to.
+
+        Reads the provenance tags written by the capture import (instance,
+        prototype, light and mesh-hash tags, on objects and their data), so
+        "related to this scene" follows what is actually present, not
+        whatever the mod file also happens to contain.
+        """
+        props = (
+            constants.PROP_USD_INSTANCE_PATH,
+            constants.PROP_USD_PRIM_PATH,
+            constants.PROP_USD_PROTOTYPE_PATH,
+            'usd_light_path',
+            constants.PROP_REMIX_MESH_HASH,
+        )
+        hashes: Set[str] = set()
+        for obj in bpy.data.objects:
+            for holder in filter(None, (obj, getattr(obj, 'data', None))):
+                for prop in props:
+                    tokens = _hash_tokens(str(holder.get(prop, '')))
+                    if tokens:
+                        hashes |= tokens
+        return hashes
+
+    def _scene_objects_for_hashes(self, hash_tokens: Set[str]) -> List[bpy.types.Object]:
+        """Scene objects whose provenance tags carry any of *hash_tokens*.
+
+        Mirrors ``_scene_relation_hashes`` so routing and relation checks stay
+        consistent.
+        """
+        if not hash_tokens:
+            return []
+        props = (
+            constants.PROP_USD_INSTANCE_PATH,
+            constants.PROP_USD_PRIM_PATH,
+            constants.PROP_USD_PROTOTYPE_PATH,
+            'usd_light_path',
+            constants.PROP_REMIX_MESH_HASH,
+        )
+        targets: List[bpy.types.Object] = []
+        seen = set()
+        for obj in bpy.data.objects:
+            if obj.name in seen:
+                continue
+            for holder in filter(None, (obj, getattr(obj, 'data', None))):
+                for prop in props:
+                    if _hash_tokens(str(holder.get(prop, ''))) & hash_tokens:
+                        targets.append(obj)
+                        seen.add(obj.name)
+                        break
+                if obj.name in seen:
+                    break
+        return targets
+
+    def _mod_collection_label(self) -> str:
+        """Label for the created-content collection: ``mod <name>``."""
+        name = None
+        for layer in self.stage.GetLayerStack(False):
+            custom = layer.customLayerData or {}
+            name = custom.get('lightspeed_mod_name')
+            if name:
+                break
+        if not name:
+            identifier = self.stage.GetRootLayer().realPath or self.stage.GetRootLayer().identifier
+            stem = os.path.basename(identifier)
+            if not stem or ':' in stem:
+                # Anonymous layer identifiers have no path separator
+                # ('anon:0x...:mod_modtest.usda'); strip to the file stem.
+                stem = stem.rsplit(':', 1)[-1]
+            name = os.path.splitext(stem)[0] or 'mod'
+        return 'mod ' + bpy.path.clean_name(name or 'mod')
+
+    def _ensure_mod_collection(self) -> Optional[bpy.types.Collection]:
+        """Reuse (or create) the collection that holds operator-created content.
+
+        Created placements and lights must not mix into capture-import
+        collections, so they are linked into a dedicated ``mod <name>``
+        collection as a direct child of the scene collection.
+        """
+        if self.mod_collection:
+            return self.mod_collection
+        label = self._mod_collection_label()
+        collection = bpy.data.collections.get(label)
+        if collection is None:
+            collection = bpy.data.collections.new(label)
+        scene_collection = getattr(self.context.scene, 'collection', None)
+        if scene_collection is not None and collection.name not in scene_collection.children:
             try:
-                # Use link without update for batch operations
-                self.context.collection.objects.link(new_obj)
+                scene_collection.children.link(collection)
+            except RuntimeError:
+                pass  # already linked somewhere in the scene tree
+        self.mod_collection = collection
+        return collection
+
+    def _target_collection(self) -> bpy.types.Collection:
+        """Collection for created objects: the mod collection, with fallback."""
+        collection = self._ensure_mod_collection()
+        if collection is None:
+            collection = self.context.collection
+        return collection
+
+    # -- Prototype light placement (capture instances, not prototype origin) --
+
+    @staticmethod
+    def _light_prototype_container(prim: Usd.Prim):
+        """Nearest mesh_<HASH> ancestor of a mod light, if present."""
+        parent = prim.GetParent()
+        while parent and str(parent.GetPath()) != '/':
+            path = str(parent.GetPath())
+            if path.startswith(constants.ROOTNODE_MESHES + '/') and re.fullmatch(
+                constants.REGEX_MESH_PATH, path.rsplit('/', 1)[-1]
+            ):
+                return parent
+            parent = parent.GetParent()
+        return None
+
+    def _get_light_stage(self):
+        """Read-only composed stage for lights; never write to the capture/mod.
+
+        Apply Mod historically opens mod.usda by itself. If the active capture
+        was not listed as its sublayer, mapped inst_<HASH> light paths do not
+        exist. Build an anonymous [mod, capture] composition solely for light
+        placement, while keeping self.stage and the edit-layer scan unchanged.
+        """
+        if self._light_stage is not None:
+            return self._light_stage
+        self._light_stage = self.stage
+        self._light_xform_cache = self.xform_cache or UsdGeom.XformCache(self.time_code)
+        scene = self.context.scene
+        capture_path = bpy.path.abspath(scene.get(constants.PROP_SOURCE_CAPTURE, ''))
+        mod_path = getattr(self, 'mod_file_path', '') or (self.stage.GetRootLayer().realPath or '')
+        if not capture_path or not os.path.isfile(capture_path) or not os.path.isfile(mod_path):
+            return self._light_stage
+        if os.path.normcase(os.path.abspath(capture_path)) == os.path.normcase(os.path.abspath(mod_path)):
+            return self._light_stage
+        if self._capture_layers():
+            return self._light_stage  # Already a complete [mod, capture] project.
+        try:
+            root = Sdf.Layer.CreateAnonymous('remix_blender_light_composition.usda')
+            root.subLayerPaths = [
+                os.path.abspath(mod_path).replace('\\', '/'),
+                os.path.abspath(capture_path).replace('\\', '/'),
+            ]
+            composed = Usd.Stage.Open(root.identifier, Usd.Stage.LoadAll)
+            if composed is not None:
+                self._light_stage_root = root
+                self._light_stage = composed
+                self._light_xform_cache = UsdGeom.XformCache(self.time_code)
+        except Exception as exc:
+            self.report({'WARNING'}, f'Cannot compose capture for light placements: {exc}')
+        return self._light_stage
+
+    def _get_capture_light_stage(self):
+        """Optional original-capture stage for nested mesh anchor correction."""
+        if self._capture_light_stage is not None:
+            return self._capture_light_stage
+        path = bpy.path.abspath(self.context.scene.get(constants.PROP_SOURCE_CAPTURE, ''))
+        if not path or not os.path.isfile(path):
+            return None
+        try:
+            self._capture_light_stage = Usd.Stage.Open(path, Usd.Stage.LoadAll)
+        except Exception:
+            return None
+        return self._capture_light_stage
+
+    @staticmethod
+    def _mapped_anchor_path(anchor, prototype_path: str, instance_path: str) -> str:
+        """Locate the USD mesh prim whose world matrix the Blender anchor uses."""
+        mesh_path = str(anchor.get(constants.PROP_USD_PRIM_PATH, ''))
+        if mesh_path.startswith(prototype_path + '/'):
+            return instance_path + mesh_path[len(prototype_path):]
+        if mesh_path.startswith(instance_path + '/'):
+            return mesh_path
+        return instance_path
+
+    def _instance_anchor_objects(self, prototype_path: str) -> dict:
+        """One scene MESH object per captured instance of this prototype."""
+        mesh_hash = next(iter(_hash_tokens(prototype_path.rsplit('/', 1)[-1])), None)
+        if not mesh_hash:
+            return {}
+        anchors = {}
+        for obj in self.context.scene.objects:
+            if obj.type != 'MESH':
+                continue
+            instance_path = str(obj.get(constants.PROP_USD_INSTANCE_PATH, ''))
+            leaf = instance_path.rsplit('/', 1)[-1]
+            if not instance_path.startswith(constants.ROOTNODE_INSTANCES + '/'):
+                continue
+            if not re.fullmatch(constants.REGEX_INSTANCE_PATH, leaf):
+                continue
+            if mesh_hash not in _hash_tokens(leaf):
+                continue
+            provenance = str(obj.get(constants.PROP_USD_PROTOTYPE_PATH, '') or
+                             obj.get(constants.PROP_USD_PRIM_PATH, ''))
+            if provenance and _hash_tokens(provenance) and mesh_hash not in _hash_tokens(provenance):
+                continue
+            # Multi-part meshes share one placement; light is not duplicated
+            # for each part. Prefer a direct instance-root anchor if present.
+            previous = anchors.get(instance_path)
+            if previous is None or self._mapped_anchor_path(
+                obj, prototype_path, instance_path
+            ) == instance_path:
+                anchors[instance_path] = obj
+        return anchors
+
+    def _prototype_light_relative_matrix(self, light_prim, prototype_prim, instance_path, anchor):
+        """Light matrix relative to the Blender object's actual USD mesh path.
+
+        Matrices below are USD-local column matrices (Gf is transposed). The
+        anchor's matrix_world already includes capture metresPerUnit and Y-up
+        conversion, so multiplying the unscaled USD-relative transform avoids
+        applying either conversion twice. Nested Xforms and rotations survive.
+        """
+        prototype_path = str(prototype_prim.GetPath())
+        source_path = str(light_prim.GetPath())
+        stage = self._get_light_stage()
+        cache = self._light_xform_cache
+        mapped_light_path = instance_path + source_path[len(prototype_path):]
+        mapped_light = stage.GetPrimAtPath(mapped_light_path)
+        mapped_anchor = stage.GetPrimAtPath(
+            self._mapped_anchor_path(anchor, prototype_path, instance_path)
+        )
+        if mapped_light and mapped_light.IsValid() and mapped_anchor and mapped_anchor.IsValid():
+            anchor_world = self._gf_matrix_to_mathutils(cache.GetLocalToWorldTransform(mapped_anchor))
+            light_world = self._gf_matrix_to_mathutils(cache.GetLocalToWorldTransform(mapped_light))
+            return anchor_world.inverted_safe() @ light_world
+
+        source_cache = self.xform_cache or UsdGeom.XformCache(self.time_code)
+        proto_world = self._gf_matrix_to_mathutils(source_cache.GetLocalToWorldTransform(prototype_prim))
+        light_world = self._gf_matrix_to_mathutils(source_cache.GetLocalToWorldTransform(light_prim))
+        proto_to_light = proto_world.inverted_safe() @ light_world
+
+        # A capture mesh can be nested below mesh_<HASH>; its Blender object
+        # has that mesh's (not the instance root's) matrix_world. Recover the
+        # original mesh offset before attaching a new prototype light.
+        capture_stage = self._get_capture_light_stage()
+        if capture_stage is not None:
+            original_instance = capture_stage.GetPrimAtPath(instance_path)
+            original_anchor = capture_stage.GetPrimAtPath(
+                self._mapped_anchor_path(anchor, prototype_path, instance_path)
+            )
+            if (original_instance and original_instance.IsValid() and
+                    original_anchor and original_anchor.IsValid()):
+                capture_cache = UsdGeom.XformCache(self.time_code)
+                root_world = self._gf_matrix_to_mathutils(
+                    capture_cache.GetLocalToWorldTransform(original_instance)
+                )
+                anchor_world = self._gf_matrix_to_mathutils(
+                    capture_cache.GetLocalToWorldTransform(original_anchor)
+                )
+                return anchor_world.inverted_safe() @ root_world @ proto_to_light
+        return proto_to_light
+
+    @staticmethod
+    def _light_data_identity(data):
+        return data.as_pointer() if hasattr(data, 'as_pointer') else id(data)
+
+    @staticmethod
+    def _desired_blender_light_type(prim):
+        usd_type = str(prim.GetTypeName())
+        if usd_type == 'SphereLight':
+            is_spot, _, _ = sphere_cone_parameters(prim)
+            return 'SPOT' if is_spot else 'POINT'
+        if usd_type in {'RectLight', 'DiskLight', 'CylinderLight', 'PortalLight'}:
+            return 'AREA'
+        if usd_type in {'DistantLight', 'DomeLight'}:
+            return 'SUN'
+        if usd_type == 'SpotLight':
+            return 'SPOT'
+        return 'POINT'
+
+    def _sync_prototype_light(self, light_prim, prototype_prim) -> None:
+        """Each scene instance gets a separate Object but shared Light datablock.
+
+        The group is (source prototype light, *composed light parameters*), not
+        the USD instance path. An instance-authored color, intensity, radius or
+        cone override splits its group, leaving its datablock independent.
+        Existing objects from an older import are relinked on the next Apply.
+        """
+        source_path = str(light_prim.GetPath())
+        prototype_path = str(prototype_prim.GetPath())
+        anchors = self._instance_anchor_objects(prototype_path)
+        if not anchors:
+            self.report({'WARNING'}, f'No capture instance for prototype light {source_path}; skipping')
+            return
+        existing = {
+            (obj.get('usd_light_path'), obj.get('usd_light_instance_path')): obj
+            for obj in self.context.scene.objects
+            if obj.type == 'LIGHT' and obj.get('usd_light_instance_path')
+        }
+        canonical_by_signature = {}
+        claimed_data = set()
+        created_any = False
+        for instance_path, anchor in sorted(anchors.items()):
+            key = (source_path, instance_path)
+            if key in self._routed_light_instances:
+                continue
+            bl_light = existing.get(key)
+            newly_created = False
+            previous_data = None
+            provisional = None
+            try:
+                relative = self._prototype_light_relative_matrix(
+                    light_prim, prototype_prim, instance_path, anchor
+                )
+                mapped_path = instance_path + source_path[len(prototype_path):]
+                mapped_light = self._get_light_stage().GetPrimAtPath(mapped_path)
+                applied_light = (mapped_light if mapped_light and mapped_light.IsValid()
+                                 else light_prim)
+                signature = light_parameter_signature(applied_light, self.time_code)
+                group = (source_path, signature)
+                canonical = canonical_by_signature.get(group)
+                if canonical is None:
+                    desired_type = self._desired_blender_light_type(applied_light)
+                    if (bl_light is not None and bl_light.data.type == desired_type
+                            and self._light_data_identity(bl_light.data) not in claimed_data):
+                        canonical = bl_light.data
+                        self._apply_light_properties(applied_light, bl_light)
+                    else:
+                        provisional = self._create_light_object(applied_light)
+                        if provisional is None:
+                            continue
+                        canonical = provisional.data
+                    claimed_data.add(self._light_data_identity(canonical))
+                if bl_light is None:
+                    if provisional is not None:
+                        bl_light = provisional
+                        provisional = None
+                    else:
+                        # Share the Light ID; do not copy it or create a new ID.
+                        name = bpy.path.clean_name(applied_light.GetName()) + '_mod_light'
+                        bl_light = bpy.data.objects.new(name=name, object_data=canonical)
+                    newly_created = True
+                    self._target_collection().objects.link(bl_light)
+                    self.stats['objects_created'] += 1
+                    created_any = True
+                elif bl_light.data != canonical:
+                    previous_data = bl_light.data
+                    bl_light.data = canonical
+
+                bl_light['usd_light_path'] = source_path
+                bl_light['usd_light_instance_path'] = instance_path
+                bl_light[constants.PROP_USD_PROTOTYPE_PATH] = prototype_path
+                bl_light['usd_light_source_path'] = source_path
+                bl_light.parent = anchor
+                bl_light.matrix_parent_inverse = mathutils.Matrix.Identity(4)
+                bl_light.matrix_world = anchor.matrix_world @ relative
+                self._apply_visibility(applied_light, bl_light)
+                canonical_by_signature[group] = canonical
+                self._routed_light_instances.add(key)
+                if previous_data is not None and previous_data.users == 0:
+                    bpy.data.lights.remove(previous_data)
+                if provisional is not None:
+                    # A type change on an existing object built a temporary
+                    # object to obtain correctly typed Light data.
+                    bpy.data.objects.remove(provisional, do_unlink=True)
+                    provisional = None
+            except Exception as exc:
+                if provisional is not None:
+                    provisional_data = provisional.data
+                    bpy.data.objects.remove(provisional, do_unlink=True)
+                    if provisional_data.users == 0:
+                        bpy.data.lights.remove(provisional_data)
+                if newly_created and bl_light is not None:
+                    data = bl_light.data
+                    bpy.data.objects.remove(bl_light, do_unlink=True)
+                    if data and data.users == 0:
+                        bpy.data.lights.remove(data)
+                    self.stats['objects_created'] -= 1
+                elif previous_data is not None and bl_light is not None:
+                    bl_light.data = previous_data
+                self.report({'WARNING'}, f'Failed to place light {source_path} on {instance_path}: {exc}')
+
+        if created_any:
+            # Remove only obsolete, mod-created single lights from the old
+            # implementation; never touch capture-owned or unrelated lights.
+            mod_label = self._mod_collection_label()
+            for obj in tuple(self.context.scene.objects):
+                if (obj.type == 'LIGHT' and obj.get('usd_light_path') == source_path
+                        and not obj.get('usd_light_instance_path')
+                        and obj.get(constants.PROP_USD_INSTANCE_PATH) == source_path
+                        and any(col.name == mod_label for col in obj.users_collection)):
+                    data = obj.data
+                    bpy.data.objects.remove(obj, do_unlink=True)
+                    if data and data.users == 0:
+                        bpy.data.lights.remove(data)
+
+    def _composed_matrix_is_identity(self, prim: Usd.Prim) -> bool:
+        """Whether the prim's composed local-to-world matrix is the identity."""
+        try:
+            matrix = self.xform_cache.GetLocalToWorldTransform(prim)
+        except Exception:
+            return False
+        for row in range(4):
+            for col in range(4):
+                expected = 1.0 if row == col else 0.0
+                if abs(matrix[row][col] - expected) > 1e-6:
+                    return False
+        return True
+
+    def _create_new_object(self, prim: Usd.Prim) -> None:
+        """Route prims the mod adds following the official Toolkit mod model.
+
+        Replacements hold their content on ``mesh_<HASH>`` prototype records
+        (a ``references = None`` reset plus ``ref_*`` asset children), while
+        placements stay on ``inst_<HASH>[_<N>]`` prims owned by the capture.
+        Changed prims route accordingly: a ``mesh_<HASH>`` record swaps its
+        content into the scene objects of that hash, an ``inst_`` placement is
+        materialized as new objects (except a canonical redefinition of the
+        prototype anchor, which also replaces in place), typed lights are
+        always their own scene-wide object even under prototype containers,
+        and deeper children are covered by their nearest ``inst_``/``mesh_``
+        container once.
+        """
+        prim_path = str(prim.GetPath())
+
+        if self._is_usd_light_prim(prim):
+            # Prototype-owned lights are handled before this branch by
+            # _process_prim; direct /RootNode/lights sources remain scene lights.
+            if prim_path in self._routed_container_paths:
+                return
+            self._routed_container_paths.add(prim_path)
+            new_obj = self._create_light_object(prim)
+            if new_obj:
+                self._register_created_object(new_obj, prim, prim_path)
+            return
+
+        leaf = prim_path.rsplit('/', 1)[-1]
+        if re.fullmatch(constants.REGEX_INSTANCE_PATH, leaf):
+            self._route_instance_addition(prim)
+        elif re.fullmatch(constants.REGEX_MESH_PATH, leaf):
+            self._route_mesh_prototype_addition(prim)
+        elif prim.IsA(UsdGeom.Mesh):
+            # Meshes under prototype containers are already covered by the
+            # container's replacement; attribute edits there must not spawn
+            # standalone scene objects.
+            if self._hop_to_prototype_container(prim):
+                return
+            new_obj = self._create_mesh_object(prim)
+            if new_obj:
+                self._register_created_object(new_obj, prim, prim_path)
+                self._bind_first_material(new_obj, (prim,))
+        else:
+            self._hop_to_prototype_container(prim)
+
+    def _register_created_object(self, new_obj: bpy.types.Object, prim: Usd.Prim, prim_path: str) -> None:
+        """Finalize one intrinsically created object (collection, transform, tags)."""
+        self.stats['objects_created'] += 1
+        try:
+            self._target_collection().objects.link(new_obj)
+        except Exception as e:
+            self.report({'WARNING'}, f"Failed to link object {new_obj.name}: {e}")
+        if prim.IsA(UsdGeom.Xformable):
+            self._apply_transform(prim, new_obj)
+        self._apply_visibility(prim, new_obj)
+        new_obj[constants.PROP_USD_INSTANCE_PATH] = prim_path
+        print(f"Created new {new_obj.type} object '{new_obj.name}' from <{prim_path}>")
+
+    def _bind_first_material(self, new_obj: bpy.types.Object, candidates) -> None:
+        """Bind the first relative material among candidate prims, if any."""
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            binding = UsdShade.MaterialBindingAPI(candidate).GetDirectBindingRel()
+            if binding and binding.GetTargets():
+                self._apply_material(candidate, new_obj)
+                return
+
+    def _apply_material_to_hash_objects(self, prim: Usd.Prim) -> None:
+        """Apply an over record's material binding to objects of the same hash.
+
+        ``over`` records on ``mesh_<HASH>`` containers never own scene
+        transforms, but a rebinding authored inside the prototype (the
+        Toolkit texture-swap layout) must still reach the scene objects
+        that carry the container's hash. Flag-only records carry no
+        binding rel and stop right here.
+        """
+        binding = UsdShade.MaterialBindingAPI(prim).GetDirectBindingRel()
+        if not binding or not binding.GetTargets():
+            return
+
+        hash_tokens = _hash_tokens(str(prim.GetPath()).rsplit('/', 1)[-1])
+        scene_objects = self._scene_objects_for_hashes(hash_tokens)
+        if not scene_objects:
+            return
+
+        # Prototype rescoping reskins live capture objects, so the capture
+        # material is passed as the existing base: unspecified inputs are
+        # preserved instead of lost during the rebuild.
+        first_material = None
+        for bl_object in scene_objects:
+            if bl_object.material_slots and bl_object.material_slots[0].material:
+                first_material = bl_object.material_slots[0].material
+                break
+
+        try:
+            bl_material = mod_apply_utils.get_or_create_mod_instance_material_util(
+                base_material_usd_path=str(binding.GetTargets()[0]),
+                instance_prim_for_metadata=prim,
+                current_mod_stage=self.stage,
+                texture_res_context_path_p=os.path.dirname(self.stage.GetRootLayer().realPath),
+                mod_file_path_for_tex_p=self.stage.GetRootLayer().realPath,
+                mod_base_material_node_cache_param=self.base_material_node_cache,
+                local_material_cache_param=self.material_cache,
+                report_fn=self.report,
+                existing_bl_material_param=first_material,
+            )
+            if not bl_material:
+                return
+            for bl_object in scene_objects:
+                if bl_object.type != 'MESH':
+                    continue
+                self._assign_object_material(bl_object, bl_material)
+                self.stats['materials_applied'] += 1
+        except Exception as e:
+            self.report({'WARNING'}, f"Failed to apply materials for {prim.GetPath()}: {e}")
+
+    def _route_instance_addition(self, prim: Usd.Prim) -> None:
+        """Route an added ``inst_<HASH>[_<N>]`` placement or canonical anchor."""
+        instance_path = str(prim.GetPath())
+        if instance_path in self._routed_container_paths:
+            return
+        self._routed_container_paths.add(instance_path)
+        leaf = instance_path.rsplit('/', 1)[-1]
+        hash_tokens = _hash_tokens(leaf)
+        scene_objects = self._scene_objects_for_hashes(hash_tokens)
+        # inst_..._0 with an identity matrix is the prototype's canonical
+        # anchor: the mod re-defining it is a replacement, not a new placement.
+        suffix = re.search(r'_(\d+)$', leaf)
+        canonical_anchor = (
+            bool(scene_objects)
+            and suffix is not None
+            and suffix.group(1) == '0'
+            and self._composed_matrix_is_identity(prim)
+        )
+        if canonical_anchor:
+            self._replace_prototype_hash(hash_tokens, prim)
+            return
+        self._materialize_new_placement(prim, instance_path, leaf)
+
+    def _route_mesh_prototype_addition(self, prim: Usd.Prim) -> None:
+        """Route a ``mesh_<HASH>`` prototype record the mod owns."""
+        container_path = str(prim.GetPath())
+        if container_path in self._routed_container_paths:
+            return
+        self._routed_container_paths.add(container_path)
+        if container_path not in self._mod_authored_prototype_paths:
+            # Reached from a child hop: ``over``-only edits keep the
+            # capture-owned prototype intact; nothing here owns scene
+            # geometry, so the hop merely covers the child.
+            return
+        hash_tokens = _hash_tokens(container_path.rsplit('/', 1)[-1])
+        if not self._scene_objects_for_hashes(hash_tokens):
+            # A prototype nothing in the scene references stays library
+            # content and must not enter the scene.
+            self.report({'INFO'}, f"Prototype {container_path.rsplit('/', 1)[-1]} is unrelated to this scene; skipping")
+            return
+        for hash_value in hash_tokens:
+            self._replace_prototype_hash({hash_value}, prim)
+        # Referenced asset layers are not necessarily in GetLayerStack().
+        # Their nested light prims may never occur in changed_prims, yet their
+        # composed descendants must appear under each captured placement.
+        for descendant in Usd.PrimRange(prim):
+            if descendant != prim and self._is_usd_light_prim(descendant):
+                self._sync_prototype_light(descendant, prim)
+
+    def _hop_to_prototype_container(self, prim: Usd.Prim) -> bool:
+        """Cover a changed child (``ref_*``) by its nearest prototype container.
+
+        Returns whether an ``inst_``/``mesh_`` container ancestor was found.
+        The child's content is covered when the container is routed by this
+        call or was routed earlier in the run.
+        """
+        ancestor = prim.GetParent()
+        while ancestor and str(ancestor.GetPath()) != '/':
+            ancestor_path = str(ancestor.GetPath())
+            leaf = ancestor_path.rsplit('/', 1)[-1]
+            if re.fullmatch(constants.REGEX_INSTANCE_PATH, leaf):
+                if ancestor_path not in self._routed_container_paths:
+                    self._route_instance_addition(ancestor)
+                return True
+            if re.fullmatch(constants.REGEX_MESH_PATH, leaf):
+                if ancestor_path not in self._routed_container_paths:
+                    self._route_mesh_prototype_addition(ancestor)
+                return True
+            ancestor = ancestor.GetParent()
+        return False
+
+    def _shared_mesh_prototype_path(self, mesh_prim) -> str:
+        """Return the prototype Mesh path unless this placement overrides geometry.
+
+        The same reference subtree is mapped under each inst_<HASH> prim by
+        USD. Instance-local geometry/primvars edits must retain separate IDs.
+        """
+        mapped = str(mesh_prim.GetPath())
+        from_instance = re.match(
+            r'^/RootNode/instances/inst_([0-9A-Fa-f]{16})_\d+(/.*)$', mapped
+        )
+        if not from_instance:
+            return mapped
+        proposed = '/RootNode/meshes/mesh_' + from_instance.group(1) + from_instance.group(2)
+        prototype = self.stage.GetPrimAtPath(proposed)
+        if not prototype or not prototype.IsValid() or not prototype.IsA(UsdGeom.Mesh):
+            return mapped
+        # A layer's *direct* opinion at this instance path (as opposed to a
+        # reference opinion on the prototype) can change mesh attributes.
+        for layer in self.stage.GetLayerStack(True):
+            spec = layer.GetPrimAtPath(mesh_prim.GetPath())
+            if not spec:
+                continue
+            for prop in spec.properties:
+                prop_name = str(getattr(prop, 'name', prop))
+                if prop_name in {'points', 'faceVertexCounts', 'faceVertexIndices', 'normals'} or prop_name.startswith('primvars:'):
+                    return mapped
+        return proposed
+
+    def _materialize_new_placement(self, prim: Usd.Prim, instance_path: str, leaf_name: str) -> list:
+        """Create new Blender objects for an added placement.
+
+        One object per ``UsdGeom.Mesh`` composing under the placement; each
+        keeps the composed Mesh matrix so nested prototype layouts survive
+        (A16), and inherits the placement's visibility and provenance tags.
+        """
+        created = []
+        instance_name = bpy.path.clean_name(leaf_name) + '_mod'
+        target_collection = self._target_collection()
+        for mesh_prim in [p for p in Usd.PrimRange(prim) if p.IsA(UsdGeom.Mesh)]:
+            source_mesh_path = self._shared_mesh_prototype_path(mesh_prim)
+            bl_mesh = self._new_placement_mesh_data.get(source_mesh_path)
+            if bl_mesh is None:
+                mesh_data = mod_apply_utils.get_mesh_data_from_mod(
+                    mesh_prim, self.time_code, self.up_axis_is_y, self.report
+                )
+                if not mesh_data:
+                    continue
+                verts, faces, uvs_data, normals_data = mesh_data
+                bl_mesh = bpy.data.meshes.new(name=instance_name)
+                bl_mesh.from_pydata(verts, [], faces)
+                bl_mesh.update()
+                if uvs_data:
+                    self._apply_mesh_uvs(bl_mesh, uvs_data)
+                if normals_data:
+                    self._apply_mesh_normals(bl_mesh, normals_data)
+                bl_mesh['usd_mesh_source_path'] = source_mesh_path
+                self._new_placement_mesh_data[source_mesh_path] = bl_mesh
+
+            bl_object = bpy.data.objects.new(name=instance_name, object_data=bl_mesh)
+            self._apply_transform(mesh_prim, bl_object)
+            try:
+                target_collection.objects.link(bl_object)
             except Exception as e:
-                self.report({'WARNING'}, f"Failed to link object {new_obj.name}: {e}")
-            
-            # Apply transform
-            if prim.IsA(UsdGeom.Xformable):
-                self._apply_transform(prim, new_obj)
-            
-            # Apply visibility
-            if prim.IsA(UsdGeom.Imageable):
-                self._apply_visibility(prim, new_obj)
-            
-            # Apply material
-            if new_obj.type == 'MESH' and prim.IsA(UsdGeom.Boundable):
-                self._apply_material(prim, new_obj)
-            
-            # Tag with USD path
-            new_obj["usd_instance_path"] = prim_path
-            
-            print(f"Created new {new_obj.type} object '{new_obj.name}' from <{prim_path}>")
-        
-        return new_obj
+                self.report({'WARNING'}, f"Failed to link object {bl_object.name}: {e}")
+            bl_object[constants.PROP_USD_INSTANCE_PATH] = instance_path
+            if mesh_prim != prim:
+                bl_object[constants.PROP_USD_PRIM_PATH] = str(mesh_prim.GetPath())
+            self._apply_visibility(prim, bl_object)
+            self._bind_first_material(bl_object, (mesh_prim if mesh_prim != prim else None, prim))
+            self.stats['objects_created'] += 1
+            created.append((mesh_prim, bl_object))
+        if not created:
+            self.report({'WARNING'}, f"No UsdGeom.Mesh composes under added placement {instance_path}; skipping")
+        return created
+
+    def _replace_prototype_hash(self, hash_tokens: Set[str], container_prim: Usd.Prim) -> None:
+        """Swap scene objects of *hash_tokens* onto the mod's prototype content.
+
+        The replacement's Mesh prims join into one mesh datablock with part
+        transforms baked in container-relative space (capture prototypes store
+        raw prototype-local vertices the same way), and each target adopts it
+        via ``obj.data``: transforms, visibility and provenance tags stay as
+        the scene owns them. An empty reset hides the targets instead - the
+        mod asks for the prototype to disappear.
+        """
+        if hash_tokens & self._replaced_prototype_hashes:
+            return  # this hash was already routed to a replacement this run
+        self._replaced_prototype_hashes |= hash_tokens
+
+        # Replacement covers pre-existing scene content only: placements this
+        # run materialized already show the replacement composed per part, and
+        # swapping them onto the joined datablock would duplicate geometry.
+        # The container being routed right now is not excluded (a canonical
+        # anchor replacement must reach the objects tagged with its own path).
+        route_paths = set(self._routed_container_paths)
+        route_paths.discard(str(container_prim.GetPath()))
+        targets = [
+            obj for obj in self._scene_objects_for_hashes(hash_tokens)
+            if obj.type == 'MESH' and str(obj.get(constants.PROP_USD_INSTANCE_PATH, '')) not in route_paths
+        ]
+        if not targets:
+            self.report({'INFO'}, f"Prototype {'/'.join(sorted(hash_tokens))} has no scene objects; nothing to replace")
+            return
+
+        parts = [p for p in Usd.PrimRange(container_prim) if p.IsA(UsdGeom.Mesh)]
+        if not parts:
+            for obj in targets:
+                obj.hide_viewport = True
+                obj.hide_render = True
+                self.report({'INFO'}, f"Prototype reset is empty; hid '{obj.name}'")
+            return
+
+        try:
+            container_matrix = self.xform_cache.GetLocalToWorldTransform(container_prim)
+        except Exception:
+            container_matrix = Gf.Matrix4d(1.0)
+        container_matrix_bl = self._gf_matrix_to_mathutils(container_matrix).inverted_safe()
+        container_label = bpy.path.clean_name(str(container_prim.GetPath()).rsplit('/', 1)[-1]) + '_mod'
+
+        joined_verts: List = []
+        joined_faces: List = []
+        slots: List = []
+        uvs_parts: List = []
+        normals_parts: List = []
+        all_parts_have_uvs = True
+        all_parts_have_normals = True
+        vertex_offset = 0
+        loop_start = 0
+        for part_prim in parts:
+            mesh_data = mod_apply_utils.get_mesh_data_from_mod(
+                part_prim, self.time_code, self.up_axis_is_y, self.report
+            )
+            if not mesh_data:
+                print('DEBUG-JOIN part=%r NO-DATA' % str(part_prim.GetPath()))
+                continue
+            verts, faces, uvs_data, normals_data = mesh_data
+            try:
+                part_matrix = self.xform_cache.GetLocalToWorldTransform(part_prim)
+            except Exception:
+                part_matrix = Gf.Matrix4d(1.0)
+            part_bake = self._gf_matrix_to_mathutils(part_matrix) @ container_matrix_bl
+            for vert in verts:
+                joined_verts.append(tuple(part_bake @ mathutils.Vector((vert[0], vert[1], vert[2]))))
+            joined_faces.extend(tuple((index + vertex_offset) for index in face) for face in faces)
+            vertex_offset += len(verts)
+
+            if uvs_data is None:
+                all_parts_have_uvs = False
+            else:
+                uvs_parts.append((uvs_data, loop_start, vertex_offset))
+            if normals_data is None:
+                all_parts_have_normals = False
+            else:
+                normals_parts.append((normals_data, loop_start, vertex_offset))
+
+            part_loop_count = sum(len(face) for face in faces)
+            loop_start += part_loop_count
+
+            binding = UsdShade.MaterialBindingAPI(part_prim).GetDirectBindingRel()
+            material_path = str(binding.GetTargets()[0]) if (binding and binding.GetTargets()) else None
+            slot_material = None
+            if material_path:
+                slot_material = mod_apply_utils.get_or_create_mod_instance_material_util(
+                    base_material_usd_path=material_path,
+                    instance_prim_for_metadata=None,
+                    current_mod_stage=self.stage,
+                    texture_res_context_path_p=os.path.dirname(self.stage.GetRootLayer().realPath),
+                    mod_file_path_for_tex_p=self.stage.GetRootLayer().realPath,
+                    mod_base_material_node_cache_param=self.base_material_node_cache,
+                    local_material_cache_param=self.material_cache,
+                    report_fn=self.report,
+                )
+            slots.append((slot_material, len(joined_faces)))  # slot + face-range end
+
+        if not joined_faces:
+            self.report({'WARNING'}, f"Replacement for {'/'.join(sorted(hash_tokens))} has no mesh geometry; skipping")
+            return
+
+        replaced_mesh = bpy.data.meshes.new(name=container_label)
+        replaced_mesh.from_pydata(joined_verts, [], joined_faces)
+        replaced_mesh.update()
+
+        if any(slot is not None for slot, _ in slots):
+            for slot_material, _range_end in slots:
+                replaced_mesh.materials.append(slot_material)
+            for polygon in replaced_mesh.polygons:
+                polygon.material_index = self._part_index_for_face(polygon.index, slots)
+
+        if all_parts_have_uvs and uvs_parts:
+            self._apply_joined_mesh_uvs(replaced_mesh, uvs_parts)
+        if all_parts_have_normals and normals_parts:
+            self._apply_joined_mesh_normals(replaced_mesh, normals_parts)
+
+        for obj in targets:
+            old_data = obj.data
+            if old_data:
+                for key in list(old_data.keys()):
+                    try:
+                        replaced_mesh[key] = old_data[key]
+                    except Exception:
+                        pass  # non-copyable props: provenance is best-effort
+            obj.data = replaced_mesh
+            self.stats['objects_updated'] += 1
+            self.report({'INFO'}, f"Replaced prototype content on '{obj.name}' from the mod")
+
+    @staticmethod
+    def _gf_matrix_to_mathutils(matrix):
+        """Convert a Gf matrix (row-vector convention) to a mathutils matrix."""
+        return mathutils.Matrix((
+            (matrix[0][0], matrix[1][0], matrix[2][0], matrix[3][0]),
+            (matrix[0][1], matrix[1][1], matrix[2][1], matrix[3][1]),
+            (matrix[0][2], matrix[1][2], matrix[2][2], matrix[3][2]),
+            (matrix[0][3], matrix[1][3], matrix[2][3], matrix[3][3]),
+        ))
+
+    @staticmethod
+    def _part_index_for_face(face_index: int, slots: list) -> int:
+        """Slot index of the part owning the joined-datablock face *face_index*."""
+        for part_index, (_material, range_end) in enumerate(slots):
+            if face_index < range_end:
+                return part_index
+        return 0
+
+    def _apply_joined_mesh_uvs(self, bl_mesh: bpy.types.Mesh, uvs_parts: list) -> None:
+        """Fill one UV layer for a joined datablock from per-part UV data.
+
+        *uvs_parts* holds ``(uvs_data_tuple, loop_start)`` per part in join
+        order (part loop ranges are contiguous, matching the face join). A UV
+        layer is only built when every met part authored UVs; vertex-mapped
+        parts re-index through their own vertex range.
+        """
+        uv_layer = bl_mesh.uv_layers.new(name="st")
+        loop_uvs = [(0.0, 0.0)] * len(bl_mesh.loops)
+        interpolated_any = False
+        for part_index, (uvs_data, loop_start, _) in enumerate(uvs_parts):
+            values, indices, interp = uvs_data
+            if not values:
+                continue
+            part_end = uvs_parts[part_index + 1][1] if part_index + 1 < len(uvs_parts) else len(bl_mesh.loops)
+            part_loops = bl_mesh.loops[loop_start:part_end]
+            if interp == UsdGeom.Tokens.faceVarying:
+                if indices and len(indices) == len(part_loops):
+                    for offset, uv_index in enumerate(indices):
+                        if 0 <= uv_index < len(values):
+                            u, v = values[uv_index]
+                            loop_uvs[loop_start + offset] = (u, 1.0 - v)
+                elif len(values) == len(part_loops):
+                    for offset, (u, v) in enumerate(values):
+                        loop_uvs[loop_start + offset] = (u, 1.0 - v)
+                interpolated_any = True
+            elif interp == UsdGeom.Tokens.vertex:
+                vertex_offset = uvs_parts[part_index][2]
+                for loop in part_loops:
+                    local_index = loop.vertex_index - vertex_offset
+                    if 0 <= local_index < len(values):
+                        u, v = values[local_index]
+                        loop_uvs[loop.index] = (u, 1.0 - v)
+                interpolated_any = True
+        flattened = [coord for pair in loop_uvs for coord in pair]
+        uv_layer.data.foreach_set("uv", flattened)
+
+    def _apply_joined_mesh_normals(self, bl_mesh: bpy.types.Mesh, normals_parts: list) -> None:
+        """Fill custom normals for a joined datablock from per-part data.
+
+        Same contract as ``_apply_joined_mesh_uvs`` for ``(value, index,
+        interpolation)`` normal tuples; missing interpolation coverage falls
+        back to split normals.
+        """
+        loop_normals = [(0.0, 0.0, 1.0)] * len(bl_mesh.loops)
+        interpolated_any = False
+        for part_index, (normals_data, loop_start, _) in enumerate(normals_parts):
+            values, indices, interp = normals_data
+            if not values:
+                continue
+            part_end = normals_parts[part_index + 1][1] if part_index + 1 < len(normals_parts) else len(bl_mesh.loops)
+            part_loops = bl_mesh.loops[loop_start:part_end]
+            if interp == UsdGeom.Tokens.faceVarying:
+                if indices and len(indices) == len(part_loops):
+                    for offset, norm_index in enumerate(indices):
+                        if 0 <= norm_index < len(values):
+                            loop_normals[loop_start + offset] = tuple(values[norm_index])
+                elif len(values) == len(part_loops):
+                    for offset, normal in enumerate(values):
+                        loop_normals[loop_start + offset] = tuple(normal)
+                interpolated_any = True
+            elif interp == UsdGeom.Tokens.vertex:
+                vertex_offset = normals_parts[part_index][2]
+                for loop in part_loops:
+                    local_index = loop.vertex_index - vertex_offset
+                    if 0 <= local_index < len(values):
+                        loop_normals[loop.index] = tuple(values[local_index])
+                interpolated_any = True
+        if not interpolated_any:
+            calc_normals_split_compatible(bl_mesh)
+            return
+        set_mesh_auto_smooth_compatible(bl_mesh, True)
+        try:
+            set_custom_normals_compatible(bl_mesh, loop_normals)
+        except Exception:
+            calc_normals_split_compatible(bl_mesh)
+
     
     def _apply_transform(self, prim: Usd.Prim, bl_object: bpy.types.Object):
         """Apply USD transform to Blender object."""
@@ -701,34 +1766,62 @@ class ModFileLoader:
                 bl_light_data.energy = new_energy_val
                 changed_props.append("energy (intensity/exposure)")
 
+        # Native Blender light temperature: the light keeps the USD color as
+        # a tint, ``use_temperature``/``temperature`` carry the Kelvin value.
+        # The helper stores the temperature-free color, so repeated runs
+        # recompute instead of compounding the tint.
         enable_temp_attr = light_api.GetEnableColorTemperatureAttr()
         color_temp_attr = light_api.GetColorTemperatureAttr()
-        if enable_temp_attr.IsDefined() and enable_temp_attr.IsAuthored():
-            use_temp = enable_temp_attr.Get(time_code)
-            if bl_light_data.use_custom_color_temp != use_temp:
-                bl_light_data.use_custom_color_temp = use_temp
-                changed_props.append("use_color_temp")
-            if use_temp and color_temp_attr.IsDefined() and color_temp_attr.IsAuthored():
-                new_temp = color_temp_attr.Get(time_code)
-                if bl_light_data.color_temperature != new_temp:
-                    bl_light_data.color_temperature = new_temp
-                    changed_props.append("color_temperature")
-        elif color_temp_attr.IsDefined() and color_temp_attr.IsAuthored() and bl_light_data.use_custom_color_temp:
-            new_temp = color_temp_attr.Get(time_code)
-            if bl_light_data.color_temperature != new_temp:
-                bl_light_data.color_temperature = new_temp
-                changed_props.append("color_temperature (assuming enabled)")
+        enable_authored = enable_temp_attr.IsDefined() and enable_temp_attr.IsAuthored()
+        temp_authored = color_temp_attr.IsDefined() and color_temp_attr.IsAuthored()
+        if enable_authored or temp_authored:
+            use_temp = (
+                enable_temp_attr.Get(time_code)
+                if enable_authored
+                else bl_light_data.get('usd_color_temperature') is not None
+            )
+            kelvin = None
+            if use_temp:
+                kelvin = (
+                    color_temp_attr.Get(time_code) if temp_authored
+                    else bl_light_data.get('usd_color_temperature')
+                )
+            base_color = (
+                tuple(light_api.GetColorAttr().Get(time_code))
+                if light_api.GetColorAttr().IsDefined()
+                else bl_light_data.get('usd_base_color')
+            )
+            temp_color = mod_apply_utils.mod_light_color_with_temperature(
+                bl_light_data, base_color, kelvin
+            )
+            if tuple(bl_light_data.color) != tuple(temp_color):
+                bl_light_data.color = temp_color
+                changed_props.append('color (color temperature)')
 
         # Type-specific properties (only if the underlying Blender light type still matches)
-        if self._is_specific_light_type(prim, 'SphereLight') and bl_light_data.type == 'POINT':
+        if self._is_specific_light_type(prim, 'SphereLight'):
             sphere_api = UsdLux.SphereLight(prim)
-            if sphere_api.GetRadiusAttr().IsDefined() and sphere_api.GetRadiusAttr().IsAuthored():
-                new_size = sphere_api.GetRadiusAttr().Get(time_code) * 2.0 * current_scene_scale
-                if sphere_api.GetTreatAsPointAttr().Get(time_code):
-                    new_size = 0.0
-                if abs(bl_light_data.shadow_soft_size - new_size) > 1e-5:
-                    bl_light_data.shadow_soft_size = new_size
-                    changed_props.append("size (radius)")
+            is_spot, cone_angle, cone_softness = sphere_cone_parameters(prim, time_code)
+            if bl_light_data.type == 'SPOT' and is_spot:
+                new_angle = cone_spot_size(cone_angle)
+                new_blend = max(0.0, min(1.0, cone_softness))
+                if abs(bl_light_data.spot_size - new_angle) > 1e-5:
+                    bl_light_data.spot_size = new_angle
+                    changed_props.append('spot_size')
+                if abs(bl_light_data.spot_blend - new_blend) > 1e-5:
+                    bl_light_data.spot_blend = new_blend
+                    changed_props.append('spot_blend')
+            if bl_light_data.type in {'POINT', 'SPOT'}:
+                radius_attr = sphere_api.GetRadiusAttr()
+                if radius_attr.IsDefined() and radius_attr.IsAuthored():
+                    new_radius = float(radius_attr.Get(time_code)) * current_scene_scale
+                    treat_as_point = sphere_api.GetTreatAsPointAttr()
+                    if (bl_light_data.type == 'POINT' and treat_as_point.IsDefined()
+                            and treat_as_point.Get(time_code)):
+                        new_radius = 0.0
+                    if abs(bl_light_data.shadow_soft_size - new_radius) > 1e-5:
+                        bl_light_data.shadow_soft_size = new_radius
+                        changed_props.append('radius')
         elif self._is_specific_light_type(prim, 'RectLight') and bl_light_data.type == 'AREA':
             rect_api = UsdLux.RectLight(prim)
             if rect_api.GetWidthAttr().IsDefined() and rect_api.GetWidthAttr().IsAuthored():
@@ -742,17 +1835,9 @@ class ModFileLoader:
                     bl_light_data.size_y = new_height
                     changed_props.append("size_y (height)")
         elif self._is_specific_light_type(prim, 'SpotLight') and bl_light_data.type == 'SPOT':
-            spot_api = UsdLux.SpotLight(prim)
-            if spot_api.GetShapingConeAngleAttr().IsDefined() and spot_api.GetShapingConeAngleAttr().IsAuthored():
-                new_angle = math.radians(spot_api.GetShapingConeAngleAttr().Get(time_code)) * 2.0
-                if abs(bl_light_data.spot_size - new_angle) > 1e-5:
-                    bl_light_data.spot_size = new_angle
-                    changed_props.append("spot_size")
-            if spot_api.GetShapingConeSoftnessAttr().IsDefined() and spot_api.GetShapingConeSoftnessAttr().IsAuthored():
-                new_blend = spot_api.GetShapingConeSoftnessAttr().Get(time_code)
-                if abs(bl_light_data.spot_blend - new_blend) > 1e-5:
-                    bl_light_data.spot_blend = new_blend
-                    changed_props.append("spot_blend")
+            _, half_angle, softness = sphere_cone_parameters(prim, time_code)
+            bl_light_data.spot_size = cone_spot_size(half_angle)
+            bl_light_data.spot_blend = max(0.0, min(1.0, softness))
         elif self._is_specific_light_type(prim, 'DiskLight') and bl_light_data.type == 'POINT':
             disk_api = UsdLux.DiskLight(prim)
             if disk_api.GetRadiusAttr().IsDefined() and disk_api.GetRadiusAttr().IsAuthored():
@@ -810,7 +1895,9 @@ class ModFileLoader:
     def _create_light_object(self, prim: Usd.Prim) -> Optional[bpy.types.Object]:
         """Create a new light object from USD prim."""
         try:
-            scene_scale = self.context.scene.remix_export_scale
+            scene_scale = self.context.scene.get('remix_import_unit_scale')
+            if scene_scale is None:
+                scene_scale = self.context.scene.remix_export_scale
             return mod_apply_utils.create_new_blender_light_from_mod(
                 prim, self.time_code, scene_scale, self.report
             )

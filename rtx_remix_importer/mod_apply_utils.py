@@ -6,6 +6,8 @@ import os
 import json
 import hashlib
 
+from .light_sharing import sphere_cone_parameters, cone_spot_size
+
 # Note: This has not been fully implemented and will most likely not work.
 
 # --- Transform Helper ---
@@ -77,6 +79,35 @@ def get_mesh_data_from_mod(usd_mesh_prim_param, current_time_code, is_mod_y_up, 
         return None
 
 # --- Light Creation Helper (for new lights from foreign mod.usda) ---
+def mod_light_color_with_temperature(bl_light_data, base_color, kelvin):
+    """Apply (or clear) a Kelvin color temperature on a Blender light.
+
+    Blender carries light color temperature natively: ``use_temperature``
+    toggles it, ``temperature`` holds the Kelvin value and
+    ``temperature_color`` shows the computed blackbody color. With the
+    temperature on, ``light.color`` acts as a tint over the blackbody, so
+    the light keeps the temperature-free *base_color* in ``color`` and the
+    native properties carry the Kelvin value. The USD color and the applied
+    Kelvin value also go to custom props:
+    ``_apply_light_properties`` reads them back when the Toolkit layer
+    authors the temperature without the enable attribute, and they keep
+    repeated Apply runs from re-deriving the wrong base.
+    """
+    base_color = tuple(
+        float(channel) for channel in
+        (base_color if base_color is not None else (1.0, 1.0, 1.0))
+    )
+    bl_light_data['usd_base_color'] = base_color
+    bl_light_data.use_temperature = bool(kelvin)
+    if kelvin:
+        bl_light_data['usd_color_temperature'] = kelvin
+        bl_light_data.temperature = float(kelvin)
+    else:
+        if bl_light_data.get('usd_color_temperature') is not None:
+            del bl_light_data['usd_color_temperature']
+    return base_color
+
+
 def create_new_blender_light_from_mod(usd_light_prim, time_code_param, scene_scale_param, report_fn):
     # Note: Transform is applied separately after this function returns the object.
     # current_context, xform_cache_param, is_y_up_in_mod_param removed as transform is external now.
@@ -97,8 +128,10 @@ def create_new_blender_light_from_mod(usd_light_prim, time_code_param, scene_sca
                 return False
         return False
 
-    if safe_is_light_type(usd_light_prim, 'SphereLight'):
-        bl_type = 'POINT'
+    is_sphere = safe_is_light_type(usd_light_prim, 'SphereLight')
+    is_cone_sphere, cone_angle, cone_softness = sphere_cone_parameters(usd_light_prim, time_code_param) if is_sphere else (False, 45.0, 0.0)
+    if is_sphere:
+        bl_type = 'SPOT' if is_cone_sphere else 'POINT'
     elif safe_is_light_type(usd_light_prim, 'RectLight'):
         bl_type = 'AREA'
     elif safe_is_light_type(usd_light_prim, 'DistantLight'):
@@ -106,7 +139,7 @@ def create_new_blender_light_from_mod(usd_light_prim, time_code_param, scene_sca
     elif safe_is_light_type(usd_light_prim, 'SpotLight'):
         bl_type = 'SPOT'
     elif safe_is_light_type(usd_light_prim, 'DiskLight'):
-        bl_type = 'POINT'
+        bl_type = 'AREA'
     elif safe_is_light_type(usd_light_prim, 'DomeLight'):
         report_fn({'INFO'}, f"USD DomeLight <{usd_light_prim.GetPath()}> mapped to Blender SUN light. For IBL, consider environment textures.")
         bl_type = 'SUN'
@@ -116,31 +149,42 @@ def create_new_blender_light_from_mod(usd_light_prim, time_code_param, scene_sca
     elif safe_is_light_type(usd_light_prim, 'PortalLight'):
         report_fn({'INFO'}, f"USD PortalLight <{usd_light_prim.GetPath()}> mapped to Blender AREA light.")
         bl_type = 'AREA'
-    elif safe_is_light_type(usd_light_prim, 'DiskLight'):
-        report_fn({'INFO'}, f"USD DiskLight <{usd_light_prim.GetPath()}> mapped to Blender POINT light with sphere shape.")
-        bl_type = 'POINT'
 
     bl_light_data = bpy.data.lights.new(name=bl_light_data_name, type=bl_type)
     light_api = UsdLux.LightAPI(usd_light_prim)
 
-    if light_api.GetColorAttr().IsDefined(): bl_light_data.color = light_api.GetColorAttr().Get(time_code_param)
+    base_color = (
+        tuple(light_api.GetColorAttr().Get(time_code_param))
+        if light_api.GetColorAttr().IsDefined() else None
+    )
+    enable_temp_attr = light_api.GetEnableColorTemperatureAttr()
+    temperature = (
+        light_api.GetColorTemperatureAttr().Get(time_code_param)
+        if enable_temp_attr.Get(time_code_param)
+        and light_api.GetColorTemperatureAttr().IsDefined()
+        else None
+    )
+    # Native Blender light temperature: the light keeps the USD color as a
+    # tint, ``use_temperature``/``temperature`` carry the Kelvin value.
+    bl_light_data.color = mod_light_color_with_temperature(bl_light_data, base_color, temperature)
+
     intensity = light_api.GetIntensityAttr().Get(time_code_param) if light_api.GetIntensityAttr().IsDefined() else 1.0
     exposure = light_api.GetExposureAttr().Get(time_code_param) if light_api.GetExposureAttr().IsDefined() else 0.0
     bl_light_data.energy = intensity * pow(2, exposure)
 
-    if light_api.GetEnableColorTemperatureAttr().Get(time_code_param) and light_api.GetColorTemperatureAttr().IsDefined():
-        bl_light_data.use_custom_color_temp = True
-        bl_light_data.color_temperature = light_api.GetColorTemperatureAttr().Get(time_code_param)
-
-    if safe_is_light_type(usd_light_prim, 'SphereLight'):
-        sphere_light_api = getattr(UsdLux, 'SphereLight')(usd_light_prim)
-        # Set shape only if the attribute exists (newer Blender versions)
-        if hasattr(bl_light_data, 'shape'):
-            bl_light_data.shape = 'SPHERE'
-        if hasattr(bl_light_data, 'size'):
-            bl_light_data.size = sphere_light_api.GetRadiusAttr().Get(time_code_param) * 2.0 * scene_scale_param if sphere_light_api.GetRadiusAttr().IsDefined() else 0.1 * scene_scale_param
-        if sphere_light_api.GetTreatAsPointAttr().Get(time_code_param) and hasattr(bl_light_data, 'size'):
-             bl_light_data.size = 0.0
+    if is_sphere:
+        sphere_light_api = UsdLux.SphereLight(usd_light_prim)
+        radius_attr = sphere_light_api.GetRadiusAttr()
+        radius = radius_attr.Get(time_code_param) if radius_attr.IsDefined() else 0.1
+        if bl_light_data.type == 'SPOT':
+            bl_light_data.spot_size = cone_spot_size(cone_angle)
+            bl_light_data.spot_blend = max(0.0, min(1.0, cone_softness))
+            bl_light_data.shadow_soft_size = float(radius) * scene_scale_param
+        else:
+            bl_light_data.shadow_soft_size = float(radius) * scene_scale_param
+            treat_as_point = sphere_light_api.GetTreatAsPointAttr()
+            if treat_as_point.IsDefined() and treat_as_point.Get(time_code_param):
+                bl_light_data.shadow_soft_size = 0.0
     elif safe_is_light_type(usd_light_prim, 'RectLight'):
         rect_light_api = getattr(UsdLux, 'RectLight')(usd_light_prim)
         # Set shape only if the attribute exists (newer Blender versions)
@@ -151,11 +195,9 @@ def create_new_blender_light_from_mod(usd_light_prim, time_code_param, scene_sca
         if hasattr(bl_light_data, 'size_y'):
             bl_light_data.size_y = rect_light_api.GetHeightAttr().Get(time_code_param) * scene_scale_param if rect_light_api.GetHeightAttr().IsDefined() else 1.0 * scene_scale_param
     elif safe_is_light_type(usd_light_prim, 'SpotLight'):
-        spot_api = getattr(UsdLux, 'SpotLight')(usd_light_prim)
-        if hasattr(bl_light_data, 'spot_size'):
-            bl_light_data.spot_size = math.radians(spot_api.GetShapingConeAngleAttr().Get(time_code_param)) if spot_api.GetShapingConeAngleAttr().IsDefined() else math.radians(45)
-        if hasattr(bl_light_data, 'spot_blend'):
-            bl_light_data.spot_blend = spot_api.GetShapingConeSoftnessAttr().Get(time_code_param) if spot_api.GetShapingConeSoftnessAttr().IsDefined() else 0.15
+        _, spot_angle, spot_softness = sphere_cone_parameters(usd_light_prim, time_code_param)
+        bl_light_data.spot_size = cone_spot_size(spot_angle)
+        bl_light_data.spot_blend = max(0.0, min(1.0, spot_softness))
     elif safe_is_light_type(usd_light_prim, 'DiskLight'):
         disk_api = getattr(UsdLux, 'DiskLight')(usd_light_prim)
         # Set shape only if the attribute exists (newer Blender versions)
@@ -240,29 +282,18 @@ def _get_mod_socket(node, *names):
     return None
 
 def create_mod_default_blender_material_util(name, report_fn, is_translucent=False):
-    """Create a standard Principled BSDF material for mod overrides.
-
-    Translucent mods are represented by Principled's transmission layer
-    (Transmission Weight = 1.0) instead of a custom node group.
-    """
+    """Create a Glass BSDF for translucent MDL, Principled for opaque MDL."""
+    if is_translucent:
+        from .glass_nodes import create_glass_material
+        return create_glass_material(name)
     mat = bpy.data.materials.new(name=name)
     mat.use_nodes = True
     nodes, links = mat.node_tree.nodes, mat.node_tree.links
     nodes.clear()
     output_node = nodes.new(type='ShaderNodeOutputMaterial')
     output_node.location = (300, 0)
-
     bsdf = nodes.new(type='ShaderNodeBsdfPrincipled')
     bsdf.location = (0, 0)
-    if is_translucent:
-        # Set up for transmission
-        if 'Transmission Weight' in bsdf.inputs:
-            bsdf.inputs['Transmission Weight'].default_value = 1.0
-        elif 'Transmission' in bsdf.inputs:
-            bsdf.inputs['Transmission'].default_value = 1.0
-        ior_socket = _get_mod_socket(bsdf, 'IOR')
-        if ior_socket is not None:
-            ior_socket.default_value = 1.3
     links.new(bsdf.outputs['BSDF'], output_node.inputs['Surface'])
     return mat, bsdf
 
@@ -292,7 +323,7 @@ def process_mod_input_util(usd_input_val, input_type_name, nodes, links, target_
     target_socket = target_node.inputs.get(target_socket_name)
     if not target_socket or usd_input_val is None: return None
     created_node = None
-    texture_node_x, normal_map_node_x = target_node.location.x - 400, target_node.location.x - 150
+    texture_node_x = target_node.location.x - 400
     if isinstance(usd_input_val, (str, Sdf.AssetPath)):
         path_str = str(usd_input_val).strip('@')
         is_likely_texture_path = '../' in path_str or 'assets/' in path_str or \
@@ -313,12 +344,9 @@ def process_mod_input_util(usd_input_val, input_type_name, nodes, links, target_
                     if target_socket.is_linked:
                         src = target_socket.links[0].from_node
                         if is_normal and src.type == 'NORMAL_MAP':
+                            from .normal_nodes import find_normal_texture_node
                             existing_container_node = src
-                            color_in = src.inputs.get('Color')
-                            if color_in and color_in.is_linked:
-                                cand = color_in.links[0].from_node
-                                if cand.type == 'TEX_IMAGE':
-                                    existing_tex_node = cand
+                            existing_tex_node = find_normal_texture_node(src)
                         elif not is_normal and src.type == 'TEX_IMAGE':
                             existing_tex_node = src
                         elif not is_normal and src.type in ('SEPARATE_COLOR', 'SEPRGB'):
@@ -329,6 +357,13 @@ def process_mod_input_util(usd_input_val, input_type_name, nodes, links, target_
                     if existing_tex_node:
                         if existing_tex_node.image != image:
                             existing_tex_node.image = image
+                        if is_normal:
+                            from .normal_nodes import connect_xy_normal
+                            connect_xy_normal(
+                                nodes, links, existing_tex_node, target_socket,
+                                normal_map_node=existing_container_node,
+                                target_x=target_node.location.x, node_y=node_pos[1],
+                            )
                         if is_non_color and not is_normal and target_socket.type == 'VALUE':
                             current_link = target_socket.links[0]
                             if current_link.from_node == existing_tex_node or current_link.from_socket.name not in ('Red', 'R'):
@@ -340,9 +375,12 @@ def process_mod_input_util(usd_input_val, input_type_name, nodes, links, target_
                         tex_node.label = f"{input_type_name.replace('_', ' ').title()} Texture"; tex_node.location = (texture_node_x, node_pos[1])
                         out_sock_name = 'Color'
                         if is_normal:
-                            nm = nodes.new(type='ShaderNodeNormalMap'); nm.location = (normal_map_node_x, node_pos[1])
-                            links.new(tex_node.outputs[out_sock_name], nm.inputs['Color']); links.new(nm.outputs['Normal'], target_socket)
-                            created_node = nm
+                            from .normal_nodes import connect_xy_normal
+                            created_node = connect_xy_normal(
+                                nodes, links, tex_node, target_socket,
+                                normal_map_node=existing_container_node,
+                                target_x=target_node.location.x, node_y=node_pos[1],
+                            )
                         elif is_non_color and target_socket.type == 'VALUE':
                             from .scalar_texture import connect_scalar_red
                             connect_scalar_red(nodes, links, tex_node, target_socket); created_node = tex_node
@@ -353,6 +391,17 @@ def process_mod_input_util(usd_input_val, input_type_name, nodes, links, target_
     elif isinstance(usd_input_val, (int, float)) and target_socket.type == 'VALUE': target_socket.default_value = float(usd_input_val)
     elif isinstance(usd_input_val, bool) and target_socket.type == 'VALUE': target_socket.default_value = 1.0 if usd_input_val else 0.0
     return created_node
+
+def _get_mod_value_and_attr(shader, name):
+    value, attr = get_mod_input_value_util(shader, 'inputs:' + name)
+    if value is None:
+        value, attr = get_mod_input_value_util(shader, name)
+    return value, attr
+
+
+def _get_mod_value(shader, name):
+    return _get_mod_value_and_attr(shader, name)[0]
+
 
 def _shader_prim_is_translucent(shader_prim_instance):
     """Detect a translucent mod shader from its own authored inputs (the
@@ -368,7 +417,7 @@ def _shader_prim_is_translucent(shader_prim_instance):
 
 # Principled-only attributes that have no direct socket counterpart on the
 # node; they are preserved as custom material properties.
-_TRANSLUCENT_EXTRA_PROPERTIES = ("Thin Wall Thickness", "Transmittance Measurement Distance", "Thin Walled")
+_TRANSLUCENT_EXTRA_PROPERTIES = ("Thin Wall Thickness", "Transmittance Measurement Distance", "Thin Walled", "Use Diffuse Layer")
 
 
 def process_mod_pbr_util(shader_prim_instance, bl_mat_instance, main_shader_node_instance,
@@ -376,16 +425,15 @@ def process_mod_pbr_util(shader_prim_instance, bl_mat_instance, main_shader_node
     nodes, links = bl_mat_instance.node_tree.nodes, bl_mat_instance.node_tree.links
 
     # Detect if this is a translucent material from the mod shader's inputs
-    is_translucent = _shader_prim_is_translucent(shader_prim_instance)
+    is_translucent = main_shader_node_instance.type == 'BSDF_GLASS' or _shader_prim_is_translucent(shader_prim_instance)
 
     if is_translucent:
-        # Translucent material input mapping (AperturePBR_Translucent -> Principled)
+        # Glass inputs, rather than Principled's transmission approximation.
         input_map = {
-            "Base Color": ["inputs:transmittance_texture", "transmittance_texture", "inputs:transmittance_color", "transmittance_color"],
+            "Color": ["inputs:transmittance_texture", "transmittance_texture", "inputs:transmittance_color", "transmittance_color"],
             "IOR": ["inputs:ior_constant", "ior_constant"],
             "Normal": ["inputs:normalmap_texture", "normalmap_texture"],
-            "Emission Color": ["inputs:emissive_mask_texture", "emissive_mask_texture", "inputs:emissive_color", "emissive_color"],
-            "Emission Strength": ["inputs:emissive_intensity", "emissive_intensity"],
+            "Roughness": ["inputs:reflectionroughness_texture", "reflectionroughness_texture", "inputs:reflection_roughness_constant", "reflection_roughness_constant"],
         }
     else:
         # Standard opaque PBR input mapping (Principled sockets)
@@ -441,11 +489,49 @@ def process_mod_pbr_util(shader_prim_instance, bl_mat_instance, main_shader_node
             if node_created:
                 y_off -= spacing
 
-    # Translucent attributes without a Principled socket counterpart are kept
+    if is_translucent and main_shader_node_instance.type == 'BSDF_GLASS':
+        from .glass_nodes import ensure_emission, emission_node
+        enabled = _get_mod_value(shader_prim_instance, 'enable_emission')
+        emissive_values = (
+            ('Color', ('emissive_mask_texture', 'emissive_color')),
+            ('Strength', ('emissive_intensity',)),
+        )
+        any_emission_input = any(_get_mod_value(shader_prim_instance, name) is not None
+                                 for _socket, names in emissive_values for name in names)
+        if enabled is True or (enabled is None and any_emission_input):
+            emission = ensure_emission(bl_mat_instance)
+            for sock, names in emissive_values:
+                for name in names:
+                    val, attr = _get_mod_value_and_attr(shader_prim_instance, name)
+                    if val is not None:
+                        source_layer = mod_file_path_for_tex_p
+                        if attr:
+                            for spec in attr.GetPropertyStack():
+                                if spec.HasInfo('default') and spec.layer.realPath:
+                                    source_layer = spec.layer.realPath
+                                    break
+                        process_mod_input_util(val, name, nodes, links, emission, sock,
+                                               os.path.dirname(source_layer), source_layer,
+                                               node_pos=(-400, -250), is_non_color=sock == 'Strength',
+                                               report_fn=report_fn)
+                        break
+            explicit_intensity = _get_mod_value(shader_prim_instance, 'emissive_intensity')
+            if (explicit_intensity is None and not emission.inputs['Strength'].is_linked
+                    and emission.inputs['Strength'].default_value == 0):
+                emission.inputs['Strength'].default_value = 40.0
+        elif enabled is False:
+            emission = emission_node(bl_mat_instance)
+            if emission:
+                emission.inputs['Strength'].default_value = 0.0
+                for link in list(emission.inputs['Strength'].links):
+                    links.remove(link)
+
+    # Translucent attributes without a Glass socket counterpart are kept
     # as custom material properties so the values survive reloads.
     for prop_label in _TRANSLUCENT_EXTRA_PROPERTIES:
         prop_usd_names = {
             "Thin Walled": ["inputs:thin_walled", "thin_walled"],
+            "Use Diffuse Layer": ["inputs:use_diffuse_layer", "use_diffuse_layer"],
             "Thin Wall Thickness": ["inputs:thin_wall_thickness", "thin_wall_thickness"],
             "Transmittance Measurement Distance": ["inputs:transmittance_measurement_distance", "transmittance_measurement_distance"],
         }
@@ -573,6 +659,9 @@ def create_mod_material_nodes_util(material_usd_path_str, current_mod_stage,
     # type and existing node graph of the material it patches.
     if not has_explicit_type and existing_bl_material_param and existing_bl_material_param.node_tree:
         for node in existing_bl_material_param.node_tree.nodes:
+            if node.type == 'BSDF_GLASS':
+                is_translucent = True
+                break
             if node.type == 'BSDF_PRINCIPLED':
                 trans = node.inputs.get('Transmission Weight') or node.inputs.get('Transmission')
                 is_translucent = bool(trans is not None and not trans.is_linked and trans.default_value >= 0.5)
@@ -581,20 +670,21 @@ def create_mod_material_nodes_util(material_usd_path_str, current_mod_stage,
     target_mat_name = f"{mat_name}_mod_override"
 
     def _principled_state_matches(node):
-        """Whether an existing Principled BSDF node matches the translucent state."""
+        if node.type == 'BSDF_GLASS':
+            return is_translucent
         if node.type != 'BSDF_PRINCIPLED':
             return False
         trans = node.inputs.get('Transmission Weight') or node.inputs.get('Transmission')
         is_node_translucent = bool(trans is not None and not trans.is_linked and trans.default_value >= 0.5)
-        # Legacy pre-Principled node groups are always treated as opaque;
-        # rebuilding into a standard Principled setup is the point of the port.
-        return is_node_translucent == bool(is_translucent)
+        return not is_translucent and not is_node_translucent
 
     def _find_main_shader_node(material):
         """Find the main shading node of a material: a Principled BSDF first,
         falling back to a legacy Aperture group for old .blend materials."""
         principled, group = None, None
         for node in material.node_tree.nodes:
+            if node.type == 'BSDF_GLASS' and is_translucent:
+                return node
             if node.type == 'BSDF_PRINCIPLED':
                 principled = node
                 break
@@ -617,7 +707,21 @@ def create_mod_material_nodes_util(material_usd_path_str, current_mod_stage,
             bl_mat = existing_mat
             report_fn({'INFO'}, f"  Reusing existing material '{existing_mat.name}' - updating shader parameters in place")
         else:
-            report_fn({'INFO'}, f"  Existing material '{existing_mat.name}' has a different shader structure (opaque/translucent changed) - rebuilding")
+            # Upgrade the material datablock IN PLACE. Creating a new datablock
+            # with the same base name on every reload produces .001/.002 copies.
+            if is_translucent:
+                from .glass_nodes import upgrade_legacy_translucent, reset_glass_nodes
+                main_node = upgrade_legacy_translucent(existing_mat)
+                if main_node is None:
+                    main_node = reset_glass_nodes(existing_mat)
+            else:
+                nodes, links = existing_mat.node_tree.nodes, existing_mat.node_tree.links
+                nodes.clear()
+                output = nodes.new(type='ShaderNodeOutputMaterial')
+                main_node = nodes.new(type='ShaderNodeBsdfPrincipled')
+                links.new(main_node.outputs['BSDF'], output.inputs['Surface'])
+            bl_mat = existing_mat
+            report_fn({'INFO'}, f"  Upgraded existing material '{existing_mat.name}' in place to the new shader type")
 
     if not bl_mat:
         # FIX: mod.usda material overrides are meant to ADD/PATCH specific inputs
@@ -630,15 +734,23 @@ def create_mod_material_nodes_util(material_usd_path_str, current_mod_stage,
         # isn't mentioned in this mod material (like diffuse here) stays intact.
         if existing_bl_material_param and existing_bl_material_param.node_tree:
             base_node = _find_main_shader_node(existing_bl_material_param)
-            if base_node is not None:
+            legacy_translucent = False
+            if base_node is None and is_translucent:
+                for old_node in existing_bl_material_param.node_tree.nodes:
+                    if old_node.type == 'BSDF_PRINCIPLED':
+                        socket = old_node.inputs.get('Transmission Weight') or old_node.inputs.get('Transmission')
+                        legacy_translucent = bool(socket and not socket.is_linked and socket.default_value >= 0.5)
+                        break
+            if base_node is not None or legacy_translucent:
                 bl_mat = existing_bl_material_param.copy()
                 bl_mat.name = target_mat_name
                 main_node = None
-                for copied_node in bl_mat.node_tree.nodes:
-                    if copied_node.type == 'BSDF_PRINCIPLED':
-                        main_node = copied_node
-                        break
-                if main_node is None and base_node.type == 'GROUP':
+                if legacy_translucent:
+                    from .glass_nodes import upgrade_legacy_translucent
+                    main_node = upgrade_legacy_translucent(bl_mat)
+                else:
+                    main_node = _find_main_shader_node(bl_mat)
+                if main_node is None and base_node is not None and base_node.type == 'GROUP':
                     # Legacy base material: find the copied group node by name.
                     for copied_node in bl_mat.node_tree.nodes:
                         if copied_node.type == 'GROUP' and copied_node.node_tree and copied_node.node_tree.name == base_node.node_tree.name:

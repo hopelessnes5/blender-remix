@@ -78,7 +78,7 @@ The official Toolkit is a Kit-based application (`lightspeed.trex.*` extensions)
 | Feature | Official Toolkit component | Status | Notes in this add-on |
 |---|---|:--:|---|
 | List / inspect the assets a mod replaces | stage manager, `get_replaced_hashes` | ✅ | `Exported Assets` box: scan, filter "not in scene", select, delete |
-| Read the mod back into the scene | stage manager reload | 🟡 | `Apply Mod File Changes` (experimental) |
+| Read the mod back into the scene | stage manager reload | 🟡 | `Apply Mod File Changes` (experimental): follows the Toolkit mod model — scene additions are limited by the 16-character hash relation with the current scene and capture; replacements swap prototype content into the existing hash objects in place (empty resets hide them); `over` records and material-binding scan hits touch materials only, never transforms; Toolkit color temperature uses Blender's native light temperature setting; new placements, lights and standalone meshes go to a dedicated `mod <name>` collection |
 | Force re-export of an asset | — | ✅ | `Invalidate Remix Assets` |
 | Undo / redo of USD edits | `lightspeed.trex.commands`, Kit undo stack | ⛔ | Blender operator undo only |
 | Properties panes for raw USD attributes | `lightspeed.trex.properties_pane.*` | ⛔ | |
@@ -245,7 +245,7 @@ checks the texture source guard: height and normal exports refuse hard-link
 and symlink aliases and the recorded pre-decode source path before texconv
 availability is even checked, and a distinct target still exports.
 
-**Executed result:** 328 tests pass on both Blender 4.5.5 LTS (bundled OpenUSD
+**Executed result:** 330 tests pass on both Blender 4.5.5 LTS (bundled OpenUSD
 25.02) and Blender 5.1.2 (bundled OpenUSD 25.08) on Windows, exit code `0`.
 `register()` / `unregister()` are exercised by the suite through the
 UI-operator tests. The package-install smoke check — a freshly built
