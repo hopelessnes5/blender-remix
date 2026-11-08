@@ -997,54 +997,6 @@ class ModFileLoader:
                 anchors[instance_path] = obj
         return anchors
 
-    def _prototype_light_relative_matrix(self, light_prim, prototype_prim, instance_path, anchor):
-        """Light matrix relative to the Blender object's actual USD mesh path.
-
-        Matrices below are USD-local column matrices (Gf is transposed). The
-        anchor's matrix_world already includes capture metresPerUnit and Y-up
-        conversion, so multiplying the unscaled USD-relative transform avoids
-        applying either conversion twice. Nested Xforms and rotations survive.
-        """
-        prototype_path = str(prototype_prim.GetPath())
-        source_path = str(light_prim.GetPath())
-        stage = self._get_light_stage()
-        cache = self._light_xform_cache
-        mapped_light_path = instance_path + source_path[len(prototype_path):]
-        mapped_light = stage.GetPrimAtPath(mapped_light_path)
-        mapped_anchor = stage.GetPrimAtPath(
-            self._mapped_anchor_path(anchor, prototype_path, instance_path)
-        )
-        if mapped_light and mapped_light.IsValid() and mapped_anchor and mapped_anchor.IsValid():
-            anchor_world = self._gf_matrix_to_mathutils(cache.GetLocalToWorldTransform(mapped_anchor))
-            light_world = self._gf_matrix_to_mathutils(cache.GetLocalToWorldTransform(mapped_light))
-            return anchor_world.inverted_safe() @ light_world
-
-        source_cache = self.xform_cache or UsdGeom.XformCache(self.time_code)
-        proto_world = self._gf_matrix_to_mathutils(source_cache.GetLocalToWorldTransform(prototype_prim))
-        light_world = self._gf_matrix_to_mathutils(source_cache.GetLocalToWorldTransform(light_prim))
-        proto_to_light = proto_world.inverted_safe() @ light_world
-
-        # A capture mesh can be nested below mesh_<HASH>; its Blender object
-        # has that mesh's (not the instance root's) matrix_world. Recover the
-        # original mesh offset before attaching a new prototype light.
-        capture_stage = self._get_capture_light_stage()
-        if capture_stage is not None:
-            original_instance = capture_stage.GetPrimAtPath(instance_path)
-            original_anchor = capture_stage.GetPrimAtPath(
-                self._mapped_anchor_path(anchor, prototype_path, instance_path)
-            )
-            if (original_instance and original_instance.IsValid() and
-                    original_anchor and original_anchor.IsValid()):
-                capture_cache = UsdGeom.XformCache(self.time_code)
-                root_world = self._gf_matrix_to_mathutils(
-                    capture_cache.GetLocalToWorldTransform(original_instance)
-                )
-                anchor_world = self._gf_matrix_to_mathutils(
-                    capture_cache.GetLocalToWorldTransform(original_anchor)
-                )
-                return anchor_world.inverted_safe() @ root_world @ proto_to_light
-        return proto_to_light
-
     def _unanchored_distant_light_instances(self, light_prim, prototype_prim) -> dict:
         """Composed USD placements for a sky/directional light without Blender MESH anchors.
 
@@ -1074,18 +1026,37 @@ class ModFileLoader:
                     instances[instance_path] = None  # no Blender mesh parent
         return instances if instances else {'': None}
 
-    def _unanchored_light_matrix(self, prim):
-        """Blender world matrix for a standalone light from a composed USD prim.
+    def _refresh_view_layer(self) -> None:
+        """Evaluate the depsgraph so freshly moved objects report fresh matrices.
 
-        Unlike mesh-relative prototype placement, SUN orientation is computed
-        directly from the composed prim, including Y-Up to Z-Up conversion.
-        The scene's capture unit scale applies to location only, not rotation.
+        The mod pass often moves `usd_instance_path` anchors right before
+        `_sync_prototype_light` reads them; Blender recomputes ``matrix_world``
+        only during a view-layer update.
+        """
+        view_layer = getattr(self.context, 'view_layer', None) or bpy.context.view_layer
+        if view_layer is not None:
+            # Blender can leave freshly hidden or re-linked anchors at stale
+            # matrices after a single update; the second update converges the
+            # evaluation.
+            view_layer.update()
+            view_layer.update()
+
+    def _composed_light_world_matrix(self, prim, y_up=None):
+        """Blender world matrix for a light from its composed USD prim.
+
+        Both standalone suns and anchored per-instance lights share this:
+        position and orientation come from the composed prim with the stage's
+        Y-up conversion, then the scene scale applies to location. Anchors
+        only provide the Blender parenting, never the unit conversion. Anchored
+        callers pass ``y_up`` because their anchors' Blender frames follow the
+        loader's own up-axis flag, not the light stage's metadata.
         """
         stage = prim.GetStage()
         cache = self._light_xform_cache if stage == self._get_light_stage() else self.xform_cache
         if cache is None:
             cache = UsdGeom.XformCache(self.time_code)
-        y_up = UsdGeom.GetStageUpAxis(stage) == UsdGeom.Tokens.y
+        if y_up is None:
+            y_up = UsdGeom.GetStageUpAxis(stage) == UsdGeom.Tokens.y
         matrix = mod_apply_utils.get_blender_transform_matrix_from_mod(
             prim, cache, y_up, self.report
         )
@@ -1124,6 +1095,10 @@ class ModFileLoader:
         """
         source_path = str(light_prim.GetPath())
         prototype_path = str(prototype_prim.GetPath())
+        # Anchors were moved earlier in this apply pass, but Blender refreshes
+        # ``matrix_world`` only on a depsgraph update; placing against a stale
+        # parent matrix drops prototype lights at their anchors' origins.
+        self._refresh_view_layer()
         anchors = self._instance_anchor_objects(prototype_path)
         if not anchors and light_prim.GetTypeName() == 'DistantLight':
             # Sky meshes may have no Blender MESH object and sometimes no
@@ -1147,6 +1122,7 @@ class ModFileLoader:
                 existing[(source_path, '')] = obj
         canonical_by_signature = {}
         claimed_data = set()
+        placed_objects = []
         created_any = False
         for instance_path, anchor in sorted(anchors.items()):
             key = (source_path, instance_path)
@@ -1162,12 +1138,8 @@ class ModFileLoader:
                 mapped_light = self._get_light_stage().GetPrimAtPath(mapped_path)
                 applied_light = (mapped_light if mapped_light and mapped_light.IsValid()
                                  else light_prim)
-                if anchor is None:
-                    world_matrix = self._unanchored_light_matrix(applied_light)
-                else:
-                    relative = self._prototype_light_relative_matrix(
-                        light_prim, prototype_prim, instance_path, anchor
-                    )
+                world_matrix = self._composed_light_world_matrix(
+                    applied_light, None if anchor is None else self.up_axis_is_y)
                 signature = light_parameter_signature(applied_light, self.time_code)
                 group = (source_path, signature)
                 canonical = canonical_by_signature.get(group)
@@ -1213,7 +1185,7 @@ class ModFileLoader:
                         del bl_light['usd_light_unanchored']
                     bl_light.parent = anchor
                     bl_light.matrix_parent_inverse = mathutils.Matrix.Identity(4)
-                    bl_light.matrix_world = anchor.matrix_world @ relative
+                    bl_light.matrix_world = world_matrix
                 self._apply_visibility(applied_light, bl_light)
                 canonical_by_signature[group] = canonical
                 self._routed_light_instances.add(key)
@@ -1224,6 +1196,7 @@ class ModFileLoader:
                     # object to obtain correctly typed Light data.
                     bpy.data.objects.remove(provisional, do_unlink=True)
                     provisional = None
+                placed_objects.append((bl_light, world_matrix))
             except Exception as exc:
                 if provisional is not None:
                     provisional_data = provisional.data
@@ -1239,6 +1212,18 @@ class ModFileLoader:
                 elif previous_data is not None and bl_light is not None:
                     bl_light.data = previous_data
                 self.report({'WARNING'}, f'Failed to place light {source_path} on {instance_path}: {exc}')
+
+        if placed_objects:
+            # ``bl_light.matrix_world`` assignments save a basis derived from
+            # the parent's current datablock matrix, and a parent moved or
+            # hidden earlier in this pass (or freshly re-parented) can still
+            # evaluate at identity. The parenting above also re-tags the
+            # family, so one more update now yields true worlds; stamping the
+            # same requested world again recomputes the bases against real
+            # anchors instead of leaving lights at (10, 6, 6) style drift.
+            self._refresh_view_layer()
+            for placed_light, placed_world in placed_objects:
+                placed_light.matrix_world = placed_world
 
         if created_any:
             # Remove only obsolete, mod-created single lights from the old

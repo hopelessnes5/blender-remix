@@ -133,13 +133,15 @@ class TestLinkBehaviour(unittest.TestCase):
         self.loader.context = SimpleNamespace(scene=Scene())
         self.loader._routed_light_instances = set()
         self.loader.stats = {'objects_created': 0}
-        self.loader._prototype_light_relative_matrix = lambda *args: Matrix()
+        self.loader._composed_light_world_matrix = lambda _light, _y_up=None: Matrix()
+        self.loader._refresh_view_layer = lambda: None
         self.loader._apply_visibility = lambda *args: None
         self.loader._apply_light_properties = lambda prim, obj: setattr(obj.data, 'energy', prim.energy)
         self.loader._target_collection = lambda: Collection()
         self.loader._mod_collection_label = lambda: 'mod test'
         self.loader.report = lambda *args: self.fail(f'Light placement failed: {args}')
         self.loader.time_code = None
+        self.loader.up_axis_is_y = False
         self.loader._create_light_object = lambda prim: MOCK_OBJECTS.new(prim.GetName(), Data(
             self.loader._desired_blender_light_type(prim)))
         H = 'ABCDEF0123456789'
@@ -184,7 +186,6 @@ class TestLinkBehaviour(unittest.TestCase):
         # DistantLight must still appear globally and survive repeated Apply.
         self.loader._instance_anchor_objects = lambda _proto: {}
         self.loader._unanchored_distant_light_instances = lambda _light, _proto: {'': None}
-        self.loader._unanchored_light_matrix = lambda _light: Matrix()
         self.source = Prim(self.src, energy=7, typ='DistantLight')
         self.loader._get_light_stage = lambda: Stage({self.src: self.source})
         self.loader._sync_prototype_light(self.source, self.prototype)

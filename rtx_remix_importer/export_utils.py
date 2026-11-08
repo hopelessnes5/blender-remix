@@ -650,6 +650,26 @@ class MaterialExporter:
                     # Float values
                     shader_prim.CreateAttribute(usd_attr, Sdf.ValueTypeNames.Float).Set(float(value))
 
+        # A connected volume branch is the absorption authority: the authored
+        # transmittance becomes exp(-sigma * measurement_distance) for the
+        # volume the author sees in Blender, including vanilla-authored
+        # graphs (Glass + Volume Absorption, or a scattering-free Principled
+        # Volume). Without a volume the Glass tint stays the transmittance
+        # source as before.
+        if material_type == "AperturePBR_Translucent" and bl_mat is not None:
+            from .glass_nodes import volume_transmittance
+            authored_distance = bl_mat.get('rtx_transmittance_measurement_distance')
+            measurement_distance = (float(authored_distance) if isinstance(authored_distance, (int, float))
+                                    and float(authored_distance) > 0 else 1.0)
+            transmittance_rgb, volume_note = volume_transmittance(bl_mat, measurement_distance)
+            if volume_note:
+                print(f"  Volume export note: {volume_note}")
+            if transmittance_rgb is not None:
+                shader_prim.CreateAttribute('inputs:transmittance_color', Sdf.ValueTypeNames.Color3f).Set(
+                    Gf.Vec3f(transmittance_rgb[0], transmittance_rgb[1], transmittance_rgb[2])
+                )
+                shader_prim.CreateAttribute('inputs:transmittance_measurement_distance',
+                                            Sdf.ValueTypeNames.Float).Set(measurement_distance)
 
         from .material_defaults import remove_default_inputs, weaker_layer_authors_prim
         # Omitting a default only stands when no weaker layer hides behind the

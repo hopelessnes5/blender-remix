@@ -1319,6 +1319,23 @@ def _export_material_impl(blender_material, sublayer_stage, project_root, sublay
                     value_type_usd = Sdf.ValueTypeNames.Bool if value_type == 'Bool' else Sdf.ValueTypeNames.Float
                     shader_prim.CreateAttribute(usd_attr, value_type_usd).Set(bool(value) if value_type == 'Bool' else float(value))
 
+        # A connected volume branch is the absorption authority (same rule as
+        # export_utils._export_material_textures): transmittance becomes
+        # exp(-sigma * measurement_distance) for the volume wired in Blender.
+        from ..glass_nodes import volume_transmittance
+        authored_distance = blender_material.get('rtx_transmittance_measurement_distance')
+        measurement_distance = (float(authored_distance) if isinstance(authored_distance, (int, float))
+                                and float(authored_distance) > 0 else 1.0)
+        transmittance_rgb, volume_note = volume_transmittance(blender_material, measurement_distance)
+        if volume_note:
+            print(f"  Volume export note: {volume_note}")
+        if transmittance_rgb is not None:
+            shader_prim.CreateAttribute('inputs:transmittance_color', Sdf.ValueTypeNames.Color3f).Set(
+                Gf.Vec3f(transmittance_rgb[0], transmittance_rgb[1], transmittance_rgb[2])
+            )
+            shader_prim.CreateAttribute('inputs:transmittance_measurement_distance',
+                                        Sdf.ValueTypeNames.Float).Set(measurement_distance)
+
         if enable_emission:
             shader_prim.CreateAttribute("inputs:enable_emission", Sdf.ValueTypeNames.Bool).Set(True)
             if emissive_rel_path:

@@ -224,7 +224,7 @@ class TestNormalImportEncoding(unittest.TestCase):
                 self.assertEqual(len([node for node in nodes if node.type == 'NORMAL_MAP']), 1)
                 self.assertEqual(len([node for node in nodes if node.type == 'SEPARATE_COLOR']), 1)
                 self.assertEqual(len([node for node in nodes if node.type == 'COMBINE_COLOR']), 1)
-                self.assertIs(find_normal_texture_node(normal), texture)
+                self.assertEqual(find_normal_texture_node(normal).as_pointer(), texture.as_pointer())
                 self.assertEqual(normal.inputs['Color'].links[0].from_node.inputs['Blue'].default_value, 1.0)
 
                 # Updating the same mod material reuses every node and changes only the image.

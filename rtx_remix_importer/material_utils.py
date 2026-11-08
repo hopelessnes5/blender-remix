@@ -501,6 +501,14 @@ def process_pbr(shader, bl_material, shader_node, usd_file_path_context):
             if explicit_intensity is None and not emission.inputs['Strength'].is_linked:
                 emission.inputs['Strength'].default_value = 40.0  # MDL default
 
+        from .glass_nodes import ensure_volume_absorption
+        t_color = get_input_value(shader, 'inputs:transmittance_color')
+        t_distance = get_input_value(shader, 'inputs:transmittance_measurement_distance')
+        if t_color is not None:
+            # The MDL material_volume is absorption-only:
+            # sigma = -ln(transmittance_color) / measurement_distance.
+            ensure_volume_absorption(bl_material, t_color, t_distance)
+
     # --- Opacity / Alpha Handling ---
     # UsdPreviewSurface-like 'inputs:opacity' / opacity textures also land on
     # Principled's Alpha socket for AperturePBR_Opacity materials.

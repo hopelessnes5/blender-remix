@@ -551,6 +551,14 @@ def process_mod_pbr_util(shader_prim_instance, bl_mat_instance, main_shader_node
                     bl_mat_instance[prop_name] = float(val)
                 report_fn({'INFO'}, f"  Stored {prop_label} = {val} as custom property '{prop_name}'")
                 break
+    if is_translucent and main_shader_node_instance.type == 'BSDF_GLASS':
+        from .glass_nodes import ensure_volume_absorption
+        t_color = _get_mod_value(shader_prim_instance, 'transmittance_color')
+        t_distance = _get_mod_value(shader_prim_instance, 'transmittance_measurement_distance')
+        if t_color is not None:
+            # MDL material_volume: absorption-only with
+            # sigma = -ln(transmittance_color) / measurement_distance.
+            ensure_volume_absorption(bl_mat_instance, t_color, t_distance)
     # FIX: same class of bug fixed earlier in material_utils.py (capture import) -
     # this was connecting Albedo's alpha to Opacity based purely on pixel-variance
     # (has_meaningful_alpha), ignoring the material's actual enable_opacity flag
