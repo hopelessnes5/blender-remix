@@ -821,6 +821,73 @@ def create_mod_material_nodes_util(material_usd_path_str, current_mod_stage,
 
     return bl_mat, main_node
 
+def _apply_instance_metadata_to_glass(bl_mat, instance_metadata, report_fn):
+    """Per-instance ``_remix_metadata`` overrides for a glass-based material.
+
+    The Principled metadata map targets sockets a Glass graph does not have,
+    so instance overrides on translucent materials hit the no-Principled
+    warning and were dropped. Here the MDL inputs map to their Blender
+    counterparts: ``transmittance_color`` is the Glass tint and re-densifies
+    the labeled absorption volume at the (explicit or stored) measurement
+    distance, while thin-wall scalars stay custom properties. Unknown or
+    broken graphs report and are skipped, never silently. Returns True when
+    something applied.
+    """
+    if not bl_mat or not bl_mat.node_tree:
+        report_fn({'WARNING'}, f'  Glass metadata override skipped: "{bl_mat.name}" has no node tree')
+        return False
+    from .glass_nodes import ensure_volume_absorption, glass_node
+    scalar_props = {
+        'thin_walled': 'rtx_thin_walled',
+        'thin_wall_thickness': 'rtx_thin_wall_thickness',
+        'transmittance_measurement_distance': 'rtx_transmittance_measurement_distance',
+    }
+    applied = False
+    distance = None
+    color_value = None
+    for key, value in instance_metadata.items():
+        prop_name = scalar_props.get(key)
+        if prop_name is not None:
+            if not isinstance(value, (int, float, bool)):
+                report_fn({'WARNING'}, f"Metadata key '{key}' is not scalar ({type(value).__name__}) for mat '{bl_mat.name}'; skipped.")
+                continue
+            bl_mat[prop_name] = bool(value) if isinstance(value, bool) else float(value)
+            if key == 'transmittance_measurement_distance':
+                distance = float(value)
+            applied = True
+            report_fn({'INFO'}, f"  Applied metadata: Mat '{bl_mat.name}', Property '{prop_name}' = {bl_mat[prop_name]} (from {key})")
+        elif key == 'transmittance_color':
+            color_value = value
+
+    if distance is None:
+        stored_distance = bl_mat.get('rtx_transmittance_measurement_distance')
+        if isinstance(stored_distance, (int, float)) and stored_distance > 0:
+            distance = float(stored_distance)
+
+    glass = glass_node(bl_mat)
+    if glass is None:
+        if color_value is not None:
+            report_fn({'WARNING'}, f"Metadata key 'transmittance_color' has no Glass BSDF in mat '{bl_mat.name}'; skipped.")
+        return applied
+
+    if color_value is not None:
+        if isinstance(color_value, (Gf.Vec3f, Gf.Vec4f, tuple, list)) and len(color_value) >= 3:
+            tint = (float(color_value[0]), float(color_value[1]), float(color_value[2]), 1.0)
+            glass.inputs['Color'].default_value = tint
+            ensure_volume_absorption(bl_mat, tint, distance)
+            applied = True
+            report_fn({'INFO'}, f"  Applied metadata: Mat '{bl_mat.name}', Glass Color = {tint} (from transmittance_color)")
+        else:
+            report_fn({'WARNING'}, f"Metadata key 'transmittance_color' has unsupported shape ({type(color_value).__name__}) for mat '{bl_mat.name}'; skipped.")
+    elif distance is not None:
+        # Distance-only override: MDL keeps the transmittance tint and
+        # recomputes sigma at the new distance, so re-densify the volume
+        # from the current tint when it is a plain value.
+        tint_socket = glass.inputs.get('Color')
+        if tint_socket is not None and not tint_socket.is_linked:
+            ensure_volume_absorption(bl_mat, tint_socket.default_value, distance)
+    return applied
+
 def get_or_create_mod_instance_material_util(base_material_usd_path, instance_prim_for_metadata, current_mod_stage,
                                              texture_res_context_path_p, mod_file_path_for_tex_p,
                                              mod_base_material_node_cache_param, # Specific cache for (mat, node) tuples
@@ -833,7 +900,13 @@ def get_or_create_mod_instance_material_util(base_material_usd_path, instance_pr
         if over_mesh_in_mod:
             for prop in over_mesh_in_mod.GetAuthoredPropertiesInNamespace("primvars:_remix_metadata"):
                 instance_metadata[prop.GetBaseName()] = prop.Get()
-    meta_hash = hashlib.md5(json.dumps(instance_metadata, sort_keys=True).encode('utf-8')).hexdigest()[:8] if instance_metadata else ""
+    # Per-instance metadata can carry Gf color vectors that plain json.dumps
+    # rejects; the cache key needs any deterministic serialization, so coerce
+    # exotic values (colors, tuples) to lists instead of crashing.
+    def _metadata_dump(metadata):
+        return json.dumps(metadata, sort_keys=True, default=lambda value: (
+            list(value) if hasattr(value, '__len__') and not isinstance(value, (str, bytes)) else str(value)))
+    meta_hash = hashlib.md5(_metadata_dump(instance_metadata).encode('utf-8')).hexdigest()[:8] if instance_metadata else ""
     unique_key = f"{base_material_usd_path}_{meta_hash}" if meta_hash else base_material_usd_path
     if unique_key in local_material_cache_param: return local_material_cache_param[unique_key]
 
@@ -952,7 +1025,8 @@ def get_or_create_mod_instance_material_util(base_material_usd_path, instance_pr
             if applied_any_metadata:
                  pass # Already reported per-socket change
         else:
-            report_fn({'WARNING'}, f"Could not find a Principled BSDF shader node in mat '{final_bl_material.name}' to apply metadata.")
+            if not _apply_instance_metadata_to_glass(final_bl_material, instance_metadata, report_fn):
+                report_fn({'WARNING'}, f"Instance metadata for mat '{final_bl_material.name}' applied nothing; no supporting Principled or Glass node.")
         # report_fn({'DEBUG'}, f"Material '{final_bl_material.name}' for instance with metadata.") # This was the old line, replaced by per-socket logs
 
     local_material_cache_param[unique_key] = final_bl_material

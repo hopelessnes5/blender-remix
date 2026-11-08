@@ -287,5 +287,143 @@ class GlassVolumeTests(unittest.TestCase):
         self.assertEqual(sum(n.type == 'VOLUME_ABSORPTION' for n in mat.node_tree.nodes), 0)
 
 
+class GlassInstanceOverrideTests(unittest.TestCase):
+    """Per-instance ``_remix_metadata`` overrides on glass-based materials.
+
+    The Principled metadata map has no Glass sockets; instance overrides must
+    land on the Glass tint and the labeled absorption volume instead of being
+    dropped with a warning.
+    """
+
+    def setUp(self):
+        self.stage = Usd.Stage.CreateInMemory()
+        UsdShade.Material.Define(self.stage, '/Material')
+        self.materials_to_remove = []
+        # Drop override copies leaked by earlier runs/cases, immediately: the
+        # mod pipeline reuses exact 'Material_mod_override' names by
+        # bpy.data lookup and a stale copy would poison the assertions.
+        for leftover in [m for m in bpy.data.materials if m.name.startswith('Material_mod_override')]:
+            bpy.data.materials.remove(leftover, do_unlink=True)
+
+    def tearDown(self):
+        for mat in self.materials_to_remove:
+            if mat.name in bpy.data.materials:
+                bpy.data.materials.remove(mat, do_unlink=True)
+
+    def glass_material(self, name):
+        mat, node = material_utils.create_translucent_blender_material(name)
+        self.materials_to_remove.append(mat)
+        return mat, node
+
+    def instance_prim(self, metadata):
+        self.stage.DefinePrim('/Inst', 'Xform')
+        mesh = self.stage.DefinePrim('/Inst/mesh', 'Mesh')
+        for key, typename, value in metadata:
+            mesh.CreateAttribute(f'primvars:_remix_metadata:{key}', typename).Set(value)
+        return self.stage.GetPrimAtPath('/Inst')
+
+    def reports(self):
+        # Real report levels arrive as sets ({'WARNING'}), normalize to booleans.
+        box = []
+
+        def report(level, message):
+            box.append(('WARNING' in level, message))
+        return box, report
+
+    def override(self, glass_mat, metadata, report):
+        final = mod_apply_utils.get_or_create_mod_instance_material_util(
+            '/Material', self.instance_prim(metadata), self.stage, '', '',
+            {}, {}, report, glass_mat)
+        if final is not None:
+            self.materials_to_remove.append(final)
+        return final
+
+    def labeled_volume(self, mat):
+        return next((n for n in mat.node_tree.nodes
+                     if n.type == 'VOLUME_ABSORPTION' and
+                     n.label == 'RTX Remix Translucent Volume Absorption'), None)
+
+    def test_transmittance_and_distance_reach_glass(self):
+        base, glass = self.glass_material('RemixInstanceOverride')
+        final = self.override(base, [
+            ('transmittance_color', Sdf.ValueTypeNames.Color3f, Gf.Vec3f(.1, .2, .4)),
+            ('transmittance_measurement_distance', Sdf.ValueTypeNames.Float, 2.0),
+        ], self.reports()[1])
+        self.assertTrue(final.name.startswith('Material_mod_override'))
+        self.assertIsNot(final, base)
+        final_glass = next(n for n in final.node_tree.nodes if n.type == 'BSDF_GLASS')
+        self.assertAlmostEqual(final_glass.inputs['Color'].default_value[1], .2)
+        self.assertAlmostEqual(final_glass.inputs['Color'].default_value[3], 1.0)
+        self.assertEqual(final['rtx_transmittance_measurement_distance'], 2.0)
+        volume = self.labeled_volume(final)
+        self.assertIsNotNone(volume)
+        sigma = [-math.log(c) / 2.0 for c in (.1, .2, .4)]
+        self.assertAlmostEqual(volume.inputs['Density'].default_value, max(1.0, max(sigma)), places=5)
+        for channel in range(3):
+            self.assertAlmostEqual(volume.inputs['Color'].default_value[channel],
+                                   1.0 - sigma[channel] / max(1.0, max(sigma)), places=5)
+        rgb, note = volume_transmittance(final, 2.0)
+        self.assertIsNone(note)
+        for channel, expected in enumerate((.1, .2, .4)):
+            self.assertAlmostEqual(rgb[channel], expected, places=4)
+        self.assertAlmostEqual(next(n for n in base.node_tree.nodes if n.type == 'BSDF_GLASS')
+                              .inputs['Color'].default_value[0], 0.97)
+
+    def test_distance_only_redensifies_volume(self):
+        base, glass = self.glass_material('RemixInstanceDistance')
+        glass.inputs['Color'].default_value = (.5, .5, .5, 1)
+        final = self.override(base, [
+            ('transmittance_measurement_distance', Sdf.ValueTypeNames.Float, 3.0),
+        ], self.reports()[1])
+        self.assertEqual(final['rtx_transmittance_measurement_distance'], 3.0)
+        final_glass = next(n for n in final.node_tree.nodes if n.type == 'BSDF_GLASS')
+        self.assertAlmostEqual(final_glass.inputs['Color'].default_value[0], .5)
+        volume = self.labeled_volume(final)
+        sigma = -math.log(.5) / 3.0
+        self.assertAlmostEqual(volume.inputs['Density'].default_value, 1.0)
+        self.assertAlmostEqual(volume.inputs['Color'].default_value[0], 1.0 - sigma, places=5)
+        rgb, note = volume_transmittance(final, 3.0)
+        self.assertIsNone(note)
+        self.assertAlmostEqual(rgb[0], .5, places=4)
+
+    def test_thin_wall_scalars_stay_properties(self):
+        base, glass = self.glass_material('RemixInstanceThinWall')
+        defaults = tuple(self.labeled_volume(base).inputs['Color'].default_value)
+        final = self.override(base, [
+            ('thin_walled', Sdf.ValueTypeNames.Bool, True),
+            ('thin_wall_thickness', Sdf.ValueTypeNames.Float, .5),
+        ], self.reports()[1])
+        self.assertTrue(final['rtx_thin_walled'])
+        self.assertAlmostEqual(final['rtx_thin_wall_thickness'], .5)
+        final_glass = next(n for n in final.node_tree.nodes if n.type == 'BSDF_GLASS')
+        self.assertAlmostEqual(final_glass.inputs['Color'].default_value[0], 0.97)
+        self.assertEqual(tuple(self.labeled_volume(final).inputs['Color'].default_value), defaults)
+
+    def test_bad_shapes_report_and_change_nothing(self):
+        base, glass = self.glass_material('RemixInstanceBadShape')
+        box, report = self.reports()
+        final = self.override(base, [
+            ('transmittance_measurement_distance', Sdf.ValueTypeNames.String, 'fast'),
+            ('transmittance_color', Sdf.ValueTypeNames.Float, .5),
+        ], report)
+        warnings = [message for is_warning, message in box if is_warning]
+        self.assertIn('transmittance_measurement_distance', ''.join(warn for warn in warnings if 'is not scalar' in warn))
+        self.assertIn('transmittance_color', ''.join(warn for warn in warnings if 'unsupported shape' in warn))
+        self.assertEqual(len([warn for warn in warnings if 'applied nothing' in warn]), 1)
+        self.assertNotIn('rtx_transmittance_measurement_distance', final.keys())
+        final_glass = next(n for n in final.node_tree.nodes if n.type == 'BSDF_GLASS')
+        self.assertAlmostEqual(final_glass.inputs['Color'].default_value[0], 0.97)
+
+    def test_unknown_keys_change_nothing_and_warn(self):
+        base, glass = self.glass_material('RemixInstanceUnknown')
+        box, report = self.reports()
+        self.override(base, [
+            ('some_unknown_key', Sdf.ValueTypeNames.Float, 3.0),
+        ], report)
+        self.assertAlmostEqual(glass.inputs['Color'].default_value[0], 0.97)
+        applied_nothing = [message for _, message in box if 'applied nothing' in message]
+        self.assertEqual(len(applied_nothing), 1)
+
+
 if __name__ == '__main__':
     unittest.main()
