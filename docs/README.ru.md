@@ -12,11 +12,13 @@
 
 ## Статус
 
-[![Паритет с Toolkit: 38%](badge-parity.svg)](PARITY.ru.md) [![Тесты: 330/330](badge-tests.svg)](PARITY.ru.md#тесты)
+Подробности по шагам: [что делает плагин](PLUGIN_PIPELINE.ru.md), [замена меша в Toolkit](TOOLKIT_REPLACEMENT_PIPELINE.ru.md).
+
+[![Паритет с Toolkit: 38%](badge-parity.svg)](PARITY.ru.md)
 
 [![Карта паритета возможностей](progress.svg)](PARITY.ru.md)
 
-17 из 45 отслеживаемых функций Toolkit реализованы полностью, 13 — частично. Снимок: 4 ноября 2026. Проверено на Blender 4.5.5 LTS и 5.1.2: 330/330 тестов. Подробные таблицы и непроверенные пункты: [docs/PARITY.ru.md](PARITY.ru.md).
+17 из 45 отслеживаемых функций Toolkit реализованы полностью, 13 — частично. Снимок: 4 ноября 2026. Проверено вручную в Blender 4.5.5 LTS и 5.1.2; автоматический набор тестов удалён по решению пользователя. Подробные таблицы и непроверенные пункты: [docs/PARITY.ru.md](PARITY.ru.md).
 
 ## Как это работает
 
@@ -77,5 +79,5 @@
 <!-- BEGIN 2026-11-06 MOD-LOADING WAVE -->
 ## Изменения 6 ноября 2026: переработка Apply Mod
 
-Полный набор — 375 тестов, 375 пройдено в Blender 4.5.5 LTS и 5.1.2. Вошло: выборочный Apply по capture-хэшам, общий `Light`/`Mesh` datablock для одинаковых prototype-светов, графики нормалей (octahedral/DirectX → Separate (R,G) + Combine (B=1) → Normal Map) и стекла (Glass BSDF), классификатор семьи шейдера (`material_family.py`), защита UV/видимости при light-only замене, SUN для `sky_<HASH>` без capture-экземпляров, температура света — нативная Blender. Текущий статус и границы: [AUDIT_CURRENT.ru.md](AUDIT_CURRENT.ru.md); практика: у нод Blender нет стабильной питоновской identity — сравнение через `as_pointer()`.
+Проверено вручную в Blender 4.5.5 LTS и 5.1.2; автоматический набор удалён по решению пользователя. Вошло: выборочный Apply по capture-хэшам, общий `Light`/`Mesh` datablock для одинаковых prototype-светов, графики нормалей (octahedral/DirectX → Separate (R,G) + Combine (B=1) → Normal Map) и стекла (Glass BSDF), классификатор семьи шейдера (`material_family.py`), защита UV/видимости при light-only замене, SUN для `sky_<HASH>` без capture-экземпляров, температура света — нативная Blender. Текущий статус и границы: [AUDIT_CURRENT.ru.md](AUDIT_CURRENT.ru.md); практика: у нод Blender нет стабильной питоновской identity — сравнение через `as_pointer()`.
 <!-- END 2026-11-06 MOD-LOADING WAVE -->

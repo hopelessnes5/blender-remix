@@ -12,11 +12,13 @@ Not affiliated with NVIDIA. RTX Remix, the RTX Remix Toolkit and AperturePBR mat
 
 ## Status
 
-[![Toolkit parity: 38%](docs/badge-parity.svg)](docs/PARITY.md) [![Tests: 330/330](docs/badge-tests.svg)](docs/PARITY.md#tests)
+Step-by-step details: [what the plugin does](docs/PLUGIN_PIPELINE.ru.md), [mesh replacement in Toolkit](docs/TOOLKIT_REPLACEMENT_PIPELINE.ru.md).
+
+[![Toolkit parity: 38%](docs/badge-parity.svg)](docs/PARITY.md)
 
 [![Feature parity progress map](docs/progress.svg)](docs/PARITY.md)
 
-17 of 45 tracked Toolkit features are fully implemented, 13 are partial. Snapshot: 4 November 2026. Tested on Blender 4.5.5 LTS and 5.1.2, 330/330 tests. Full tables and unverified items: [docs/PARITY.md](docs/PARITY.md).
+17 of 45 tracked Toolkit features are fully implemented, 13 are partial. Snapshot: 4 November 2026. Verified manually in Blender 4.5.5 LTS and 5.1.2; the automatic test suite was removed at the user's request. Full tables and unverified items: [docs/PARITY.md](docs/PARITY.md).
 
 ## How it works
 
@@ -77,5 +79,5 @@ Version 0.5.
 <!-- BEGIN 2026-11-06 MOD-LOADING WAVE -->
 ## 6 November 2026: Apply Mod overhaul
 
-Full suite — 375 tests, 375 passed in Blender 4.5.5 LTS and 5.1.2. Highlights: hash-scoped selective Apply, shared `Light`/`Mesh` datablocks for identical prototype lights with per-instance placement, normal graph (octahedral/DirectX → Separate (R,G) + Combine (B=1) → Normal Map), Glass BSDF for genuine translucent materials, shader family classifier (`material_family.py`), UV/visibility protection on light-only prototype resets, a standalone SUN for `sky_<HASH>` meshes without capture instances, and Blender-native light temperature. Current status and remaining limits: [AUDIT_CURRENT.ru.md](docs/AUDIT_CURRENT.ru.md). Practical note: Blender node wrappers carry no stable Python identity — compare nodes via `as_pointer()`.
+Verified manually in Blender 4.5.5 LTS and 5.1.2; the automatic suite was removed at the user's request. Highlights: hash-scoped selective Apply, shared `Light`/`Mesh` datablocks for identical prototype lights with per-instance placement, normal graph (octahedral/DirectX → Separate (R,G) + Combine (B=1) → Normal Map), Glass BSDF for genuine translucent materials, shader family classifier (`material_family.py`), UV/visibility protection on light-only prototype resets, a standalone SUN for `sky_<HASH>` meshes without capture instances, and Blender-native light temperature. Current status and remaining limits: [AUDIT_CURRENT.ru.md](docs/AUDIT_CURRENT.ru.md). Practical note: Blender node wrappers carry no stable Python identity — compare nodes via `as_pointer()`.
 <!-- END 2026-11-06 MOD-LOADING WAVE -->
