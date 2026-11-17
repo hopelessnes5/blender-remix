@@ -705,8 +705,8 @@ def register_properties():
     # Add property to control automatic transform application
     bpy.types.Scene.remix_auto_apply_transforms = bpy.props.BoolProperty(
         name="Auto Apply Transforms",
-        description="Automatically apply all transforms (location, rotation, and scale) before exporting meshes (fixes coordinate issues in-game and results in clean identity transforms)",
-        default=True,
+        description="Bake object rotation and scale into mesh data before export. Off by default: imported capture objects carry a Y-up to Z-up rotation that must stay on the object",
+        default=False,
     )
     
     # Add property to control texture reuse optimization

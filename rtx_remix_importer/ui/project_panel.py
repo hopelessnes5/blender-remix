@@ -214,9 +214,8 @@ class PT_RemixProjectPanel(bpy.types.Panel):
             row_transform = box_export_settings.row()
             row_transform.prop(scene, "remix_auto_apply_transforms")
             box_export_settings.prop(scene, "remix_normal_export_encoding")
-            # Inherit the captured mesh's material by default (Toolkit
-            # replacement meshes carry no binding of their own).
-            box_export_settings.prop(scene, "remix_inherit_parent_material")
+            row_inherit = box_export_settings.row()
+            row_inherit.prop(scene, "remix_inherit_parent_material")
             # Add Hide Original Mesh option
             row_hide_original = box_export_settings.row()
             row_hide_original.prop(scene, "remix_hide_original_mesh")

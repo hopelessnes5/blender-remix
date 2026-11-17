@@ -298,27 +298,125 @@ def resolve_replacement_target(context, obj, anchor_obj=None):
     """
     game_stage = get_game_stage(context)
     candidates = []
-    if anchor_obj is not None:
-        candidates.append(("target mesh", resolve_anchor_prim_path(anchor_obj)))
-    if obj is not None:
-        candidates.append(("object", resolve_anchor_prim_path(obj)))
+    for source_obj in (anchor_obj, obj):
+        if source_obj is None:
+            continue
+        for key in ('usd_prim_path', 'usd_instance_path', 'usd_path', 'usd_prototype_path'):
+            raw = source_obj.get(key, None)
+            if raw:
+                candidates.append((key, resolve_anchor_prim_path_from_raw(raw)))
+    if obj is not None and obj.type == 'MESH' and obj.data:
+        mesh_hash = obj.data.get('remix_mesh_hash', None)
+        if mesh_hash:
+            candidates.append(('mesh data', str(mesh_hash)))
 
+    fallback_path = None
     for source, raw_path in candidates:
         mesh_path = remix_mesh_prim_path(raw_path)
         if not mesh_path:
             continue
-        if game_stage is not None and not game_stage.GetPrimAtPath(mesh_path):
-            print("  %s prim %s is not part of the loaded mod - skipping" % (source, mesh_path))
-            continue
-        instance_world = None
-        if obj is not None:
-            instance_path = obj.get("usd_instance_path")
-            if instance_path:
-                instance_world = get_prim_world_matrix(game_stage, instance_path)
-        print("  Using %s prim %s as the replacement target" % (source, mesh_path))
-        return game_stage, mesh_path, instance_world
+        if game_stage is not None and game_stage.GetPrimAtPath(mesh_path):
+            return _target_result(game_stage, obj, mesh_path, source)
+        # The object can come from a different capture than the one currently
+        # composed in the game stage. Its hash still names the prim the mod
+        # must override: keep it as a fallback instead of creating a new mesh.
+        if fallback_path is None:
+            fallback_path = (mesh_path, source)
+            print("  %s prim %s is not in the loaded stage - will author an over in the mod layer" % (source, mesh_path))
+
+    # The object may already carry the hash of a previously exported new mesh.
+    # Find the capture prim whose ref_ child references that asset and replace
+    # the same original mesh instead of stacking another new mesh on top.
+    if game_stage is not None and obj is not None:
+        asset_names = {f'{get_mesh_name_from_object(obj)}.usda'}
+        name_match = _REMIX_HASH_RE.match(obj.name or '')
+        if name_match:
+            asset_names.add(f'mesh_{name_match.group(1)}.usda')
+        for asset_name in asset_names:
+            for prim in game_stage.Traverse():
+                if not prim.GetName().startswith(REMIX_REF_PREFIX):
+                    continue
+                for spec in prim.GetPrimStack():
+                    for reference in spec.referenceList.GetAddedOrExplicitItems():
+                        if os.path.basename(reference.assetPath) != asset_name:
+                            continue
+                        parent = prim.GetParent()
+                        mesh_path = str(parent.GetPath()) if parent else None
+                        if mesh_path and remix_mesh_prim_path(mesh_path):
+                            print("  reference of %s belongs to %s - replacing that captured mesh" % (asset_name, mesh_path))
+                            return _target_result(game_stage, obj, mesh_path, 'existing reference')
+
+    if fallback_path is not None:
+        mesh_path, source = fallback_path
+        return _target_result(game_stage, obj, mesh_path, source)
 
     return game_stage, None, None
+
+
+def resolve_anchor_prim_path_from_raw(raw_path):
+    """Normalize a stored USD path to the prim carrying the mesh hash."""
+    if not raw_path or not isinstance(raw_path, str) or not raw_path.startswith('/'):
+        return None
+    path_parts = raw_path.split('/')
+    for i, part in enumerate(path_parts):
+        if part.startswith('mesh_'):
+            return '/'.join(path_parts[:i + 1])
+    return raw_path
+
+
+_CAPTURE_INSTANCE_CACHE = {}
+
+
+def captured_instance_world(instance_path):
+    """Instance transform from the capture files, not from the mod stage.
+
+    The mod stage usually has no capture sublayers, so the instance prim is
+    missing there. Reading its transform from the capture is required to
+    export mesh points in prototype-local space; otherwise the game applies
+    the instance transform a second time and the replacement appears far
+    away from the original mesh.
+    """
+    if not instance_path:
+        return None
+    key = os.path.normcase(str(instance_path))
+    if key in _CAPTURE_INSTANCE_CACHE:
+        return _CAPTURE_INSTANCE_CACHE[key]
+    folder = ""
+    try:
+        folder = bpy.path.abspath(bpy.context.scene.get('remix_capture_folder_path', '') or '')
+    except Exception:
+        pass
+    result = None
+    if folder and os.path.isdir(folder):
+        for name in sorted(os.listdir(folder)):
+            if not name.lower().endswith(('.usd', '.usda')):
+                continue
+            try:
+                stage = Usd.Stage.Open(os.path.join(folder, name))
+            except Exception:
+                continue
+            if not stage:
+                continue
+            prim = stage.GetPrimAtPath(instance_path)
+            if prim and prim.IsValid():
+                result = UsdGeom.XformCache().GetLocalToWorldTransform(prim)
+                break
+    _CAPTURE_INSTANCE_CACHE[key] = result
+    if result is None:
+        print("  WARNING: no capture transform for %s; mesh points keep world space" % instance_path)
+    return result
+
+
+def _target_result(game_stage, obj, mesh_path, source):
+    instance_world = None
+    if obj is not None:
+        instance_path = obj.get("usd_instance_path")
+        if instance_path:
+            instance_world = get_prim_world_matrix(game_stage, instance_path)
+            if instance_world is None:
+                instance_world = captured_instance_world(instance_path)
+    print("  Using %s prim %s as the replacement target" % (source, mesh_path))
+    return game_stage, mesh_path, instance_world
 
 
 def _remove_prim_spec(layer, prim_path):
@@ -382,7 +480,9 @@ def _reuse_or_create_ref_holder(stage, mesh_path, edit_layer):
     holder_path = mesh_path.AppendPath(remix_new_ref_name())
     while stage.GetPrimAtPath(holder_path):
         holder_path = mesh_path.AppendPath(remix_new_ref_name())
-    stage.DefinePrim(holder_path, "Xform")
+    holder_spec = Sdf.CreatePrimInLayer(edit_layer, holder_path)
+    holder_spec.specifier = Sdf.SpecifierDef
+    holder_spec.typeName = 'Xform'
     return holder_path
 
 
@@ -410,6 +510,19 @@ def author_mesh_replacement(stage, mesh_prim_path, asset_rel_path, report_fn=pri
     Returns the holder prim path, or None on failure.
     """
     mesh_path = Sdf.Path(mesh_prim_path)
+    edit_layer = stage.GetEditTarget().GetLayer()
+    # Earlier exports could leave a `def Xform mesh_HASH` in this layer: that
+    # defines a new mesh instead of overriding the capture. Replace that spec
+    # with a plain `over`, exactly like the Toolkit's replacements.usda.
+    mesh_spec = edit_layer.GetPrimAtPath(mesh_path)
+    if mesh_spec is None:
+        mesh_spec = Sdf.CreatePrimInLayer(edit_layer, mesh_path)
+    if mesh_spec.specifier != Sdf.SpecifierOver:
+        mesh_spec.specifier = Sdf.SpecifierOver
+    mesh_spec.typeName = ''
+    mesh_spec.ClearKind()
+    for property_spec in list(mesh_spec.properties.values()):
+        mesh_spec.RemoveProperty(property_spec)
     over_prim = stage.OverridePrim(mesh_path)
     if not over_prim:
         report_fn({'ERROR'}, "Failed to override mesh prim %s" % mesh_path)
@@ -622,10 +735,15 @@ def _write_ingested_mesh_asset_impl(stage, obj, context, mesh_name_sanitized, po
     ref_target_prim = UsdGeom.Xform.Define(stage, ref_target_path).GetPrim()
     Usd.ModelAPI(ref_target_prim).SetKind("group")
     set_identity_remix_xform(ref_target_prim)
+    # The capture prim is authored `visibility = invisible`; without an
+    # explicit inherited opinion the replacement stays invisible (Toolkit
+    # capture assets set this on both the root Xform and the Mesh).
+    UsdGeom.Imageable(ref_target_prim).CreateVisibilityAttr().Set(UsdGeom.Tokens.inherited)
 
     xforms_prim = UsdGeom.Xform.Define(stage, xforms_path).GetPrim()
     Usd.ModelAPI(xforms_prim).SetKind("group")
     set_identity_remix_xform(xforms_prim)
+    UsdGeom.Imageable(xforms_prim).CreateVisibilityAttr().Set(UsdGeom.Tokens.inherited)
 
     stage.DefinePrim(looks_path, "Scope")
 
@@ -679,6 +797,8 @@ def _write_ingested_mesh_asset_impl(stage, obj, context, mesh_name_sanitized, po
             mesh_api.CreateOrientationAttr().Set(UsdGeom.Tokens.rightHanded)
             mesh_api.CreateDoubleSidedAttr().Set(False)
             mesh_api.CreateSubdivisionSchemeAttr().Set(UsdGeom.Tokens.none)
+            mesh_api.CreateVisibilityAttr().Set(UsdGeom.Tokens.inherited)
+            mesh_prim.CreateAttribute('no_delete', Sdf.ValueTypeNames.Bool, custom=True).Set(True)
             mesh_api.CreateExtentAttr().Set(Vt.Vec3fArray([Gf.Vec3f(*[min(p[a] for p in points) for a in range(3)]), Gf.Vec3f(*[max(p[a] for p in points) for a in range(3)])]))
             loops = [index for poly in polygons for index in poly.loop_indices]
             if mesh_data.uv_layers and mesh_data.uv_layers.active:
@@ -1703,10 +1823,15 @@ def _preflight_texture_destinations(context, selected_objects, project_root, tar
     for obj in selected_objects:
         if obj.type not in ('MESH', 'LIGHT') or (material_replacement_mode and obj.type != 'MESH'):
             continue
-        if obj.type == 'MESH' and not material_replacement_mode and getattr(context.scene, 'remix_inherit_parent_material', False):
+        # Inherit Parent Material skips mesh material/texture work; the
+        # separate material replacement mode always checks its materials.
+        if (obj.type == 'MESH' and not material_replacement_mode
+                and getattr(context.scene, 'remix_inherit_parent_material', True)):
             continue
-        if obj.type == 'MESH' and not material_replacement_mode:
+        if obj.type == 'MESH':
             materials = _used_mesh_materials(obj, context)
+            if not materials and obj.material_slots:
+                materials = [obj.material_slots[0].material]
         else:
             materials = [obj.material_slots[0].material] if obj.material_slots else []
         for material in materials:
@@ -1940,149 +2065,14 @@ class ExportRemixAsset(Operator):
             return None
 
     def export_mesh(self, context, obj, sublayer_stage, project_root, target_sublayer_path):
-        print(f"\n--- Exporting Mesh: {obj.name} ---")
-        remix_export_scale = context.scene.remix_export_scale or 1.0
-        anchor_obj = context.scene.remix_anchor_object_target
-        hide_original = getattr(context.scene, "remix_hide_original_mesh", True)
-        inherit_material = getattr(context.scene, "remix_inherit_parent_material", False)
-
-        if obj.type == 'MESH' and context.scene.remix_auto_apply_transforms:
-            original_selection = context.selected_objects[:]
-            original_active = context.view_layer.objects.active
-
-            try:
-                bpy.ops.object.select_all(action='DESELECT')
-                obj.select_set(True)
-                context.view_layer.objects.active = obj
-
-                needs_rotation_apply = any(abs(r) > 0.001 for r in obj.rotation_euler) or \
-                                     any(abs(r) > 0.001 for r in obj.rotation_quaternion[1:]) or \
-                                     abs(obj.rotation_quaternion[0] - 1.0) > 0.001
-                needs_scale_apply = any(abs(s - 1.0) > 0.001 for s in obj.scale)
-
-                if needs_rotation_apply or needs_scale_apply:
-                    if obj.data.users > 1:
-                        obj.data = obj.data.copy()
-
-                    bpy.ops.object.transform_apply(location=False, rotation=True, scale=True)
-
-                    if "remix_processed" in obj:
-                        del obj["remix_processed"]
-            except Exception as e:
-                print(f"  WARNING: Failed to apply rotation/scale: {e}")
-            finally:
-                bpy.ops.object.select_all(action='DESELECT')
-                for selected_obj in original_selection:
-                    if selected_obj.name in bpy.data.objects:
-                        bpy.data.objects[selected_obj.name].select_set(True)
-                if original_active and original_active.name in bpy.data.objects:
-                    context.view_layer.objects.active = bpy.data.objects[original_active.name]
-
-        custom_mesh_dir = context.scene.remix_custom_mesh_dir or "assets/ingested"
-        custom_texture_dir = context.scene.remix_custom_texture_dir or "rtx-remix/textures"
-        ingested_dir = os.path.join(project_root, custom_mesh_dir)
-        textures_dir = os.path.join(project_root, custom_texture_dir)
-        os.makedirs(ingested_dir, exist_ok=True)
-        os.makedirs(textures_dir, exist_ok=True)
-
-        mesh_name_to_use = get_mesh_name_from_object(obj)
-        mesh_name_sanitized = sanitize_prim_name(mesh_name_to_use)
-        mesh_file_name = f"{mesh_name_sanitized}.usda"
-        mesh_file_path = os.path.normpath(os.path.join(ingested_dir, mesh_file_name))
-
-        bl_mat = None
-        if obj.material_slots and obj.material_slots[0].material:
-            bl_mat = obj.material_slots[0].material
-
-        # --- Which captured Remix mesh does this object replace? ---------------
-        game_stage, target_mesh_path, target_instance_world = resolve_replacement_target(
-            context, obj, anchor_obj
+        """Delegate to the Toolkit-aligned mesh exporter."""
+        from ..mesh_export import export_mesh as run_mesh_export
+        return run_mesh_export(
+            context, obj, sublayer_stage, project_root, target_sublayer_path,
+            game_stage=get_game_stage(context),
+            report=self.report,
+            export_material_fn=export_material,
         )
-        # A new Remix mesh has no captured parent whose material could be
-        # inherited; give it a real material even though inheritance is the
-        # default for replacements.
-        if not target_mesh_path:
-            inherit_material = False
-
-        # Geometry is authored in game units and, for a replacement, in the local
-        # space of the mesh prototype being replaced. The prototype is instanced,
-        # so its own space is the only one shared by every instance of it; the
-        # `ref_` holder then stays at identity.
-        points_matrix = mathutils.Matrix.Scale(1.0 / remix_export_scale, 4) @ obj.matrix_world
-        if target_instance_world is not None:
-            points_matrix = get_safe_matrix_inverse(target_instance_world) @ points_matrix
-
-        # --- Ingested mesh asset (geometry + material) -------------------------
-        mesh_stage = self.get_or_create_stage(mesh_file_path)
-        if not mesh_stage:
-            return False
-
-        up_axis = UsdGeom.GetStageUpAxis(game_stage) if game_stage else UsdGeom.Tokens.z
-        written = write_ingested_mesh_asset(
-            mesh_stage,
-            obj,
-            context,
-            mesh_name_sanitized,
-            points_matrix,
-            bl_mat,
-            inherit_material,
-            project_root,
-            mesh_file_path,
-            up_axis,
-            self.report,
-        )
-        if not written:
-            return False
-        asset_mesh_prim_path, material_path = written
-
-        obj["remix_processed"] = True
-        obj["remix_mesh_file_path"] = mesh_file_path
-        obj["remix_material_path"] = str(material_path) if material_path else ""
-
-        # --- Author the replacement in the target layer ------------------------
-        #
-        # Remix mesh replacement is two layer edits on the *captured* prim path
-        # (see lightspeed.trex.asset_replacements.core.shared.Setup.add_new_reference):
-        #
-        #   over "mesh_<HASH>" ( references = None )
-        #   {
-        #       def Xform "ref_<uuid4hex>" ( prepend references = @./assets/ingested/x.usda@ )
-        #       {
-        #           custom bool IsRemixRef = 1
-        #           <identity translate/rotateXYZ/scale + xformOpOrder>
-        #       }
-        #   }
-        #
-        # The holder is a child of the captured mesh prim, so it inherits every
-        # instance transform and needs no transform of its own.
-        relative_mesh_path = get_relative_path(target_sublayer_path, mesh_file_path)
-        if not relative_mesh_path.startswith(("./", "../")):
-            relative_mesh_path = "./" + relative_mesh_path
-
-        if target_mesh_path:
-            reference_path = author_mesh_replacement(
-                sublayer_stage,
-                target_mesh_path,
-                relative_mesh_path,
-                self.report,
-                hide_original=hide_original,
-            )
-            if not reference_path:
-                return False
-            obj["remix_reference_prim_path"] = str(reference_path)
-            print(f"  Replacement of {target_mesh_path} authored (asset: {asset_mesh_prim_path})")
-        else:
-            self.report(
-                {'WARNING'},
-                f"No Target Mesh selected - '{obj.name}' is added as a new Remix mesh and instanced.",
-            )
-            new_mesh_path = author_new_remix_mesh(sublayer_stage, relative_mesh_path, self.report)
-            if not new_mesh_path:
-                return False
-            obj["remix_mesh_prim_path"] = str(new_mesh_path)
-
-        print(f"--- Finished Exporting Mesh: {obj.name} ---")
-        return True
 
     def execute(self, context):
         selected_objects = context.selected_objects
@@ -2336,7 +2326,7 @@ def register():
     if not hasattr(bpy.types.Scene, "remix_inherit_parent_material"):
         bpy.types.Scene.remix_inherit_parent_material = bpy.props.BoolProperty(
             name="Inherit Parent Material",
-            description="Inherit the material from the original captured mesh instead of exporting a new one; the replacement mesh carries no material binding",
+            description="Take the material from the original captured mesh; uncheck to export a new material from Blender nodes with the mesh",
             default=True
         )
     for cls in classes:
