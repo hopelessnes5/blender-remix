@@ -1998,6 +1998,11 @@ class ExportRemixAsset(Operator):
         game_stage, target_mesh_path, target_instance_world = resolve_replacement_target(
             context, obj, anchor_obj
         )
+        # A new Remix mesh has no captured parent whose material could be
+        # inherited; give it a real material even though inheritance is the
+        # default for replacements.
+        if not target_mesh_path:
+            inherit_material = False
 
         # Geometry is authored in game units and, for a replacement, in the local
         # space of the mesh prototype being replaced. The prototype is instanced,
@@ -2331,8 +2336,8 @@ def register():
     if not hasattr(bpy.types.Scene, "remix_inherit_parent_material"):
         bpy.types.Scene.remix_inherit_parent_material = bpy.props.BoolProperty(
             name="Inherit Parent Material",
-            description="Inherit material from the target anchor mesh instead of exporting a new material",
-            default=False
+            description="Inherit the material from the original captured mesh instead of exporting a new one; the replacement mesh carries no material binding",
+            default=True
         )
     for cls in classes:
         bpy.utils.register_class(cls)
