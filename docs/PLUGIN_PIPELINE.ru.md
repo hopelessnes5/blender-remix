@@ -148,9 +148,11 @@
 
 ### 5.6 Свет и устаревший путь
 
-40. `export_operator.py:1592-1669` — типы света: POINT/SPOT → SphereLight, SUN → DistantLight, AREA → Rect/DiskLight; intensity делится на `1000*scale²`.
-41. `export_operator.py:1658-1809` — имя из `usd_light_path`, parent по якорю, проверка TRS до записи, атрибуты и transform, биндинг материала, сохранение `usd_light_path`.
-42. `export_utils.py:20-385, 389-874` — устаревшие `MDLManager`, `ShaderSetup`, `MaterialExporter`, `LightExporter`, `TextureExporter`; основной оператор их не вызывает, но `_export_material_textures()` (`:453-679`) дублирует отображения и volume-override.
+40. `export_operator.py:1592-1600` — `export_light()` делегирует в `light_export.export_light()`.
+41. `light_export.py:50-73` — уникальное имя на объект: stored `usd_light_path` переиспользуется, только если его не разделяют другие света сцены; иначе детерминированное `light_<16HEX>` из имени Blender-объекта. Это убирает слияние одинаковых копий в один prim.
+42. `light_export.py:76-87` — температура: `inputs:enableColorTemperature` (bool) и `inputs:colorTemperature` (float, K) из `use_temperature`/`temperature` Blender; при выключенном флаге пишется только `False`.
+43. `light_export.py:90-210` — типы POINT/SPOT/SUN/AREA, intensity, радиус/shaping, extent, parent по якорю или `/RootNode/remix_assets`, проверка TRS, transform, биндинг материала и сохранение слоя; каждый свет записывает свой `def <LightType>` prim.
+44. `export_utils.py:20-385, 389-874` — устаревшие `MDLManager`, `ShaderSetup`, `MaterialExporter`, `LightExporter`, `TextureExporter`; основной оператор их не вызывает, но `_export_material_textures()` (`:453-679`) дублирует отображения и volume-override.
 
 ---
 
