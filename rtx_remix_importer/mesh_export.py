@@ -200,16 +200,43 @@ def resolve_target(context, obj, game_stage):
 
 
 def asset_path_for(context, project_root, obj):
-    """Absolute path of the ingested asset for this object."""
-    name = obj.name
+    """Absolute path of the ingested asset for this object.
+
+    If multiple mesh objects resolve to the same base asset filename, disambiguate
+    with a deterministic suffix derived from the object name.
+    """
     instance_path = obj.get("usd_instance_path") or ""
     mesh_token = _mesh_hash(instance_path)
     if mesh_token:
-        name = f"mesh_{mesh_token}"
+        base_name = f"mesh_{mesh_token}"
     else:
-        name = re.sub(r"[^A-Za-z0-9_]", "_", name)
+        base_name = re.sub(r"[^A-Za-z0-9_]", "_", obj.name or "object")
+
+    # Count how many mesh objects in the scene resolve to the same base name.
+    collision_count = 0
+    try:
+        for o in bpy.data.objects:
+            if getattr(o, "type", None) != "MESH":
+                continue
+            o_inst = o.get("usd_instance_path") or ""
+            o_tok = _mesh_hash(o_inst)
+            if o_tok:
+                o_base = f"mesh_{o_tok}"
+            else:
+                o_base = re.sub(r"[^A-Za-z0-9_]", "_", o.name or "object")
+            if o_base == base_name:
+                collision_count += 1
+    except Exception:
+        collision_count = 1
+
+    final_name = base_name
+    if collision_count > 1:
+        # Deterministic across sessions: stable hash of object name.
+        suffix = uuid.uuid5(uuid.NAMESPACE_DNS, obj.name or "object").hex[:8]
+        final_name = f"{base_name}_{suffix}"
+
     folder = context.scene.get("remix_custom_mesh_dir", "") or "assets/ingested"
-    return os.path.normpath(os.path.join(project_root, folder, f"{name}.usda"))
+    return os.path.normpath(os.path.join(project_root, folder, f"{final_name}.usda"))
 
 
 def capture_display_primvars(context, game_stage, mesh_hash):
@@ -479,20 +506,26 @@ def _remove_spec(layer, path):
         del parent.nameChildren[Sdf.Path(path).name]
 
 
-def _holder_for(stage, mesh_path, edit_layer):
-    """Reuse the first Remix ref child, remove duplicates and stale XForms."""
-    spec = edit_layer.GetPrimAtPath(mesh_path)
-    existing = []
-    if spec is not None:
-        for child in spec.nameChildren:
-            if child.name.startswith("ref_"):
-                existing.append(child.path)
-            elif child.name == "XForms":
-                _remove_spec(edit_layer, child.path)
-    if existing:
-        for extra in existing[1:]:
-            _remove_spec(edit_layer, extra)
-        return str(existing[0])
+def _holder_for(stage, mesh_path, edit_layer, preferred_holder_path=None):
+    """Return a Remix ref holder under mesh_path.
+
+    If preferred_holder_path is provided and still exists under mesh_path as a
+    Remix ref (IsRemixRef=1), reuse it. Otherwise create a new ref_<uuid> child.
+    Never deletes other ref_* siblings or XForms.
+    """
+    if preferred_holder_path:
+        try:
+            ph = str(preferred_holder_path)
+            prim = stage.GetPrimAtPath(ph)
+            if prim and prim.IsValid():
+                # Must be a child of mesh_path
+                parent = prim.GetParent()
+                if parent and str(parent.GetPath()) == str(mesh_path):
+                    attr = prim.GetAttribute("IsRemixRef")
+                    if attr and attr.IsValid() and attr.Get() is True:
+                        return ph
+        except Exception:
+            pass
 
     holder_path = f"{mesh_path}/ref_{uuid.uuid4().hex}"
     holder_spec = Sdf.CreatePrimInLayer(edit_layer, Sdf.Path(holder_path))
@@ -501,12 +534,14 @@ def _holder_for(stage, mesh_path, edit_layer):
     return holder_path
 
 
-def author_reference(stage, mesh_path, asset_rel, hide_original, report):
+def author_reference(stage, mesh_path, asset_rel, hide_original, report, preferred_holder_path=None):
     """Author the Toolkit replacement shape in the mod layer.
 
     hide_original=True  -> over mesh_HASH (references = None) + ref child.
     hide_original=False -> over mesh_HASH (no mask) + ref child: the capture
     geometry stays and the new asset is appended.
+
+    If preferred_holder_path is given, only that holder is modified (reused if valid).
     """
     edit_layer = stage.GetEditTarget().GetLayer()
     write_guard.ensure_writable_layer(edit_layer)
@@ -536,7 +571,7 @@ def author_reference(stage, mesh_path, asset_rel, hide_original, report):
     mesh_prim = stage.GetPrimAtPath(mesh_path)
     _set_attr(mesh_prim, "visibility", Sdf.ValueTypeNames.Token, UsdGeom.Tokens.inherited)
 
-    holder_path = _holder_for(stage, mesh_path, edit_layer)
+    holder_path = _holder_for(stage, mesh_path, edit_layer, preferred_holder_path=preferred_holder_path)
     holder = stage.GetPrimAtPath(holder_path)
     _set_attr(holder, "IsRemixRef", Sdf.ValueTypeNames.Bool, True, custom=True)
     _identity_xform(holder)
@@ -579,8 +614,6 @@ def export_mesh(context, obj, sublayer_stage, project_root, target_sublayer_path
         return False
 
     scale = context.scene.remix_export_scale or 1.0
-    hide_original = getattr(context.scene, "remix_hide_original_mesh", True)
-    inherit_material = getattr(context.scene, "remix_inherit_parent_material", True)
     if getattr(context.scene, "remix_auto_apply_transforms", False):
         bake_transforms(obj)
 
@@ -589,13 +622,23 @@ def export_mesh(context, obj, sublayer_stage, project_root, target_sublayer_path
     if instance_world is not None:
         points_matrix = get_safe_matrix_inverse(instance_world) @ points_matrix
 
+    # Per-object binding rule overrides (fallback to scene defaults).
+    obj_inherit = obj.get(
+        "remix_inherit_parent_material",
+        getattr(context.scene, "remix_inherit_parent_material", True),
+    )
+    obj_hide = obj.get(
+        "remix_hide_original_mesh",
+        getattr(context.scene, "remix_hide_original_mesh", True),
+    )
+
     asset_path = asset_path_for(context, project_root, obj)
     asset_stage = Usd.Stage.Open(asset_path) if os.path.exists(asset_path) else Usd.Stage.CreateNew(asset_path)
     write_guard.ensure_writable_layer(asset_stage.GetRootLayer(), open_path=asset_path)
     up_axis = UsdGeom.GetStageUpAxis(game_stage) if game_stage else UsdGeom.Tokens.z
     written = write_asset(
         asset_stage, context, obj, points_matrix, up_axis, project_root,
-        target_sublayer_path, inherit_material, export_material_fn, report,
+        target_sublayer_path, obj_inherit, export_material_fn, report,
         game_stage=game_stage,
     )
     if written is None:
@@ -606,7 +649,34 @@ def export_mesh(context, obj, sublayer_stage, project_root, target_sublayer_path
     if not relative.startswith("."):
         relative = "./" + relative
     if mesh_path:
-        holder = author_reference(sublayer_stage, mesh_path, relative, hide_original, report)
+        # Mesh-prim-level hide_original is aggregated across all Blender objects
+        # assigned to this mesh_path: if ANY assigned object requests hide, the
+        # mesh prim authors references=None (replace capture); otherwise reference
+        # edits are cleared (append/keep capture). Recomputed from objects whose
+        # remix_reference_prim_path is under mesh_path on each authoring pass.
+        agg_hide = bool(obj_hide)
+        try:
+            mprefix = str(mesh_path) + "/"
+            for o in bpy.data.objects:
+                if o == obj:
+                    continue
+                if getattr(o, "type", None) != "MESH":
+                    continue
+                holderp = o.get("remix_reference_prim_path")
+                if holderp and isinstance(holderp, str) and holderp.startswith(mprefix):
+                    ohide = o.get(
+                        "remix_hide_original_mesh",
+                        getattr(context.scene, "remix_hide_original_mesh", True),
+                    )
+                    if ohide:
+                        agg_hide = True
+                        break
+        except Exception:
+            agg_hide = bool(obj_hide)
+        holder = author_reference(
+            sublayer_stage, mesh_path, relative, agg_hide, report,
+            preferred_holder_path=obj.get("remix_reference_prim_path"),
+        )
         obj["remix_reference_prim_path"] = holder
     else:
         mesh_path, _ = author_new_mesh(sublayer_stage, relative, report)

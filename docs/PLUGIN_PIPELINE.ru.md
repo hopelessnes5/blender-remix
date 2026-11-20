@@ -122,7 +122,7 @@
 16. `mesh_export.py:174-233` — путь ассета, метаданные data-слоя, default fallback-материал `AperturePBR_Opacity.mdl`.
 17. `mesh_export.py:235-360` — `write_asset()`: каркас `/ReferenceTarget/XForms`, `visibility = inherited` на корне/группе/меше, точки в локальном пространстве прототипа, extent, UV `st`, нормали `faceVarying`, `no_delete = true`; материал пишется только при снятой галочке наследования.
 17a. `mesh_export.py:204-270` — сохранение vertex colors: `displayColor` (`color3f[]`) и `displayOpacity` (`float[]`) с `interpolation = vertex` берутся из color attributes Blender или из исходного USD-меша захвата (флаг `isVertexColorBakedLighting` означает запеченное освещение).
-18. `mesh_export.py:363-431` — `_remove_spec()`, `_holder_for()` и `author_reference()`: переиспользование `ref_`-холдера, удаление дублей и устаревших `XForms`.
+18. `mesh_export.py:363-431` — `_remove_spec()`, `_holder_for()` и `author_reference()`: для каждого экспортируемого объекта создаётся отдельный `ref_<uuid>`-холдер; повторный экспорт того же объекта переиспользует свой холдер (`obj["remix_reference_prim_path"]`); соседние `ref_*` не удаляются; есть переопределения на объект `remix_hide_original_mesh` / `remix_inherit_parent_material` с фолбэком на сцену; `hide_original` агрегируется по всем объектам на одном `mesh_path`; при коллизии базовых имён ассетов добавляется детерминированный суффикс.
 19. `mesh_export.py:392-432` — `hide_original=True` даёт `over mesh_<HASH> (references = None)`; `False` — `over mesh_<HASH>` без маски, то есть добавление к целевому мешу с сохранением исходной геометрии. В обоих случаях на этом же prime мод-слой пишет `visibility = inherited`: capture часто держит `visibility = invisible`, и одного `inherited` внутри ассета недостаточно — USD поднимается к родителю и находит `invisible`.
 20. `mesh_export.py:433-500` — `author_new_mesh()` и `export_mesh()`: относительный путь ассета, сохранение mod-слоя, флаги `remix_processed`/`remix_mesh_file_path`/`remix_material_path`.
 
@@ -149,10 +149,12 @@
 ### 5.6 Свет и устаревший путь
 
 40. `export_operator.py:1592-1600` — `export_light()` делегирует в `light_export.export_light()`.
-41. `light_export.py:50-73` — уникальное имя на объект: stored `usd_light_path` переиспользуется, только если его не разделяют другие света сцены; иначе детерминированное `light_<16HEX>` из имени Blender-объекта. Это убирает слияние одинаковых копий в один prim.
-42. `light_export.py:76-87` — температура: `inputs:enableColorTemperature` (bool) и `inputs:colorTemperature` (float, K) из `use_temperature`/`temperature` Blender; при выключенном флаге пишется только `False`.
-43. `light_export.py:90-210` — типы POINT/SPOT/SUN/AREA, intensity, радиус/shaping, extent, parent по якорю или `/RootNode/remix_assets`, проверка TRS, transform, биндинг материала и сохранение слоя; каждый свет записывает свой `def <LightType>` prim.
-44. `export_utils.py:20-385, 389-874` — устаревшие `MDLManager`, `ShaderSetup`, `MaterialExporter`, `LightExporter`, `TextureExporter`; основной оператор их не вызывает, но `_export_material_textures()` (`:453-679`) дублирует отображения и volume-override.
+41. `light_export.py:49-67` — уникальное имя на объект: stored `usd_light_path` переиспользуется, только если его не разделяют другие света сцены; иначе детерминированное `light_<16HEX>` из имени Blender-объекта. Это убирает слияние одинаковых копий в один prim.
+42. `light_export.py:70-79, 111-125` — температура: `inputs:enableColorTemperature` (bool) и `inputs:colorTemperature` (float, K, clamp 1000–10000) из `use_temperature`/`temperature` Blender. При включённой температуре `inputs:color` пишется белым `(1,1,1)`: Remix умножает blackbody на базовый цвет, поэтому выбор цвета в конфиге не нужен; при выключенной температуре пишется `bl_light.color`.
+43. `light_export.py:113-123` — `inputs:intensity = bl_light.energy` 1:1, без формул и без множителей; `remix_export_scale` влияет только на геометрию (радиусы/размеры), не на яркость; `inputs:exposure = 0`.
+44. `light_export.py:103-...` — типы POINT/SPOT/SUN/AREA, радиус/shaping, extent, parent по якорю или `/RootNode/remix_assets`, проверка TRS, transform, биндинг материала и сохранение слоя; каждый свет записывает свой `def <LightType>` prim.
+45. `light_utils.py:106-119` — импорт зеркален экспорту: `energy = intensity × 2^exposure` 1:1, без `×1000` и без `scene_scale²`; `mod_apply_utils.py:185`, `mod_loader.py:2025`, `sync_ops.py:428` уже использовали это правило.
+46. `export_utils.py:20-385, 389-874` — устаревшие `MDLManager`, `ShaderSetup`, `MaterialExporter`, `LightExporter`, `TextureExporter`; основной оператор их не вызывает, но `_export_material_textures()` (`:453-679`) дублирует отображения и volume-override.
 
 ---
 

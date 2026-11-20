@@ -103,22 +103,18 @@ def create_light_from_usd(light_prim, stage, scene_scale=1.0, up_axis=None):
         width = get_attr_value(light_prim, "width", 1.0) # For Rect lights
 
 
-        # Calculate combined intensity (Blender uses 'energy')
-        # USD Intensity * 2^Exposure = Power (Watts)
-        # Blender interprets energy values as milliwatts (mW), so we need to convert from watts
+        # Calculate combined intensity (Blender uses 'energy'). Remix
+        # intensity maps 1:1 to Blender energy — the exporter writes
+        # `inputs:intensity = bl_light.energy` (see light_export.py), so the
+        # value in the game is the value in the Blender light settings.
         light_power = intensity * math.pow(2, exposure)
-        watts_to_milliwatts = 1000.0  # Convert watts to milliwatts for Blender
         blender_energy_scale = 1.0 # Base scale
 
         # --- Determine Light Type and Create Data Block ---
         light_data = None
         bl_light_type = 'POINT' # Default
 
-        # Apply scene_scale^2 to energy for non-directional lights to maintain perceived brightness
-        # Also convert from watts to milliwatts for Blender
-        effective_light_power = light_power * watts_to_milliwatts
-        if prim_type != "DistantLight": # Only scale energy for Point/Area/Spot lights
-            effective_light_power *= (scene_scale * scene_scale)
+        effective_light_power = light_power * blender_energy_scale
 
         if prim_type == "SphereLight":
             # Remix-authored shaping attributes may exist without formally
@@ -161,9 +157,8 @@ def create_light_from_usd(light_prim, stage, scene_scale=1.0, up_axis=None):
         elif prim_type == "DistantLight": # Directional Light
              bl_light_type = 'SUN'
              light_data = bpy.data.lights.new(name=light_name, type=bl_light_type)
-             # Intensity for sun is often treated differently (irradiance)
-             # Sun light energy (irradiance) should not be scaled by scene_scale**2
-             # Sun lights work correctly with watts, don't convert to milliwatts
+             # DistantLight: energy is intensity × 2^exposure, the same
+             # 1:1 mapping used for every other light type.
              light_data.energy = light_power * blender_energy_scale 
              angle_rad = get_attr_value(light_prim, "angle", 0.53) # Angle in degrees in USD? Assume degrees
              light_data.angle = math.radians(angle_rad) # Blender uses radians

@@ -108,11 +108,21 @@ def export_light(context, obj, sublayer_stage, project_root, target_sublayer_pat
 
     bl_light = obj.data
     scale = context.scene.remix_export_scale or 1.0
+    use_temperature = bool(getattr(bl_light, "use_temperature", False))
     report({"INFO"}, f"Exporting Light: {obj.name}")
 
     attrs = {
-        "inputs:color": Gf.Vec3f(bl_light.color[:]),
-        "inputs:intensity": float(bl_light.energy / (1.0 if bl_light.type == "SUN" else 1000.0 * scale ** 2)),
+        # When Blender temperature mode is on, the color picker is not the
+        # light's color: Remix multiplies `inputs:color` by the blackbody of
+        # `inputs:colorTemperature` (see Toolkit compute_luminance), so a
+        # non-white base would double the tint. Write white and let the
+        # temperature define the color — the color picker is then unnecessary.
+        "inputs:color": Gf.Vec3f((1.0, 1.0, 1.0) if use_temperature
+                                  else bl_light.color[:]),
+        # Blender light energy maps 1:1 to Remix intensity: the game shows
+        # the value from the light settings. The scene-scale knob only
+        # affects geometry sizes, not intensity.
+        "inputs:intensity": float(bl_light.energy),
         "inputs:exposure": 0.0,
     }
     attrs.update(temperature_attrs(bl_light))
